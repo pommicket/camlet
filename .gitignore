@@ -4,3 +4,4 @@ camlet.debug
 .cache
 compile_commands.json
 out.bmp
+*.jpg
