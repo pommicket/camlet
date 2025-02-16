@@ -1,0 +1,6 @@
+debug
+camlet.debug
+# clangd i think
+.cache
+compile_commands.json
+out.bmp
