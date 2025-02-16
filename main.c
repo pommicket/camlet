@@ -10,15 +10,30 @@
 #include <SDL.h>
 #include <time.h>
 #include <stdbool.h>
+#include <libudev.h>
+#include <sodium.h>
 #include <GL/glcorearb.h>
 #include "ds.h"
 #include "lib/stb_image_write.h"
 
+#define HASH_SIZE 16
+#if crypto_generichash_BYTES_MIN > HASH_SIZE
+#error "crypto_generichash what happened"
+#endif
 typedef struct {
-	int32_t dev_idx;
+	uint8_t hash[HASH_SIZE];
+} Hash;
+
+typedef struct {
+	char *dev_path;
 	char *name;
 	uint32_t input_idx;
 	struct v4l2_format best_format;
+	crypto_generichash_state hash_state;
+	int usb_busnum;
+	int usb_devnum;
+	int usb_devpath;
+	Hash hash;
 } Camera;
 
 /// macro trickery to avoid having to write every GL function multiple times
@@ -215,7 +230,7 @@ GLuint gl_compile_and_link_shaders(char error_buf[256], const char *vshader_code
 }
 
 
-void get_cameras_from_device(int32_t dev_idx, int fd, Camera **cameras) {
+void get_cameras_from_device(const char *dev_path, const char *serial, int fd, Camera **cameras) {
 	struct v4l2_capability cap = {0};
 	v4l2_ioctl(fd, VIDIOC_QUERYCAP, &cap);
 	if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) return;
@@ -224,6 +239,10 @@ void get_cameras_from_device(int32_t dev_idx, int fd, Camera **cameras) {
 		input.index = input_idx;
 		if (v4l2_ioctl(fd, VIDIOC_ENUMINPUT, &input) == -1) break;
 		if (input.type != V4L2_INPUT_TYPE_CAMERA) continue;
+		Camera camera = {0};
+		crypto_generichash_init(&camera.hash_state, NULL, 0, HASH_SIZE);
+		crypto_generichash_update(&camera.hash_state, cap.card, strlen((const char *)cap.card) + 1);
+		crypto_generichash_update(&camera.hash_state, input.name, strlen((const char *)input.name) + 1);
 		struct v4l2_fmtdesc fmtdesc = {0};
 		struct v4l2_format best_format = {0};
 		for (uint32_t fmt_idx = 0; ; fmt_idx++) {
@@ -233,20 +252,42 @@ void get_cameras_from_device(int32_t dev_idx, int fd, Camera **cameras) {
 			uint32_t fourcc[2] = {fmtdesc.pixelformat, 0};
 			printf("  - %s (%s)\n",fmtdesc.description, (const char *)fourcc);
 			struct v4l2_frmsizeenum frmsize = {0};
+			if (serial && *serial)
+				crypto_generichash_update(&camera.hash_state, (const uint8_t *)serial, strlen(serial) + 1);
+			const char *bus_info = (const char *)cap.bus_info;
+			int usb_busnum = 0;
+			int usb_devnum = 0;
+			int usb_devpath = 0;
+			if (strlen(bus_info) >= 18 && strlen(bus_info) <= 20 &&
+				// what are those mystery 0s in the bus_info referring to.. . who knows...
+				sscanf(bus_info, "usb-0000:%d:00.%d-%d", &usb_busnum, &usb_devnum, &usb_devpath) == 3) {
+				camera.usb_busnum = usb_busnum;
+				camera.usb_devnum = usb_devnum;
+				camera.usb_devpath = usb_devpath;
+			} else {
+				camera.usb_busnum = -1;
+				camera.usb_devnum = -1;
+				camera.usb_devpath = -1;
+			}
 			for (uint32_t frmsz_idx = 0; ; frmsz_idx++) {
 				frmsize.index = frmsz_idx;
 				frmsize.pixel_format = fmtdesc.pixelformat;
 				if (v4l2_ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == -1) break;
-				if (frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE) {
-					printf("   - %ux%u\n", frmsize.discrete.width, frmsize.discrete.height);
-				} else {
-					printf("   - %ux%u to %ux%u skip %ux%u\n", frmsize.stepwise.min_width, frmsize.stepwise.min_height,
-						frmsize.stepwise.max_width, frmsize.stepwise.max_height,
-						frmsize.stepwise.step_width, frmsize.stepwise.step_height);
-				}
-uint32_t frame_width = frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE ? frmsize.discrete.width : frmsize.stepwise.max_width;
-uint32_t frame_height = frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE ? frmsize.discrete.height : frmsize.stepwise.max_height;
-				
+				// Now you might think do we really need this?
+				// Is it really not enough to use the device name, input name, and serial number to uniquely identify a camera??
+				// No. you fool. Of course there is a Logitech camera with an infrared sensor (for face recognition)
+				// that shows up as two video devices with identical names, capabilities, input names, etc. etc.
+				// and the only way to distinguish them is the picture formats they support.
+				// Oddly Windows doesn't show the infrared camera as an input device.
+				// I wonder if there is some way of detecting which one is the "normal" camera.
+				// Or perhaps Windows has its own special proprietary driver and we have no way of knowing.
+				crypto_generichash_update(&camera.hash_state, (const uint8_t *)&frmsz_idx, sizeof frmsz_idx);
+				crypto_generichash_update(&camera.hash_state, (const uint8_t *)&frmsize.pixel_format, sizeof frmsize.pixel_format);
+				// are there even any stepwise cameras out there?? who knows.
+				uint32_t frame_width = frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE ? frmsize.discrete.width : frmsize.stepwise.max_width;
+				uint32_t frame_height = frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE ? frmsize.discrete.height : frmsize.stepwise.max_height;
+				crypto_generichash_update(&camera.hash_state, (const uint8_t *)&frame_width, sizeof frame_width);
+				crypto_generichash_update(&camera.hash_state, (const uint8_t *)&frame_height, sizeof frame_height);
 if (fmtdesc.pixelformat == V4L2_PIX_FMT_RGB24) {
 	struct v4l2_format format = {0};
 	format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -261,60 +302,25 @@ if (fmtdesc.pixelformat == V4L2_PIX_FMT_RGB24) {
 }
 			}
 		}
-		Camera *camera = arr_addp(*cameras);
-		camera->best_format = best_format;
-		camera->name = a_sprintf(
-			"%s %s %s (%" PRIu32 "x%" PRIu32 ")", (const char *)cap.card, (const char *)cap.bus_info, (const char *)input.name,
+		camera.best_format = best_format;
+		camera.name = a_sprintf(
+			"%s %s (up to %" PRIu32 "x%" PRIu32 ")", (const char *)cap.card, (const char *)input.name,
 			best_format.fmt.pix.width, best_format.fmt.pix.height
 		);
-		camera->input_idx = input_idx;
-		camera->dev_idx = dev_idx;
+		camera.input_idx = input_idx;
+		camera.dev_path = strdup(dev_path);
+		arr_add(*cameras, camera);
 	}
 }
 
 int main() {
+	if (sodium_init() < 0) {
+		fprintf(stderr, "couldn't initialize libsodium");
+		return EXIT_FAILURE;
+	}
 	SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1"); // if this program is sent a SIGTERM/SIGINT, don't turn it into a quit event
 	if (access("/dev", R_OK) != 0) {
 		fprintf(stderr, "Can't access /dev");
-		return EXIT_FAILURE;
-	}
-	Camera *cameras = NULL;
-	for (int32_t dev_idx = 0; dev_idx < 100000; dev_idx++) {
-		char devpath[32] = {0};
-		snprintf(devpath, sizeof devpath, "/dev/video%" PRId32, dev_idx);
-		int status = access(devpath, R_OK);
-		if (status != 0 && errno == EACCES) {
-			// can't read from this device
-			continue;
-		}
-		if (status) break;
-		int fd = v4l2_open(devpath, O_RDWR | O_NONBLOCK);
-		if (fd < 0) {
-			perror("v4l2_open");
-			continue;
-		}
-		get_cameras_from_device(dev_idx, fd, &cameras);
-		v4l2_close(fd);
-	}
-	printf("Select a camera:\n");
-	for (size_t i = 0; i < arr_len(cameras); i++) {
-		printf("[%zu] %s\n", i, cameras[i].name);
-	}
-	int choice = 0;
-	Camera *camera = &cameras[choice];
-	char devpath[32] = {0};
-	snprintf(devpath, sizeof devpath, "/dev/video%" PRId32, camera->dev_idx);
-	int fd = v4l2_open(devpath, O_RDWR);
-	if (fd < 0) {
-		perror("v4l2_open");
-		return EXIT_FAILURE;
-	}
-	if (v4l2_ioctl(fd, VIDIOC_S_INPUT, &camera->input_idx) != 0) {
-		perror("v4l2_ioctl");
-		return EXIT_FAILURE;
-	}
-	if (v4l2_ioctl(fd, VIDIOC_S_FMT, &camera->best_format) != 0) {
-		perror("v4l2_ioctl");
 		return EXIT_FAILURE;
 	}
 	SDL_Init(SDL_INIT_EVERYTHING);
@@ -346,7 +352,6 @@ int main() {
 		}
 	}
 	#endif
-	uint8_t *buf = calloc(1, camera->best_format.fmt.pix.sizeimage);
 	struct timespec ts = {0};
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	double last_time = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
@@ -373,14 +378,6 @@ void main() {\n\
 	gl_FragColor = vec4(tex_color.xyz, 1.0);\n\
 }\n\
 ";
-	uint32_t frame_width = camera->best_format.fmt.pix.width;
-	uint32_t frame_height = camera->best_format.fmt.pix.height;
-	for (int align = 8; align >= 1; align >>= 1) {
-		if (frame_width % align == 0) {
-			gl_PixelStorei(GL_UNPACK_ALIGNMENT, align);
-			break;
-		}
-	}
 	char err[256] = {0};
 	GLuint program = gl_compile_and_link_shaders(err, vshader_code, fshader_code);
 	if (program == 0) return EXIT_FAILURE;
@@ -411,7 +408,125 @@ void main() {\n\
 	gl_EnableVertexAttribArray(v_pos);
 	gl_VertexAttribPointer(v_tex_coord, 2, GL_FLOAT, 0, sizeof(Vertex), (void *)offsetof(Vertex, tex_coord));
 	gl_EnableVertexAttribArray(v_tex_coord);
+	struct udev *udev = udev_new();
+	struct udev_monitor *udev_monitor = udev_monitor_new_from_netlink(udev, "udev");
+	udev_monitor_filter_add_match_subsystem_devtype(udev_monitor, "video4linux", NULL);
+	if (!udev_monitor) {
+		perror("udev_monitor_new_from_netlink");
+	}
+	if (udev_monitor) {
+		// set udev monitor to nonblocking
+		int fd = udev_monitor_get_fd(udev_monitor);
+		int flags = fcntl(fd, F_GETFL);
+		flags |= O_NONBLOCK;
+		if (fcntl(fd, F_SETFL, flags) != 0) {
+			perror("fcntl");
+		}
+		// enable monitor
+		udev_monitor_enable_receiving(udev_monitor);
+	}
+	Camera *cameras = NULL;
+	{
+		struct udev_enumerate *enumerate = udev_enumerate_new(udev);
+		udev_enumerate_add_match_subsystem(enumerate, "video4linux");
+		udev_enumerate_add_match_subsystem(enumerate, "usb");
+		udev_enumerate_scan_devices(enumerate);
+		struct udev_list_entry *device = NULL, *devices = udev_enumerate_get_list_entry(enumerate);
+		udev_list_entry_foreach(device, devices) {
+			struct udev_device *dev = udev_device_new_from_syspath(udev, udev_list_entry_get_name(device));
+			if (!dev) continue;
+			const char *devnode = udev_device_get_devnode(dev);
+			if (!devnode) continue;
+			const char *subsystem = udev_device_get_sysattr_value(dev, "subsystem");
+			const char *serial = udev_device_get_sysattr_value(dev, "serial");
+			if (strcmp(subsystem, "video4linux") == 0) {
+				int status = access(devnode, R_OK);
+				if (status != 0 && errno == EACCES) {
+					// can't read from this device
+					goto cont;
+				}
+				if (status) break;
+				int fd = v4l2_open(devnode, O_RDWR | O_NONBLOCK);
+				if (fd < 0) {
+					perror("v4l2_open");
+					goto cont;
+				}
+				get_cameras_from_device(devnode, serial, fd, &cameras);
+				v4l2_close(fd);
+			}
+			cont:
+			udev_device_unref(dev);
+		}
+		udev_list_entry_foreach(device, devices) {
+			struct udev_device *dev = udev_device_new_from_syspath(udev, udev_list_entry_get_name(device));
+			const char *busnum_str = udev_device_get_sysattr_value(dev, "busnum");
+			if (!busnum_str) continue;
+			const char *devnum_str = udev_device_get_sysattr_value(dev, "devnum");
+			if (!devnum_str) continue;
+			const char *devpath_str = udev_device_get_sysattr_value(dev, "devpath");
+			if (!devpath_str) continue;
+			const char *serial = udev_device_get_sysattr_value(dev, "serial");
+			if (!serial || !*serial) continue;
+			int busnum = atoi(busnum_str);
+			int devnum = atoi(devnum_str);
+			int devpath = atoi(devpath_str);
+			arr_foreach_ptr(cameras, Camera, camera) {
+				// allows us to distinguish between different instances of the exact same model of camera
+				if (camera->usb_busnum == busnum && camera->usb_devnum == devnum && camera->usb_devpath == devpath) {
+					crypto_generichash_update(&camera->hash_state, (const uint8_t *)serial, strlen(serial) + 1);
+				}
+			}
+			udev_device_unref(dev);
+		}
+		udev_enumerate_unref(enumerate);
+		arr_foreach_ptr(cameras, Camera, camera) {
+			memset(camera->hash.hash, 0, sizeof camera->hash.hash);
+			crypto_generichash_final(&camera->hash_state, camera->hash.hash, sizeof camera->hash.hash);
+		}
+		printf("Select a camera:\n");
+		for (size_t i = 0; i < arr_len(cameras); i++) {
+			Camera *camera =  &cameras[i];
+			printf("[%zu] %s ", i, camera->name);
+			for (size_t h = 0; h < sizeof camera->hash.hash; h++) {
+				printf("%02x", camera->hash.hash[h]);
+			}
+			printf("\n");
+		}
+	}
+	int choice = 0;
+	if (arr_len(cameras) == 0) {
+		printf("no cameras\n");
+		return EXIT_FAILURE;
+	}
+	Camera *camera = &cameras[choice];
+	int camera_fd = v4l2_open(camera->dev_path, O_RDWR);
+	if (camera_fd < 0) {
+		perror("v4l2_open");
+		return EXIT_FAILURE;
+	}
+	if (v4l2_ioctl(camera_fd, VIDIOC_S_INPUT, &camera->input_idx) != 0) {
+		perror("v4l2_ioctl");
+		return EXIT_FAILURE;
+	}
+	if (v4l2_ioctl(camera_fd, VIDIOC_S_FMT, &camera->best_format) != 0) {
+		perror("v4l2_ioctl");
+		return EXIT_FAILURE;
+	}
+	uint32_t frame_width = camera->best_format.fmt.pix.width;
+	uint32_t frame_height = camera->best_format.fmt.pix.height;
+	uint8_t *buf = calloc(1, camera->best_format.fmt.pix.sizeimage);
 	while(true) {
+		struct udev_device *dev = NULL;
+		while (udev_monitor && (dev = udev_monitor_receive_device(udev_monitor))) {
+			printf("%s %s\n",udev_device_get_sysname(dev),udev_device_get_action(dev));
+			struct udev_list_entry *attr = NULL, *attrs = udev_device_get_sysattr_list_entry(dev);
+			
+			udev_list_entry_foreach(attr, attrs) {
+				printf("%s = %s\n", udev_list_entry_get_name(attr),
+					udev_device_get_sysattr_value(dev, udev_list_entry_get_name(attr)));
+			}
+			udev_device_unref(dev);
+		}
 		SDL_Event event={0};
 		while (SDL_PollEvent(&event)) {
 			if (event.type == SDL_QUIT) goto quit;
@@ -434,7 +549,13 @@ void main() {\n\
 		last_time = t; (void)last_time;
 		gl_ActiveTexture(GL_TEXTURE0);
 		gl_BindTexture(GL_TEXTURE_2D, texture);
-		if (v4l2_read(fd, buf, camera->best_format.fmt.pix.sizeimage) == camera->best_format.fmt.pix.sizeimage) {
+		for (int align = 8; align >= 1; align >>= 1) {
+			if (frame_width % align == 0) {
+				gl_PixelStorei(GL_UNPACK_ALIGNMENT, align);
+				break;
+			}
+		}
+		if (v4l2_read(camera_fd, buf, camera->best_format.fmt.pix.sizeimage) == camera->best_format.fmt.pix.sizeimage) {
 			gl_TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame_width, frame_height, 0, GL_RGB, GL_UNSIGNED_BYTE, buf);
 		}
 		gl_UseProgram(program);
@@ -446,8 +567,10 @@ void main() {\n\
 		SDL_GL_SwapWindow(window);
 	}
 	quit:
+	udev_monitor_unref(udev_monitor);
+	udev_unref(udev);
 	//debug_save_24bpp_bmp("out.bmp", buf, camera->best_format.fmt.pix.width, camera->best_format.fmt.pix.height);
-	v4l2_close(fd);
+	v4l2_close(camera_fd);
 	SDL_Quit();
 	return 0;
 }
