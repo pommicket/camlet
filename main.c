@@ -194,7 +194,7 @@ static bool camera_setup_with_userp(Camera *camera) {
 	camera->access_method = CAMERA_ACCESS_USERP;
 	return false;
 /*
-TODO: test me with a camera that supports user i/o
+TODO: test me with a camera that supports userptr i/o
 	struct v4l2_requestbuffers req = {0};
 	req.count = CAMERA_MAX_BUFFERS;
 	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -288,7 +288,11 @@ bool camera_next_frame(Camera *camera) {
 		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 		buf.memory = memory;
 		if (v4l2_ioctl(camera->fd, VIDIOC_DQBUF, &buf) != 0) {
-			perror("v4l2_ioctl VIDIOC_DQBUF");
+			static bool printed_error;
+			if (!printed_error) {
+				perror("v4l2_ioctl VIDIOC_DQBUF");
+				printed_error = true;
+			}
 			return false;
 		}
 		camera->frame_bytes_set = buf.bytesused;
@@ -617,7 +621,7 @@ void get_cameras_from_device(const char *dev_path, const char *serial, int fd, C
 	}
 }
 
-int main() {
+int main(void) {
 	if (sodium_init() < 0) {
 		fprintf(stderr, "couldn't initialize libsodium");
 		return EXIT_FAILURE;
@@ -641,8 +645,15 @@ int main() {
 		printf("couldn't create GL context: %s\n", SDL_GetError());
 	}
 	SDL_GL_SetSwapInterval(1); // vsync
+	#if __GNUC__
+	#pragma GCC diagnostic push
+	#pragma GCC diagnostic ignored "-Wpedantic"
+	#endif
 	#define gl_get_proc(upper, lower) gl_##lower = (PFNGL##upper##PROC)SDL_GL_GetProcAddress("gl" #lower);
 	gl_for_each_proc(gl_get_proc);
+	#if __GNUC__
+	#pragma GCC diagnostic pop
+	#endif
 	#if DEBUG
 	{
 		GLint flags = 0;

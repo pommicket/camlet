@@ -1,7 +1,7 @@
 project('camlet',
 	'c',
 	default_options: [
-		'warning_level=4',
+		'warning_level=3',
 	]
 )
 
