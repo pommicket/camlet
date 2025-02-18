@@ -8,6 +8,7 @@
 #include <errno.h>
 #include <string.h>
 #include <SDL.h>
+#include <SDL_ttf.h>
 #include <time.h>
 #include <stdbool.h>
 #include <libudev.h>
@@ -15,8 +16,34 @@
 #include <GL/glcorearb.h>
 #include <sys/mman.h>
 #include <poll.h>
+#include <fontconfig/fontconfig.h>
 #include "ds.h"
 #include "lib/stb_image_write.h"
+
+
+typedef enum {
+	MENU_NONE,
+	MENU_MAIN,
+	MENU_COUNT
+} Menu;
+
+enum {
+	MENU_OPT_QUIT = 1,
+	MENU_OPT_RESOLUTION,
+	MENU_OPT_INPUT,
+};
+// use char for MenuOption type so that we can use strlen
+typedef char MenuOption;
+static const MenuOption main_menu[] = {
+	MENU_OPT_INPUT,
+	MENU_OPT_RESOLUTION,
+	MENU_OPT_QUIT,
+	0
+};
+static const MenuOption *const menus[MENU_COUNT] = {
+	NULL,
+	main_menu,
+};
 
 #define HASH_SIZE 16
 #if crypto_generichash_BYTES_MIN > HASH_SIZE
@@ -441,20 +468,26 @@ static void debug_save_24bpp_bmp(const char *filename, const uint8_t *pixels, ui
 	fclose(fp);
 }
 
-char *a_sprintf(PRINTF_FORMAT_STRING const char *fmt, ...) ATTRIBUTE_PRINTF(1, 2);
-char *a_sprintf(const char *fmt, ...) {
-	// idk if you can always just pass NULL to vsnprintf
-	va_list args;
+char *va_sprintf(const char *fmt, va_list args) {
+	va_list args_copy;
+	va_copy(args_copy, args);
 	char fakebuf[2] = {0};
-	va_start(args, fmt);
-	int ret = vsnprintf(fakebuf, 1, fmt, args);
-	va_end(args);
+	int ret = vsnprintf(fakebuf, 1, fmt, args_copy);
+	va_end(args_copy);
 	
 	if (ret < 0) return NULL; // bad format or something
 	size_t n = (size_t)ret;
 	char *str = calloc(1, n + 1);
-	va_start(args, fmt);
 	vsnprintf(str, n + 1, fmt, args);
+	return str;
+}
+
+char *a_sprintf(PRINTF_FORMAT_STRING const char *fmt, ...) ATTRIBUTE_PRINTF(1, 2);
+char *a_sprintf(const char *fmt, ...) {
+	// idk if you can always just pass NULL to vsnprintf
+	va_list args;
+	va_start(args, fmt);
+	char *str = va_sprintf(fmt, args);
 	va_end(args);
 	return str;
 }
@@ -621,18 +654,65 @@ void get_cameras_from_device(const char *dev_path, const char *serial, int fd, C
 	}
 }
 
+static void render_text_to_surface(TTF_Font *font, SDL_Surface *dest, int x, int y, SDL_Color color, const char *str) {
+	SDL_Surface *text = TTF_RenderText_Blended(font, str, color);
+	SDL_BlitSurface(text, NULL, dest, (SDL_Rect[1]){{x, y, 0, 0}});
+	SDL_FreeSurface(text);
+}
+
 int main(void) {
-	if (sodium_init() < 0) {
-		fprintf(stderr, "couldn't initialize libsodium");
-		return EXIT_FAILURE;
-	}
 	SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1"); // if this program is sent a SIGTERM/SIGINT, don't turn it into a quit event
-	if (access("/dev", R_OK) != 0) {
-		fprintf(stderr, "Can't access /dev");
+	if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
+		fprintf(stderr, "couldn't initialize SDL\n");
 		return EXIT_FAILURE;
 	}
-	SDL_Init(SDL_INIT_EVERYTHING);
+	if (sodium_init() < 0) {
+		fprintf(stderr, "couldn't initialize libsodium\n");
+		return EXIT_FAILURE;
+	}
+	if (!FcInit()) {
+		fprintf(stderr, "couldn't initialize fontconfig\n");
+		return EXIT_FAILURE;
+	}
+	#define FcFini "don't call FcFini: it's broken on certain versions of fontconfig - https://github.com/brndnmtthws/conky/pull/1755"
+	if (TTF_Init() < 0) {
+		fprintf(stderr, "couldn't initialize SDL2_ttf: %s\n", TTF_GetError());
+		return EXIT_FAILURE;
+	}
+	char *font_path = NULL;
+	{
+		// find a suitable font
+		FcPattern *pattern = FcPatternCreate();
+		FcPatternAddInteger(pattern, FC_WEIGHT, FC_WEIGHT_REGULAR);
+		FcPatternAddInteger(pattern, FC_SLANT, FC_SLANT_ROMAN);
+		FcPatternAddInteger(pattern, FC_WIDTH, FC_WIDTH_NORMAL);
+		FcPatternAddString(pattern, FC_FONTFORMAT, (FcChar8 *)"TrueType");
+		FcConfigSubstitute(0, pattern, FcMatchPattern); 
+		FcDefaultSubstitute(pattern);
+		FcResult result = 0;
+		FcPattern *font = FcFontMatch(NULL, pattern, &result);
+		if (result == FcResultMatch) {
+			FcChar8 *file;
+			if (FcPatternGetString(font, FC_FILE, 0, &file) == FcResultMatch) {
+				font_path = strdup((const char *)file);
+			}
+		} else {
+			fprintf(stderr, "couldn't find any normal TTF fonts. try installing one?\n");
+			return EXIT_FAILURE;
+		}
+		FcPatternDestroy(pattern);
+		FcPatternDestroy(font);
+	}
+	TTF_Font *font = TTF_OpenFont(font_path, 18);
+	if (!font) {
+		fprintf(stderr, "couldn't open font %s: %s\n", font_path, TTF_GetError());
+		return EXIT_FAILURE;
+	}
 	SDL_Window *window = SDL_CreateWindow("camlet", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 1280, 720, SDL_WINDOW_OPENGL|SDL_WINDOW_SHOWN|SDL_WINDOW_RESIZABLE);
+	if (!window) {
+		fprintf(stderr, "couldn't create window: %s\n", SDL_GetError());
+		return EXIT_FAILURE;
+	}
 	int gl_version_major = 3, gl_version_minor = 0;
 	#if DEBUG
 		gl_version_major = 4;
@@ -642,7 +722,8 @@ int main(void) {
 	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, gl_version_minor);
 	SDL_GLContext glctx = SDL_GL_CreateContext(window);
 	if (!glctx) {
-		printf("couldn't create GL context: %s\n", SDL_GetError());
+		fprintf(stderr, "couldn't create GL context: %s\n", SDL_GetError());
+		return EXIT_FAILURE;
 	}
 	SDL_GL_SetSwapInterval(1); // vsync
 	#if __GNUC__
@@ -670,13 +751,18 @@ int main(void) {
 	struct timespec ts = {0};
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	double last_time = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-	GLuint texture = 0;
-	gl_GenTextures(1, &texture);
-	gl_BindTexture(GL_TEXTURE_2D, texture);
-	gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-	gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-	gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	GLuint textures[2] = {0};
+	gl_GenTextures(SDL_arraysize(textures), textures);
+	for (size_t i = 0; i < SDL_arraysize(textures); i++) {
+		gl_BindTexture(GL_TEXTURE_2D, textures[i]);
+		gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+	}
+	// texture for camera output
+	GLuint texture = textures[0];
+	GLuint menu_texture = textures[1];
 	const char *vshader_code = "attribute vec2 v_pos;\n\
 attribute vec2 v_tex_coord;\n\
 uniform vec2 u_scale;\n\
@@ -839,6 +925,8 @@ void main() {\n\
 		return EXIT_FAILURE;
 	}
 	camera_set_format(camera, camera->best_format, CAMERA_ACCESS_MMAP);
+	Menu curr_menu = false;
+	int menu_sel = 0;
 	while(true) {
 		struct udev_device *dev = NULL;
 		while (udev_monitor && (dev = udev_monitor_receive_device(udev_monitor))) {
@@ -852,6 +940,7 @@ void main() {\n\
 			udev_device_unref(dev);
 		}
 		SDL_Event event={0};
+		bool menu_needs_rerendering = false;
 		while (SDL_PollEvent(&event)) {
 			if (event.type == SDL_QUIT) goto quit;
 			if (event.type == SDL_KEYDOWN) switch (event.key.keysym.sym) {
@@ -862,10 +951,82 @@ void main() {\n\
 				strftime(name, sizeof name, "%Y-%m-%d-%H-%M-%S.jpg", tm);
 				camera_write_jpg(camera, name, 90);
 				} break;
+			case SDLK_ESCAPE:
+				if (curr_menu == MENU_NONE) {
+					curr_menu = MENU_MAIN;
+				} else if (curr_menu == MENU_MAIN) {
+					curr_menu = MENU_NONE;
+				} else {
+					curr_menu = MENU_MAIN;
+				}
+				menu_needs_rerendering = true;
+				break;
+			case SDLK_UP: if (curr_menu) {
+				menu_sel--;
+				if (menu_sel < 0)
+					menu_sel += strlen(menus[curr_menu]);
+				menu_needs_rerendering = true;
+				}
+				break;
+			case SDLK_DOWN: if (curr_menu) {
+				menu_sel++;
+				menu_sel %= strlen(menus[curr_menu]);
+				menu_needs_rerendering = true;
+				}
+				break;
+			case SDLK_RETURN: if (curr_menu) switch (menus[curr_menu][menu_sel]) {
+				case MENU_OPT_QUIT:
+					goto quit;
+				}
+				break;
 			}
 		}
+		static int prev_window_width, prev_window_height;
 		int window_width = 0, window_height = 0;
 		SDL_GetWindowSize(window, &window_width, &window_height);
+		// not all window size changes seem to generate WINDOWEVENT_RESIZED.
+		menu_needs_rerendering |= window_width != prev_window_width;
+		menu_needs_rerendering |= window_height != prev_window_height;
+		prev_window_width = window_width;
+		prev_window_height = window_height;
+		int menu_width = window_width / 2, menu_height = window_height / 2;
+		menu_width = (menu_width + 7) / 8 * 8; // play nice with pixel store alignment
+		menu_needs_rerendering &= curr_menu != 0;
+		if (menu_needs_rerendering) {
+			// render menu
+			SDL_Surface *menu = SDL_CreateRGBSurfaceWithFormat(0, menu_width, menu_height, 8, SDL_PIXELFORMAT_RGB24);
+			SDL_FillRect(menu, NULL, 0x332244);
+			int font_size = menu_height / 12;
+			TTF_SetFontSize(font, font_size);
+			size_t n_options = strlen(menus[curr_menu]);
+			for (int opt_idx = 0; opt_idx < (int)n_options; opt_idx++) {
+				char *option = NULL;
+				switch (menus[curr_menu][opt_idx]) {
+				case MENU_OPT_QUIT:
+					option = strdup("Quit");
+					break;
+				case MENU_OPT_RESOLUTION:
+					option = strdup("Resolution: XYZ");
+					break;
+				case MENU_OPT_INPUT:
+					option = strdup("Input: XYZ");
+					break;
+				default:
+					assert(false);
+					option = strdup("???");
+				}
+				render_text_to_surface(font, menu, 5, 5 + opt_idx * (5 + font_size),
+					menu_sel == opt_idx
+					? (SDL_Color){255,255,0,255}
+					: (SDL_Color){255,255,255,255}, option);
+				free(option);
+			}
+			gl_BindTexture(GL_TEXTURE_2D, menu_texture);
+			SDL_LockSurface(menu);
+			gl_TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, menu_width, menu_height, 0, GL_RGB, GL_UNSIGNED_BYTE, menu->pixels);
+			SDL_UnlockSurface(menu);
+			SDL_FreeSurface(menu);
+		}
 		gl_Viewport(0, 0, window_width, window_height);
 		gl_ClearColor(0, 0, 0, 1);
 		gl_Clear(GL_COLOR_BUFFER_BIT);
@@ -873,15 +1034,15 @@ void main() {\n\
 		double t = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 //		printf("%.1fms frame time\n",(t-last_time)*1000);
 		last_time = t; (void)last_time;
+		uint32_t frame_width = camera_frame_width(camera);
+		uint32_t frame_height = camera_frame_height(camera);
+		
+		gl_UseProgram(program);
 		gl_ActiveTexture(GL_TEXTURE0);
 		gl_BindTexture(GL_TEXTURE_2D, texture);
 		if (camera_next_frame(camera)) {
 			camera_update_gl_texture_2d(camera);
 		}
-		gl_UseProgram(program);
-		uint32_t frame_width = camera_frame_width(camera);
-		uint32_t frame_height = camera_frame_height(camera);
-		
 		if ((uint64_t)window_width * frame_height > (uint64_t)frame_width * window_height) {
 			// window is wider than picture
 			float letterbox_size = window_width - (float)window_height / frame_height * frame_width;
@@ -901,7 +1062,14 @@ void main() {\n\
 		gl_Uniform1i(u_sampler, 0);
 		gl_Uniform1i(u_pixel_format, camera_pixel_format(camera));
 		gl_DrawArrays(GL_TRIANGLES, 0, (GLsizei)(3 * ntriangles));
-		gl_BindTexture(GL_TEXTURE_2D, 0);
+		if (curr_menu) {
+			gl_ActiveTexture(GL_TEXTURE0);
+			gl_BindTexture(GL_TEXTURE_2D, menu_texture);
+			gl_Uniform2f(u_scale, 0.5f, 0.5f);
+			gl_Uniform1i(u_sampler, 0);
+			gl_Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
+			gl_DrawArrays(GL_TRIANGLES, 0, (GLsizei)(3 * ntriangles));
+		}
 		SDL_GL_SwapWindow(window);
 	}
 	quit:
