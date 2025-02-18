@@ -132,7 +132,7 @@ typedef struct {
 gl_for_each_proc(gl_define_proc)
 #undef gl_define_proc
 
-static bool camera_setup_read(Camera *camera) {
+static bool camera_setup_with_read(Camera *camera) {
 	camera->access_method = CAMERA_ACCESS_READ;
 	uint32_t image_size = camera->curr_format.fmt.pix.sizeimage;
 	camera->read_frame = realloc(camera->read_frame, image_size);
@@ -143,7 +143,7 @@ static bool camera_setup_read(Camera *camera) {
 	memset(camera->read_frame, 0, image_size);
 	return camera->read_frame != NULL;
 }
-static bool camera_setup_mmap(Camera *camera) {
+static bool camera_setup_with_mmap(Camera *camera) {
 	camera->access_method = CAMERA_ACCESS_MMAP;
 	struct v4l2_requestbuffers req = {0};
 	req.count = CAMERA_MAX_BUFFERS;
@@ -162,9 +162,6 @@ static bool camera_setup_mmap(Camera *camera) {
 		if (v4l2_ioctl(camera->fd, VIDIOC_QUERYBUF, &buf) != 0) {
 			perror("v4l2_ioctl VIDIOC_QUERYBUF");
 			return false;
-		}
-		if (camera->mmap_frames[i]) {
-			v4l2_munmap(camera->mmap_frames[i], camera->mmap_size[i]);
 		}
 		camera->mmap_size[i] = buf.length;
 		camera->mmap_frames[i] = v4l2_mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
@@ -193,7 +190,7 @@ static bool camera_setup_mmap(Camera *camera) {
 	}
 	return true;
 }
-static bool camera_init_userp(Camera *camera) {
+static bool camera_setup_with_userp(Camera *camera) {
 	camera->access_method = CAMERA_ACCESS_USERP;
 	return false;
 /*
@@ -218,7 +215,26 @@ TODO: test me with a camera that supports user i/o
 			perror("v4l2_ioctl VIDIOC_QBUF");
 		}
 	}
+	if (v4l2_ioctl(camera->fd,
+		VIDIOC_STREAMON,
+		(enum v4l2_buf_type[1]) { V4L2_BUF_TYPE_VIDEO_CAPTURE }) != 0) {
+		perror("v4l2_ioctl VIDIOC_STREAMON");
+		return false;
+	}
 	return true;*/
+}
+static bool camera_stop_io(Camera *camera) {
+	// Just doing VIDIOC_STREAMOFF doesn't seem to be enough to prevent EBUSY.
+	//  (Even if we dequeue all buffers afterwards)
+	// Re-opening doesn't seem to be necessary for read-based access for me,
+	// but idk if that's true on all cameras.
+	v4l2_close(camera->fd);
+	camera->fd = v4l2_open(camera->dev_path, O_RDWR);
+	if (camera->fd < 0) {
+		perror("v4l2_open");
+		return false;
+	}
+	return true;
 }
 uint32_t camera_frame_width(Camera *camera) {
 	return camera->curr_format.fmt.pix.width;
@@ -245,6 +261,7 @@ void camera_write_jpg(Camera *camera, const char *name, int quality) {
 bool camera_next_frame(Camera *camera) {
 	struct pollfd pollfd = {.fd = camera->fd, .events = POLLIN};
 	// check whether there is any data available from camera
+	// NOTE: O_NONBLOCK on v4l2_camera doesn't seem to work, at least on my camera
 	if (poll(&pollfd, 1, 1) <= 0) {
 		return false;
 	}
@@ -312,6 +329,11 @@ void camera_update_gl_texture_2d(Camera *camera) {
 		}
 	}
 }
+
+uint32_t camera_pixel_format(Camera *camera) {
+	return camera->curr_format.fmt.pix.pixelformat;
+}
+
 void camera_free(Camera *camera) {
 	free(camera->read_frame);
 	for (int i = 0; i < CAMERA_MAX_BUFFERS; i++) {
@@ -323,20 +345,51 @@ void camera_free(Camera *camera) {
 	memset(camera, 0, sizeof *camera);
 }
 
-static bool camera_set_format(Camera *camera, PictureFormat picfmt) {
+bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod access) {
+	camera->access_method = access;
+	for (int i = 0; i < camera->buffer_count; i++) {
+		if (camera->mmap_frames[i]) {
+			v4l2_munmap(camera->mmap_frames[i], camera->mmap_size[i]);
+			camera->mmap_frames[i] = NULL;
+		}
+	}
+	free(camera->read_frame);
+	camera->read_frame = NULL;
 	struct v4l2_format format = {0};
+	camera_stop_io(camera); // prevent EBUSY when changing format
 	format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	format.fmt.pix.field = V4L2_FIELD_ANY;
-	format.fmt.pix.pixelformat = picfmt.pixfmt;
+	// v4l2 should be able to output rgb24 for all reasonable cameras
+	uint32_t pixfmt = V4L2_PIX_FMT_RGB24;
+	switch (picfmt.pixfmt) {
+	// we can actually handle these pixel formats
+	case V4L2_PIX_FMT_BGR24:
+	case V4L2_PIX_FMT_GREY:
+		pixfmt = picfmt.pixfmt;
+		break;
+	}
+	format.fmt.pix.pixelformat = pixfmt;
 	format.fmt.pix.width = picfmt.width;
 	format.fmt.pix.height = picfmt.height;
 	if (v4l2_ioctl(camera->fd, VIDIOC_S_FMT, &format) != 0) {
-		perror("v4l2_ioctl");
+		perror("v4l2_ioctl VIDIOC_S_FMT");
 		return false;
 	}
 	camera->curr_format = format;
-	printf("image size = %uB\n",format.fmt.pix.sizeimage);
-	return true;
+	//printf("image size = %uB\n",format.fmt.pix.sizeimage);
+	switch (camera->access_method) {
+	case CAMERA_ACCESS_READ:
+		return camera_setup_with_read(camera);
+	case CAMERA_ACCESS_MMAP:
+		return camera_setup_with_mmap(camera);
+	case CAMERA_ACCESS_USERP:
+		return camera_setup_with_userp(camera);
+	default:
+		#if DEBUG
+		assert(false);
+		#endif
+		return false;
+	}
 }
 
 #if DEBUG
@@ -486,6 +539,7 @@ void get_cameras_from_device(const char *dev_path, const char *serial, int fd, C
 		crypto_generichash_update(&camera.hash_state, cap.card, strlen((const char *)cap.card) + 1);
 		crypto_generichash_update(&camera.hash_state, input.name, strlen((const char *)input.name) + 1);
 		struct v4l2_fmtdesc fmtdesc = {0};
+		printf("-----\n");
 		for (uint32_t fmt_idx = 0; ; fmt_idx++) {
 			fmtdesc.index = fmt_idx;
 			fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -614,22 +668,35 @@ int main() {
 	gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	const char *vshader_code = "attribute vec2 v_pos;\n\
 attribute vec2 v_tex_coord;\n\
+uniform vec2 u_scale;\n\
 out vec2 tex_coord;\n\
 void main() {\n\
 	tex_coord = vec2(v_tex_coord.x, 1.0 - v_tex_coord.y);\n\
-	gl_Position = vec4(v_pos, 0.0, 1.0);\n\
+	gl_Position = vec4(u_scale * v_pos, 0.0, 1.0);\n\
 }\n\
 ";
 	const char *fshader_code = "in vec4 color;\n\
 in vec2 tex_coord;\n\
 uniform sampler2D u_sampler;\n\
+uniform int u_pixel_format;\n\
 void main() {\n\
-	vec4 tex_color = texture2D(u_sampler, tex_coord);\n\
-	gl_FragColor = vec4(tex_color.xyz, 1.0);\n\
+	vec3 color;\n\
+	switch (u_pixel_format) {\n\
+	case 0x59455247: // GREY\n\
+		color = texture2D(u_sampler, tex_coord).xxx;\n\
+		break;\n\
+	default:\n\
+		color = texture2D(u_sampler, tex_coord).xyz;\n\
+		break;\n\
+	}\n\
+	gl_FragColor = vec4(color, 1.0);\n\
 }\n\
 ";
 	char err[256] = {0};
 	GLuint program = gl_compile_and_link_shaders(err, vshader_code, fshader_code);
+	if (*err) {
+		fprintf(stderr, "%s\n",err);
+	}
 	if (program == 0) return EXIT_FAILURE;
 	GLuint vbo = 0, vao = 0;
 	gl_GenBuffers(1, &vbo);
@@ -649,6 +716,8 @@ void main() {\n\
 	};
 	int ntriangles = sizeof triangles / sizeof triangles[0];
 	GLuint u_sampler = gl_GetUniformLocation(program, "u_sampler");
+	GLuint u_pixel_format = gl_GetUniformLocation(program, "u_pixel_format");
+	GLuint u_scale = gl_GetUniformLocation(program, "u_scale");
 	GLint v_pos = gl_GetAttribLocation(program, "v_pos");
 	GLint v_tex_coord = gl_GetAttribLocation(program, "v_tex_coord");
 	gl_BindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -758,8 +827,7 @@ void main() {\n\
 		perror("v4l2_ioctl");
 		return EXIT_FAILURE;
 	}
-	camera_set_format(camera, camera->best_format);
-	camera_setup_mmap(camera);
+	camera_set_format(camera, camera->best_format, CAMERA_ACCESS_MMAP);
 	while(true) {
 		struct udev_device *dev = NULL;
 		while (udev_monitor && (dev = udev_monitor_receive_device(udev_monitor))) {
@@ -788,6 +856,8 @@ void main() {\n\
 		int window_width = 0, window_height = 0;
 		SDL_GetWindowSize(window, &window_width, &window_height);
 		gl_Viewport(0, 0, window_width, window_height);
+		gl_ClearColor(0, 0, 0, 1);
+		gl_Clear(GL_COLOR_BUFFER_BIT);
 		clock_gettime(CLOCK_MONOTONIC, &ts);
 		double t = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 //		printf("%.1fms frame time\n",(t-last_time)*1000);
@@ -798,9 +868,27 @@ void main() {\n\
 			camera_update_gl_texture_2d(camera);
 		}
 		gl_UseProgram(program);
+		uint32_t frame_width = camera_frame_width(camera);
+		uint32_t frame_height = camera_frame_height(camera);
+		
+		if ((uint64_t)window_width * frame_height > (uint64_t)frame_width * window_height) {
+			// window is wider than picture
+			float letterbox_size = window_width - (float)window_height / frame_height * frame_width;
+			letterbox_size /= window_width;
+			gl_Uniform2f(u_scale, 1-letterbox_size, 1);
+		} else if ((uint64_t)window_width * frame_height < (uint64_t)frame_width * window_height) {
+			// window is narrower than picture
+			float letterbox_size = window_height - (float)window_width / frame_width * frame_height;
+			letterbox_size /= window_height;
+			gl_Uniform2f(u_scale, 1, 1-letterbox_size);
+		} else {
+			// don't mess with fp inaccuracy
+			gl_Uniform2f(u_scale, 1, 1);
+		}
 		gl_BindBuffer(GL_ARRAY_BUFFER, vbo);
 		gl_BindVertexArray(vao);
 		gl_Uniform1i(u_sampler, 0);
+		gl_Uniform1i(u_pixel_format, camera_pixel_format(camera));
 		gl_DrawArrays(GL_TRIANGLES, 0, (GLsizei)(3 * ntriangles));
 		gl_BindTexture(GL_TEXTURE_2D, 0);
 		SDL_GL_SwapWindow(window);
