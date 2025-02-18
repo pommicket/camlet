@@ -683,10 +683,13 @@ int main(void) {
 	{
 		// find a suitable font
 		FcPattern *pattern = FcPatternCreate();
+		FcLangSet *langs = FcLangSetCreate();
+		FcLangSetAdd(langs, (const FcChar8 *)"en-US");
+		FcPatternAddLangSet(pattern, FC_LANG, langs);
 		FcPatternAddInteger(pattern, FC_WEIGHT, FC_WEIGHT_REGULAR);
 		FcPatternAddInteger(pattern, FC_SLANT, FC_SLANT_ROMAN);
 		FcPatternAddInteger(pattern, FC_WIDTH, FC_WIDTH_NORMAL);
-		FcPatternAddString(pattern, FC_FONTFORMAT, (FcChar8 *)"TrueType");
+		FcPatternAddString(pattern, FC_FONTFORMAT, (const FcChar8 *)"TrueType");
 		FcConfigSubstitute(0, pattern, FcMatchPattern); 
 		FcDefaultSubstitute(pattern);
 		FcResult result = 0;
@@ -702,6 +705,7 @@ int main(void) {
 		}
 		FcPatternDestroy(pattern);
 		FcPatternDestroy(font);
+		FcLangSetDestroy(langs);
 	}
 	TTF_Font *font = TTF_OpenFont(font_path, 18);
 	if (!font) {
