@@ -813,7 +813,7 @@ void main() {\n\
 			memset(camera->hash.hash, 0, sizeof camera->hash.hash);
 			crypto_generichash_final(&camera->hash_state, camera->hash.hash, sizeof camera->hash.hash);
 		}
-		printf("Select a camera:\n");
+		printf("---CAMERAS---\n");
 		for (size_t i = 0; i < arr_len(cameras); i++) {
 			Camera *camera = &cameras[i];
 			printf("[%zu] %s ", i, camera->name);
