@@ -59,6 +59,23 @@ typedef struct {
 	uint32_t pixfmt;
 } PictureFormat;
 
+int picture_format_cmp_resolution(const PictureFormat *a, const PictureFormat *b) {
+	if (a->width < b->width) return -1;
+	if (a->width > b->width) return 1;
+	if (a->height < b->height) return -1;
+	if (a->height > b->height) return 1;
+	return 0;
+}
+
+int picture_format_cmp_qsort(const void *av, const void *bv) {
+	const PictureFormat *a = av, *b = bv;
+	if (a->pixfmt < b->pixfmt) return -1;
+	if (a->pixfmt > b->pixfmt) return 1;
+	int cmp = picture_format_cmp_resolution(a, b);
+	if (cmp) return cmp;
+	return 0;
+}
+
 typedef enum {
 	// (default value)
 	CAMERA_ACCESS_NOT_SETUP,
@@ -263,12 +280,20 @@ static bool camera_stop_io(Camera *camera) {
 	}
 	return true;
 }
-uint32_t camera_frame_width(Camera *camera) {
+int32_t camera_frame_width(Camera *camera) {
 	return camera->curr_format.fmt.pix.width;
 }
-uint32_t camera_frame_height(Camera *camera) {
+int32_t camera_frame_height(Camera *camera) {
 	return camera->curr_format.fmt.pix.height;
 }
+PictureFormat camera_picture_format(Camera *camera) {
+	return (PictureFormat) {
+		.width = camera_frame_width(camera),
+		.height = camera_frame_height(camera),
+		.pixfmt = camera->curr_format.fmt.pix.pixelformat
+	};
+}
+
 static uint8_t *camera_curr_frame(Camera *camera) {
 	if (camera->read_frame)
 		return camera->read_frame;
@@ -377,6 +402,11 @@ void camera_free(Camera *camera) {
 }
 
 bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod access) {
+	if (camera->access_method == access
+		&& picture_format_cmp_qsort((PictureFormat[1]) { camera_picture_format(camera) }, &picfmt) == 0) {
+		// no changes needed
+		return true;
+	}
 	camera->access_method = access;
 	for (int i = 0; i < camera->buffer_count; i++) {
 		if (camera->mmap_frames[i]) {
@@ -605,21 +635,9 @@ void get_cameras_from_device(const char *dev_path, const char *serial, int fd, C
 				frmsize.index = frmsz_idx;
 				frmsize.pixel_format = fmtdesc.pixelformat;
 				if (v4l2_ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == -1) break;
-				// Now you might think do we really need this?
-				// Is it really not enough to use the device name, input name, and serial number to uniquely identify a camera??
-				// No. you fool. Of course there is a Logitech camera with an infrared sensor (for face recognition)
-				// that shows up as two video devices with identical names, capabilities, input names, etc. etc.
-				// and the only way to distinguish them is the picture formats they support.
-				// Oddly Windows doesn't show the infrared camera as an input device.
-				// I wonder if there is some way of detecting which one is the "normal" camera.
-				// Or perhaps Windows has its own special proprietary driver and we have no way of knowing.
-				crypto_generichash_update(&camera.hash_state, (const uint8_t *)&frmsz_idx, sizeof frmsz_idx);
-				crypto_generichash_update(&camera.hash_state, (const uint8_t *)&frmsize.pixel_format, sizeof frmsize.pixel_format);
 				// are there even any stepwise cameras out there?? who knows.
 				uint32_t frame_width = frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE ? frmsize.discrete.width : frmsize.stepwise.max_width;
 				uint32_t frame_height = frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE ? frmsize.discrete.height : frmsize.stepwise.max_height;
-				crypto_generichash_update(&camera.hash_state, (const uint8_t *)&frame_width, sizeof frame_width);
-				crypto_generichash_update(&camera.hash_state, (const uint8_t *)&frame_height, sizeof frame_height);
 				arr_add(camera.formats, ((PictureFormat) {
 					.width = frame_width,
 					.height = frame_height,
@@ -631,12 +649,34 @@ void get_cameras_from_device(const char *dev_path, const char *serial, int fd, C
 			arr_free(camera.formats);
 			continue;
 		}
+		arr_qsort(camera.formats, picture_format_cmp_qsort);
+		// deduplicate
+		{
+			int i, o;
+			for (o = 0, i = 0; i < (int)arr_len(camera.formats); i++) {
+				if (i == 0 || picture_format_cmp_qsort(&camera.formats[i-1], &camera.formats[i]) != 0) {
+					camera.formats[o++] = camera.formats[i];
+				}
+			}
+			arr_set_len(camera.formats, o);
+		}
 		camera.input_idx = input_idx;
 		camera.dev_path = strdup(dev_path);
 		// select best format
 		PictureFormat best_format = {0};
 		uint32_t desired_format = V4L2_PIX_FMT_RGB24;
 		arr_foreach_ptr(camera.formats, PictureFormat, fmt) {
+			// Now you might think do we really need this?
+			// Is it really not enough to use the device name, input name, and serial number to uniquely identify a camera??
+			// No. you fool. Of course there is a Logitech camera with an infrared sensor (for face recognition)
+			// that shows up as two video devices with identical names, capabilities, input names, etc. etc.
+			// and the only way to distinguish them is the picture formats they support.
+			// Oddly Windows doesn't show the infrared camera as an input device.
+			// I wonder if there is some way of detecting which one is the "normal" camera.
+			// Or perhaps Windows has its own special proprietary driver and we have no way of knowing.
+			crypto_generichash_update(&camera.hash_state, (const uint8_t *)&fmt->pixfmt, sizeof fmt->pixfmt);
+			crypto_generichash_update(&camera.hash_state, (const uint8_t *)&fmt->width, sizeof fmt->width);
+			crypto_generichash_update(&camera.hash_state, (const uint8_t *)&fmt->height, sizeof fmt->height);
 			if (best_format.pixfmt == desired_format && fmt->pixfmt != desired_format) {
 				continue;
 			}
@@ -655,7 +695,7 @@ void get_cameras_from_device(const char *dev_path, const char *serial, int fd, C
 }
 
 static void render_text_to_surface(TTF_Font *font, SDL_Surface *dest, int x, int y, SDL_Color color, const char *str) {
-	SDL_Surface *text = TTF_RenderText_Blended(font, str, color);
+	SDL_Surface *text = TTF_RenderUTF8_Blended(font, str, color);
 	SDL_BlitSurface(text, NULL, dest, (SDL_Rect[1]){{x, y, 0, 0}});
 	SDL_FreeSurface(text);
 }
@@ -700,7 +740,7 @@ int main(void) {
 				font_path = strdup((const char *)file);
 			}
 		} else {
-			fprintf(stderr, "couldn't find any normal TTF fonts. try installing one?\n");
+			fprintf(stderr, "couldn't find any regular English TTF fonts. try installing one?\n");
 			return EXIT_FAILURE;
 		}
 		FcPatternDestroy(pattern);
@@ -931,6 +971,7 @@ void main() {\n\
 	camera_set_format(camera, camera->best_format, CAMERA_ACCESS_MMAP);
 	Menu curr_menu = false;
 	int menu_sel = 0;
+	PictureFormat desired_fmt = {0};
 	while(true) {
 		struct udev_device *dev = NULL;
 		while (udev_monitor && (dev = udev_monitor_receive_device(udev_monitor))) {
@@ -960,9 +1001,11 @@ void main() {\n\
 					curr_menu = MENU_MAIN;
 				} else if (curr_menu == MENU_MAIN) {
 					curr_menu = MENU_NONE;
+					camera_set_format(camera, desired_fmt, camera->access_method);
 				} else {
 					curr_menu = MENU_MAIN;
 				}
+				desired_fmt = camera_picture_format(camera);
 				menu_needs_rerendering = true;
 				break;
 			case SDLK_UP: if (curr_menu) {
@@ -978,9 +1021,40 @@ void main() {\n\
 				menu_needs_rerendering = true;
 				}
 				break;
+			case SDLK_LEFT:
+			case SDLK_RIGHT: if (curr_menu) {
+				int direction = event.key.keysym.sym == SDLK_LEFT ? -1 : 1;
+				switch (menus[curr_menu][menu_sel]) {
+				case MENU_OPT_QUIT:
+					goto quit;
+				case MENU_OPT_RESOLUTION: if (camera) {
+					// change desired_resolution
+					PictureFormat *available = NULL;
+					int curr_idx = -1;
+					arr_foreach_ptr(camera->formats, PictureFormat, fmt) {
+						if (fmt->pixfmt == desired_fmt.pixfmt) {
+							if (picture_format_cmp_resolution(fmt, &desired_fmt) == 0) {
+								curr_idx = arr_len(available);
+							}
+							arr_add(available, *fmt);
+						}
+					}
+					assert(curr_idx >= 0);
+					int new_idx = (curr_idx + direction + arr_len(available)) % arr_len(available);
+					assert(new_idx >= 0 && new_idx < (int)arr_len(available));
+					desired_fmt = available[new_idx];
+					arr_free(available);
+					menu_needs_rerendering = true;
+					}
+					break;
+				}
+				}
+				break;
 			case SDLK_RETURN: if (curr_menu) switch (menus[curr_menu][menu_sel]) {
 				case MENU_OPT_QUIT:
 					goto quit;
+				case MENU_OPT_RESOLUTION:
+					camera_set_format(camera, desired_fmt, camera->access_method);
 				}
 				break;
 			}
@@ -1000,8 +1074,10 @@ void main() {\n\
 			// render menu
 			SDL_Surface *menu = SDL_CreateRGBSurfaceWithFormat(0, menu_width, menu_height, 8, SDL_PIXELFORMAT_RGB24);
 			SDL_FillRect(menu, NULL, 0x332244);
-			int font_size = menu_height / 12;
+			int font_size = menu_height / 20;
 			TTF_SetFontSize(font, font_size);
+			SDL_Color text_color = {255, 255, 255, 255};
+			SDL_Color highlight_color = {255, 255, 0, 255};
 			size_t n_options = strlen(menus[curr_menu]);
 			for (int opt_idx = 0; opt_idx < (int)n_options; opt_idx++) {
 				char *option = NULL;
@@ -1010,10 +1086,11 @@ void main() {\n\
 					option = strdup("Quit");
 					break;
 				case MENU_OPT_RESOLUTION:
-					option = strdup("Resolution: XYZ");
+					option = a_sprintf("Resolution: %" PRIu32 "x%" PRIu32,
+						desired_fmt.width, desired_fmt.height);
 					break;
 				case MENU_OPT_INPUT:
-					option = strdup("Input: XYZ");
+					option = a_sprintf("Input: %s", camera->name);
 					break;
 				default:
 					assert(false);
@@ -1021,10 +1098,11 @@ void main() {\n\
 				}
 				render_text_to_surface(font, menu, 5, 5 + opt_idx * (5 + font_size),
 					menu_sel == opt_idx
-					? (SDL_Color){255,255,0,255}
-					: (SDL_Color){255,255,255,255}, option);
+					? highlight_color
+					: text_color, option);
 				free(option);
 			}
+			render_text_to_surface(font, menu, 5, menu_height - 10 - font_size, text_color, "UP/DOWN to select option, LEFT/RIGHT to change value, ENTER to apply");
 			gl_BindTexture(GL_TEXTURE_2D, menu_texture);
 			SDL_LockSurface(menu);
 			gl_TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, menu_width, menu_height, 0, GL_RGB, GL_UNSIGNED_BYTE, menu->pixels);
