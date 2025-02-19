@@ -31,12 +31,14 @@ enum {
 	MENU_OPT_QUIT = 1,
 	MENU_OPT_RESOLUTION,
 	MENU_OPT_INPUT,
+	MENU_OPT_PIXFMT,
 };
 // use char for MenuOption type so that we can use strlen
 typedef char MenuOption;
 static const MenuOption main_menu[] = {
 	MENU_OPT_INPUT,
 	MENU_OPT_RESOLUTION,
+	MENU_OPT_PIXFMT,
 	MENU_OPT_QUIT,
 	0
 };
@@ -59,6 +61,13 @@ typedef struct {
 	uint32_t pixfmt;
 } PictureFormat;
 
+int uint32_cmp_qsort(const void *av, const void *bv) {
+	uint32_t a = *(const uint32_t *)av, b = *(const uint32_t *)bv;
+	if (a < b) return -1;
+	if (a > b) return 1;
+	return 0;
+}
+
 int picture_format_cmp_resolution(const PictureFormat *a, const PictureFormat *b) {
 	if (a->width < b->width) return -1;
 	if (a->width > b->width) return 1;
@@ -74,6 +83,72 @@ int picture_format_cmp_qsort(const void *av, const void *bv) {
 	int cmp = picture_format_cmp_resolution(a, b);
 	if (cmp) return cmp;
 	return 0;
+}
+
+const char *pixfmt_to_string(uint32_t pixfmt) {
+	switch (pixfmt) {
+	case V4L2_PIX_FMT_RGB332: return "RGB332";
+	case V4L2_PIX_FMT_RGB444: return "RGB444";
+	case V4L2_PIX_FMT_XRGB444: return "4bpc XRGB";
+	case V4L2_PIX_FMT_RGBX444: return "4bpc RGBX";
+	case V4L2_PIX_FMT_XBGR444: return "4bpc XBGR";
+	case V4L2_PIX_FMT_BGRX444: return "4bpc BGRX";
+	case V4L2_PIX_FMT_RGB555:  return "RGB555";
+	case V4L2_PIX_FMT_XRGB555: return "XRGB555";
+	case V4L2_PIX_FMT_RGBX555: return "RGBX555";
+	case V4L2_PIX_FMT_XBGR555: return "XBGR555";
+	case V4L2_PIX_FMT_BGRX555: return "BGRX555";
+	case V4L2_PIX_FMT_RGB565:  return "RGB565";
+	case V4L2_PIX_FMT_RGB555X: return "RGB555BE";
+	case V4L2_PIX_FMT_XRGB555X: return "XRGB555BE";
+	case V4L2_PIX_FMT_RGB565X: return "RGB565BE";
+	case V4L2_PIX_FMT_BGR24: return "8bpc BGR";
+	case V4L2_PIX_FMT_RGB24: return "8bpc RGB";
+	case V4L2_PIX_FMT_XBGR32: return "8bpc XBGR";
+	case V4L2_PIX_FMT_BGRX32: return "8bpc BGRX";
+	case V4L2_PIX_FMT_RGBX32: return "8bpc RGBX";
+	case V4L2_PIX_FMT_XRGB32: return "8bpc XRGB";
+	case V4L2_PIX_FMT_GREY: return "8-bit grayscale";
+	case V4L2_PIX_FMT_Y4: return "4-bit grayscale";
+	case V4L2_PIX_FMT_YUYV: return "YUYV 4:2:2";
+	case V4L2_PIX_FMT_YYUV: return "YYUV 4:2:2";
+	case V4L2_PIX_FMT_YVYU: return "YVYU 4:2:2";
+	case V4L2_PIX_FMT_UYVY: return "UYVY 4:2:2";
+	case V4L2_PIX_FMT_VYUY: return "VYUY 4:2:2";
+	case V4L2_PIX_FMT_YUV444: return "4bpc YUV";
+	case V4L2_PIX_FMT_YUV555: return "5bpc YUV";
+	case V4L2_PIX_FMT_YUV565: return "YUV565";
+	case V4L2_PIX_FMT_YUV24: return "8bpc YUV";
+	case V4L2_PIX_FMT_XYUV32: return "8bpc XYUV";
+	case V4L2_PIX_FMT_VUYX32: return "8bpc VUYX";
+	case V4L2_PIX_FMT_YUVX32: return "8bpc YUVX";
+	case V4L2_PIX_FMT_MJPEG:  return "MJPEG";
+	case V4L2_PIX_FMT_JPEG: return "JPEG";
+	case V4L2_PIX_FMT_MPEG: return "MPEG";
+	case V4L2_PIX_FMT_H264: return "H264";
+	case V4L2_PIX_FMT_H264_NO_SC: return "AVC1";
+	case V4L2_PIX_FMT_H264_MVC: return "H264 MVC";
+	case V4L2_PIX_FMT_H263: return "H263";
+	case V4L2_PIX_FMT_MPEG1: return "MPEG1";
+	case V4L2_PIX_FMT_MPEG2: return "MPEG2";
+	case V4L2_PIX_FMT_MPEG4: return "MPEG4";
+	case V4L2_PIX_FMT_XVID: return "XVID";
+	default: {
+		static char s[5];
+		memcpy(s, &pixfmt, 4);
+		return s;
+		}
+	}
+}
+
+bool pix_fmt_supported(uint32_t pixfmt) {
+	switch (pixfmt) {
+	case V4L2_PIX_FMT_RGB24:
+	case V4L2_PIX_FMT_BGR24:
+	case V4L2_PIX_FMT_GREY:
+		return true;
+	}
+	return false;
 }
 
 typedef enum {
@@ -1047,6 +1122,44 @@ void main() {\n\
 					menu_needs_rerendering = true;
 					}
 					break;
+				case MENU_OPT_PIXFMT: if (camera) {
+					uint32_t *available = NULL;
+					arr_add(available, V4L2_PIX_FMT_RGB24);
+					arr_foreach_ptr(camera->formats, PictureFormat, fmt) {
+						if (!pix_fmt_supported(fmt->pixfmt))
+							continue;
+						arr_foreach_ptr(available, uint32_t, prev) {
+							if (*prev == fmt->pixfmt) goto skip;
+						}
+						arr_add(available, fmt->pixfmt);
+						skip:;
+					}
+					arr_qsort(available, uint32_cmp_qsort);
+					int curr_idx = -1;
+					arr_foreach_ptr(available, uint32_t, x) {
+						if (*x == desired_fmt.pixfmt) {
+							curr_idx = (int)(x - available);
+						}
+					}
+					assert(curr_idx >= 0);
+					int new_idx = (curr_idx + direction + arr_len(available)) % arr_len(available);
+					assert(new_idx >= 0 && new_idx < (int)arr_len(available));
+					uint32_t desired_pixfmt = available[new_idx];
+					PictureFormat best_format = {.pixfmt = desired_pixfmt};
+					int32_t best_score = INT32_MIN;
+					arr_foreach_ptr(camera->formats, PictureFormat, fmt) {
+						if (fmt->pixfmt != desired_pixfmt) {
+							continue;
+						}
+						int32_t score = -abs(fmt->width - desired_fmt.width) + abs(fmt->height - desired_fmt.height);
+						if (score >= best_score) {
+							best_score = score;
+							best_format = *fmt;
+						}
+					}
+					desired_fmt = best_format;
+					menu_needs_rerendering = true;
+				}
 				}
 				}
 				break;
@@ -1054,6 +1167,7 @@ void main() {\n\
 				case MENU_OPT_QUIT:
 					goto quit;
 				case MENU_OPT_RESOLUTION:
+				case MENU_OPT_PIXFMT:
 					camera_set_format(camera, desired_fmt, camera->access_method);
 				}
 				break;
@@ -1091,6 +1205,9 @@ void main() {\n\
 					break;
 				case MENU_OPT_INPUT:
 					option = a_sprintf("Input: %s", camera->name);
+					break;
+				case MENU_OPT_PIXFMT:
+					option = a_sprintf("Picture format: %s", pixfmt_to_string(desired_fmt.pixfmt));
 					break;
 				default:
 					assert(false);
