@@ -1,8 +1,6 @@
 /*
 TODO
--set saved image format
 -add support for more pixfmts
--screen effect when picture is taken
 -view previous pictures (thumbnails)
 -click in menus
 -left/right in resolution menu
@@ -381,6 +379,7 @@ void main() {\n\
 in vec2 tex_coord;\n\
 uniform sampler2D u_sampler;\n\
 uniform int u_pixel_format;\n\
+uniform float u_flash;\n\
 uniform float u_opacity;\n\
 void main() {\n\
 	vec3 color;\n\
@@ -396,7 +395,7 @@ void main() {\n\
 		color = texture2D(u_sampler, tex_coord).xyz;\n\
 		break;\n\
 	}\n\
-	gl_FragColor = vec4(color, opacity);\n\
+	gl_FragColor = vec4(mix(color, vec3(1.0), u_flash), opacity);\n\
 }\n\
 ";
 	char err[256] = {0};
@@ -410,6 +409,7 @@ void main() {\n\
 	gl.GenVertexArrays(1, &vao);
 	const GLuint u_sampler = gl.GetUniformLocation(program, "u_sampler");
 	const GLuint u_offset = gl.GetUniformLocation(program, "u_offset");
+	const GLuint u_flash = gl.GetUniformLocation(program, "u_flash");
 	const GLuint u_pixel_format = gl.GetUniformLocation(program, "u_pixel_format");
 	const GLuint u_scale = gl.GetUniformLocation(program, "u_scale");
 	const GLuint u_opacity = gl.GetUniformLocation(program, "u_opacity");
@@ -508,6 +508,7 @@ void main() {\n\
 		if (!camera_open(state->camera))
 			return EXIT_FAILURE;
 	}
+	double flash_time = INFINITY;
 	while(true) {
 		struct udev_device *dev = NULL;
 		while (udev_monitor && (dev = udev_monitor_receive_device(udev_monitor))) {
@@ -525,24 +526,29 @@ void main() {\n\
 		while (SDL_PollEvent(&event)) {
 			if (event.type == SDL_QUIT) goto quit;
 			if (event.type == SDL_KEYDOWN) switch (event.key.keysym.sym) {
-			case SDLK_SPACE: {
-				time_t t = time(NULL);
-				struct tm *tm = localtime(&t);
-				static char name[64];
-				strftime(name, sizeof name, "%Y-%m-%d-%H-%M-%S", tm);
-				sprintf(name + strlen(name), ".%s", image_format_extensions[state->image_format]);
-				switch (state->image_format) {
-				case IMG_FMT_JPEG:
-					camera_save_jpg(state->camera, name, 90);
-					break;
-				case IMG_FMT_PNG:
-					camera_save_png(state->camera, name);
-					break;
-				case IMG_FMT_COUNT:
-					assert(false);
-					break;
+			case SDLK_SPACE:
+				if (state->camera) {
+					time_t t = time(NULL);
+					struct tm *tm = localtime(&t);
+					static char name[64];
+					strftime(name, sizeof name, "%Y-%m-%d-%H-%M-%S", tm);
+					sprintf(name + strlen(name), ".%s", image_format_extensions[state->image_format]);
+					bool success = false;
+					switch (state->image_format) {
+					case IMG_FMT_JPEG:
+						success = camera_save_jpg(state->camera, name, 90);
+						break;
+					case IMG_FMT_PNG:
+						success = camera_save_png(state->camera, name);
+						break;
+					case IMG_FMT_COUNT:
+						assert(false);
+						break;
+					}
+					if (success)
+						flash_time = 0;
 				}
-				} break;
+				break;
 			case SDLK_ESCAPE:
 				if (state->curr_menu == MENU_NONE) {
 					state->curr_menu = MENU_MAIN;
@@ -779,6 +785,7 @@ void main() {\n\
 		clock_gettime(CLOCK_MONOTONIC, &ts);
 		double curr_time = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 		double frame_time = curr_time - last_time;
+		flash_time += frame_time;
 		last_time = curr_time;
 		
 		gl.UseProgram(program);
@@ -824,7 +831,9 @@ void main() {\n\
 		gl.Disable(GL_BLEND);
 		gl.BindBuffer(GL_ARRAY_BUFFER, vbo);
 		gl.BindVertexArray(vao);
+		gl.Uniform1f(u_flash, expf(-flash_time * 3));
 		gl.DrawArrays(GL_TRIANGLES, 0, 6);
+		gl.Uniform1f(u_flash, 0);
 		if (state->curr_menu) {
 			gl.Enable(GL_BLEND);
 			gl.ActiveTexture(GL_TEXTURE0);
