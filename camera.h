@@ -105,7 +105,7 @@ int32_t camera_frame_height(Camera *camera);
 PictureFormat camera_picture_format(Camera *camera);
 void camera_write_jpg(Camera *camera, const char *name, int quality);
 bool camera_next_frame(Camera *camera);
-void camera_update_gl_texture_2d(Camera *camera);
+void camera_update_gl_textures(Camera *camera, const GLuint textures[3]);
 const char *camera_name(Camera *camera);
 uint32_t camera_pixel_format(Camera *camera);
 CameraAccessMethod camera_access_method(Camera *camera);

@@ -353,8 +353,9 @@ bool camera_next_frame(Camera *camera) {
 		return false;
 	}
 }
-void camera_update_gl_texture_2d(Camera *camera) {
+void camera_update_gl_textures(Camera *camera, const GLuint textures[3]) {
 	int prev_align = 1;
+	gl.BindTexture(GL_TEXTURE_2D, textures[0]);
 	gl.GetIntegerv(GL_UNPACK_ALIGNMENT, &prev_align);
 	uint32_t frame_width = camera_frame_width(camera), frame_height = camera_frame_height(camera);
 	for (int align = 8; align >= 1; align >>= 1) {

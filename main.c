@@ -319,7 +319,7 @@ int main(void) {
 	struct timespec ts = {0};
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	double last_time = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-	GLuint textures[4] = {0};
+	GLuint textures[6] = {0};
 	gl.GenTextures(SDL_arraysize(textures), textures);
 	for (size_t i = 0; i < SDL_arraysize(textures); i++) {
 		gl.BindTexture(GL_TEXTURE_2D, textures[i]);
@@ -328,11 +328,11 @@ int main(void) {
 		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	}
+	GLuint menu_texture = textures[0];
+	GLuint no_camera_texture = textures[1];
+	GLuint fps_texture = textures[2];
 	// texture for camera output
-	GLuint texture = textures[0];
-	GLuint menu_texture = textures[1];
-	GLuint no_camera_texture = textures[2];
-	GLuint fps_texture = textures[3];
+	GLuint camera_textures[3] = {textures[3], textures[4], textures[5]};
 	static const int32_t no_camera_width = 1280, no_camera_height = 720;
 	{
 		// create no camera texture
@@ -352,6 +352,8 @@ int main(void) {
 		gl.BindTexture(GL_TEXTURE_2D, no_camera_texture);
 		gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, surf->pixels);
 		SDL_UnlockSurface(surf);
+		gl.GenerateMipmap(GL_TEXTURE_2D);
+		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR_MIPMAP_LINEAR);
 	}
 	const char *vshader_code = "attribute vec2 v_pos;\n\
 attribute vec2 v_tex_coord;\n\
@@ -768,12 +770,18 @@ void main() {\n\
 			}
 		}
 		if (state->camera) {
-			gl.BindTexture(GL_TEXTURE_2D, texture);
 			if (camera_next_frame(state->camera)) {
-				camera_update_gl_texture_2d(state->camera);
+				camera_update_gl_textures(state->camera, camera_textures);
 			}
 			gl.Uniform1i(u_pixel_format, camera_pixel_format(state->camera));
+			gl.ActiveTexture(GL_TEXTURE0);
+			gl.BindTexture(GL_TEXTURE_2D, camera_textures[0]);
+			gl.ActiveTexture(GL_TEXTURE1);
+			gl.BindTexture(GL_TEXTURE_2D, camera_textures[1]);
+			gl.ActiveTexture(GL_TEXTURE2);
+			gl.BindTexture(GL_TEXTURE_2D, camera_textures[2]);
 		} else {
+			gl.ActiveTexture(GL_TEXTURE0);
 			gl.BindTexture(GL_TEXTURE_2D, no_camera_texture);
 			gl.Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
 		}
