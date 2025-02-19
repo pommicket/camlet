@@ -1,26 +1,30 @@
+/*
+TODO
+-help menu
+-set saved image format
+-add support for more pixfmts
+-screen effect when picture is taken
+-view previous pictures (thumbnails)
+-click in menus
+-left/right in resolution menu
+*/
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
-#include <libv4l2.h>
 #include <linux/videodev2.h>
-#include <fcntl.h>
 #include <inttypes.h>
 #include <errno.h>
 #include <string.h>
 #include <SDL.h>
 #include <SDL_ttf.h>
 #include <time.h>
-#include <stdbool.h>
 #include <libudev.h>
 #include <sodium.h>
-#include <GL/glcorearb.h>
-#include <sys/mman.h>
-#include <poll.h>
 #include <fontconfig/fontconfig.h>
+#include <fcntl.h>
+#include <unistd.h>
 #include "ds.h"
-#include "lib/stb_image_write.h"
-
-typedef struct Camera Camera;
+#include "camera.h"
 
 typedef enum {
 	MENU_NONE,
@@ -54,565 +58,11 @@ typedef struct {
 	Camera **cameras;
 } State;
 
-#define HASH_SIZE 16
 #if crypto_generichash_BYTES_MIN > HASH_SIZE
 #error "crypto_generichash what happened"
 #endif
-typedef struct {
-	uint8_t hash[HASH_SIZE];
-} Hash;
 
-typedef struct {
-	int32_t width;
-	int32_t height;
-	uint32_t pixfmt;
-} PictureFormat;
-
-int uint32_cmp_qsort(const void *av, const void *bv) {
-	uint32_t a = *(const uint32_t *)av, b = *(const uint32_t *)bv;
-	if (a < b) return -1;
-	if (a > b) return 1;
-	return 0;
-}
-
-int picture_format_cmp_resolution(const PictureFormat *a, const PictureFormat *b) {
-	if (a->width < b->width) return -1;
-	if (a->width > b->width) return 1;
-	if (a->height < b->height) return -1;
-	if (a->height > b->height) return 1;
-	return 0;
-}
-
-int picture_format_cmp_qsort(const void *av, const void *bv) {
-	const PictureFormat *a = av, *b = bv;
-	if (a->pixfmt < b->pixfmt) return -1;
-	if (a->pixfmt > b->pixfmt) return 1;
-	int cmp = picture_format_cmp_resolution(a, b);
-	if (cmp) return cmp;
-	return 0;
-}
-
-const char *pixfmt_to_string(uint32_t pixfmt) {
-	switch (pixfmt) {
-	case V4L2_PIX_FMT_RGB332: return "RGB332";
-	case V4L2_PIX_FMT_RGB444: return "RGB444";
-	case V4L2_PIX_FMT_XRGB444: return "4bpc XRGB";
-	case V4L2_PIX_FMT_RGBX444: return "4bpc RGBX";
-	case V4L2_PIX_FMT_XBGR444: return "4bpc XBGR";
-	case V4L2_PIX_FMT_BGRX444: return "4bpc BGRX";
-	case V4L2_PIX_FMT_RGB555:  return "RGB555";
-	case V4L2_PIX_FMT_XRGB555: return "XRGB555";
-	case V4L2_PIX_FMT_RGBX555: return "RGBX555";
-	case V4L2_PIX_FMT_XBGR555: return "XBGR555";
-	case V4L2_PIX_FMT_BGRX555: return "BGRX555";
-	case V4L2_PIX_FMT_RGB565:  return "RGB565";
-	case V4L2_PIX_FMT_RGB555X: return "RGB555BE";
-	case V4L2_PIX_FMT_XRGB555X: return "XRGB555BE";
-	case V4L2_PIX_FMT_RGB565X: return "RGB565BE";
-	case V4L2_PIX_FMT_BGR24: return "8bpc BGR";
-	case V4L2_PIX_FMT_RGB24: return "8bpc RGB";
-	case V4L2_PIX_FMT_XBGR32: return "8bpc XBGR";
-	case V4L2_PIX_FMT_BGRX32: return "8bpc BGRX";
-	case V4L2_PIX_FMT_RGBX32: return "8bpc RGBX";
-	case V4L2_PIX_FMT_XRGB32: return "8bpc XRGB";
-	case V4L2_PIX_FMT_GREY: return "8-bit grayscale";
-	case V4L2_PIX_FMT_Y4: return "4-bit grayscale";
-	case V4L2_PIX_FMT_YUYV: return "YUYV 4:2:2";
-	case V4L2_PIX_FMT_YYUV: return "YYUV 4:2:2";
-	case V4L2_PIX_FMT_YVYU: return "YVYU 4:2:2";
-	case V4L2_PIX_FMT_UYVY: return "UYVY 4:2:2";
-	case V4L2_PIX_FMT_VYUY: return "VYUY 4:2:2";
-	case V4L2_PIX_FMT_YUV444: return "4bpc YUV";
-	case V4L2_PIX_FMT_YUV555: return "5bpc YUV";
-	case V4L2_PIX_FMT_YUV565: return "YUV565";
-	case V4L2_PIX_FMT_YUV24: return "8bpc YUV";
-	case V4L2_PIX_FMT_XYUV32: return "8bpc XYUV";
-	case V4L2_PIX_FMT_VUYX32: return "8bpc VUYX";
-	case V4L2_PIX_FMT_YUVX32: return "8bpc YUVX";
-	case V4L2_PIX_FMT_MJPEG:  return "MJPEG";
-	case V4L2_PIX_FMT_JPEG: return "JPEG";
-	case V4L2_PIX_FMT_MPEG: return "MPEG";
-	case V4L2_PIX_FMT_H264: return "H264";
-	case V4L2_PIX_FMT_H264_NO_SC: return "AVC1";
-	case V4L2_PIX_FMT_H264_MVC: return "H264 MVC";
-	case V4L2_PIX_FMT_H263: return "H263";
-	case V4L2_PIX_FMT_MPEG1: return "MPEG1";
-	case V4L2_PIX_FMT_MPEG2: return "MPEG2";
-	case V4L2_PIX_FMT_MPEG4: return "MPEG4";
-	case V4L2_PIX_FMT_XVID: return "XVID";
-	default: {
-		static char s[5];
-		memcpy(s, &pixfmt, 4);
-		return s;
-		}
-	}
-}
-
-bool pix_fmt_supported(uint32_t pixfmt) {
-	switch (pixfmt) {
-	case V4L2_PIX_FMT_RGB24:
-	case V4L2_PIX_FMT_BGR24:
-	case V4L2_PIX_FMT_GREY:
-		return true;
-	}
-	return false;
-}
-
-typedef enum {
-	// (default value)
-	CAMERA_ACCESS_NOT_SETUP,
-	// access camera via mmap streaming
-	CAMERA_ACCESS_MMAP,
-	// access camera via read calls
-	CAMERA_ACCESS_READ,
-	// access camera via user-pointer streaming
-	CAMERA_ACCESS_USERP,
-} CameraAccessMethod;
-
-#define CAMERA_MAX_BUFFERS 4
-struct Camera {
-	char *dev_path;
-	char *name;
-	uint32_t input_idx;
-	struct v4l2_format curr_format;
-	crypto_generichash_state hash_state;
-	int usb_busnum;
-	int usb_devnum;
-	int usb_devpath;
-	int fd;
-	Hash hash;
-	uint8_t *read_frame;
-	// number of bytes actually read into current frame.
-	// this can be variable for compressed formats, and doesn't match v4l2_format sizeimage for grayscale for example
-	size_t frame_bytes_set;
-	int curr_frame_idx;
-	int buffer_count;
-	struct v4l2_buffer frame_buffer;
-	CameraAccessMethod access_method;
-	PictureFormat best_format;
-	PictureFormat *formats;
-	size_t mmap_size[CAMERA_MAX_BUFFERS];
-	uint8_t *mmap_frames[CAMERA_MAX_BUFFERS];
-	uint8_t *userp_frames[CAMERA_MAX_BUFFERS];
-};
-
-
-/// macro trickery to avoid having to write every GL function multiple times
-#define gl_for_each_proc(do)\
-	do(DRAWARRAYS, DrawArrays)\
-	do(GENTEXTURES, GenTextures)\
-	do(DELETETEXTURES, DeleteTextures)\
-	do(GENERATEMIPMAP, GenerateMipmap)\
-	do(TEXIMAGE2D, TexImage2D)\
-	do(BINDTEXTURE, BindTexture)\
-	do(TEXPARAMETERI, TexParameteri)\
-	do(GETERROR, GetError)\
-	do(GETINTEGERV, GetIntegerv)\
-	do(ENABLE, Enable)\
-	do(DISABLE, Disable)\
-	do(BLENDFUNC, BlendFunc)\
-	do(VIEWPORT, Viewport)\
-	do(CLEARCOLOR, ClearColor)\
-	do(CLEAR, Clear)\
-	do(FINISH, Finish)\
-	do(CREATESHADER, CreateShader)\
-	do(DELETESHADER, DeleteShader)\
-	do(CREATEPROGRAM, CreateProgram)\
-	do(SHADERSOURCE, ShaderSource)\
-	do(GETSHADERIV, GetShaderiv)\
-	do(GETSHADERINFOLOG, GetShaderInfoLog)\
-	do(COMPILESHADER, CompileShader)\
-	do(CREATEPROGRAM, CreateProgram)\
-	do(DELETEPROGRAM, DeleteProgram)\
-	do(ATTACHSHADER, AttachShader)\
-	do(LINKPROGRAM, LinkProgram)\
-	do(GETPROGRAMIV, GetProgramiv)\
-	do(GETPROGRAMINFOLOG, GetProgramInfoLog)\
-	do(USEPROGRAM, UseProgram)\
-	do(GETATTRIBLOCATION, GetAttribLocation)\
-	do(GETUNIFORMLOCATION, GetUniformLocation)\
-	do(GENBUFFERS, GenBuffers)\
-	do(DELETEBUFFERS, DeleteBuffers)\
-	do(BINDBUFFER, BindBuffer)\
-	do(BUFFERDATA, BufferData)\
-	do(VERTEXATTRIBPOINTER, VertexAttribPointer)\
-	do(ENABLEVERTEXATTRIBARRAY, EnableVertexAttribArray)\
-	do(DISABLEVERTEXATTRIBARRAY, DisableVertexAttribArray)\
-	do(GENVERTEXARRAYS, GenVertexArrays)\
-	do(DELETEVERTEXARRAYS, DeleteVertexArrays)\
-	do(BINDVERTEXARRAY, BindVertexArray)\
-	do(ACTIVETEXTURE, ActiveTexture)\
-	do(UNIFORM1F, Uniform1f)\
-	do(UNIFORM2F, Uniform2f)\
-	do(UNIFORM3F, Uniform3f)\
-	do(UNIFORM4F, Uniform4f)\
-	do(UNIFORM1I, Uniform1i)\
-	do(UNIFORM2I, Uniform2i)\
-	do(UNIFORM3I, Uniform3i)\
-	do(UNIFORM4I, Uniform4i)\
-	do(UNIFORMMATRIX4FV, UniformMatrix4fv)\
-	do(DEBUGMESSAGECALLBACK, DebugMessageCallback)\
-	do(DEBUGMESSAGECONTROL, DebugMessageControl)\
-	do(PIXELSTOREI, PixelStorei)
-#define gl_define_proc(upper, lower) PFNGL##upper##PROC gl_##lower;
-gl_for_each_proc(gl_define_proc)
-#undef gl_define_proc
-
-static bool camera_setup_with_read(Camera *camera) {
-	camera->access_method = CAMERA_ACCESS_READ;
-	uint32_t image_size = camera->curr_format.fmt.pix.sizeimage;
-	camera->read_frame = realloc(camera->read_frame, image_size);
-	if (!camera->read_frame) {
-		perror("realloc");
-		return false;
-	}
-	memset(camera->read_frame, 0, image_size);
-	return camera->read_frame != NULL;
-}
-static bool camera_setup_with_mmap(Camera *camera) {
-	camera->access_method = CAMERA_ACCESS_MMAP;
-	struct v4l2_requestbuffers req = {0};
-	req.count = CAMERA_MAX_BUFFERS;
-	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	req.memory = V4L2_MEMORY_MMAP;
-	if (v4l2_ioctl(camera->fd, VIDIOC_REQBUFS, &req) != 0) {
-		perror("v4l2_ioctl VIDIOC_REQBUFS");
-		return false;
-	}
-	camera->buffer_count = req.count;
-	for (int i = 0; i < camera->buffer_count; i++) {
-		struct v4l2_buffer buf = {0};
-		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		buf.memory = V4L2_MEMORY_MMAP;
-		buf.index = i;
-		if (v4l2_ioctl(camera->fd, VIDIOC_QUERYBUF, &buf) != 0) {
-			perror("v4l2_ioctl VIDIOC_QUERYBUF");
-			return false;
-		}
-		camera->mmap_size[i] = buf.length;
-		camera->mmap_frames[i] = v4l2_mmap(NULL, buf.length, PROT_READ | PROT_WRITE,
-			MAP_SHARED, camera->fd, buf.m.offset);
-		if (camera->mmap_frames[i] == MAP_FAILED) {
-			camera->mmap_frames[i] = NULL;
-			perror("mmap");
-			return false;
-		}
-	}
-	for (int i = 0; i < camera->buffer_count; i++) {
-		struct v4l2_buffer buf = {0};
-		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		buf.memory = V4L2_MEMORY_MMAP;
-		buf.index = i;
-		if (v4l2_ioctl(camera->fd, VIDIOC_QBUF, &buf) != 0) {
-			perror("v4l2_ioctl VIDIOC_QBUF");
-			return false;
-		}
-	}
-	if (v4l2_ioctl(camera->fd,
-		VIDIOC_STREAMON,
-		(enum v4l2_buf_type[1]) { V4L2_BUF_TYPE_VIDEO_CAPTURE }) != 0) {
-		perror("v4l2_ioctl VIDIOC_STREAMON");
-		return false;
-	}
-	return true;
-}
-
-PictureFormat *camera_get_resolutions_with_pixfmt(Camera *camera, uint32_t pixfmt) {
-	PictureFormat *available = NULL;
-	arr_foreach_ptr(camera->formats, PictureFormat, fmt) {
-		if (fmt->pixfmt == pixfmt) {
-			arr_add(available, *fmt);
-		}
-	}
-	return available;
-}
-uint32_t *camera_get_pixfmts(Camera *camera) {
-	uint32_t *available = NULL;
-	arr_add(available, V4L2_PIX_FMT_RGB24);
-	arr_foreach_ptr(camera->formats, const PictureFormat, fmt) {
-		if (!pix_fmt_supported(fmt->pixfmt))
-			continue;
-		arr_foreach_ptr(available, uint32_t, prev) {
-			if (*prev == fmt->pixfmt) goto skip;
-		}
-		arr_add(available, fmt->pixfmt);
-		skip:;
-	}
-	arr_qsort(available, uint32_cmp_qsort);
-	return available;
-}
-PictureFormat camera_closest_resolution(Camera *camera, uint32_t pixfmt, int32_t desired_width, int32_t desired_height) {
-	PictureFormat best_format = {.pixfmt = pixfmt};
-	int32_t best_score = INT32_MIN;
-	arr_foreach_ptr(camera->formats, const PictureFormat, fmt) {
-		if (fmt->pixfmt != pixfmt) {
-			continue;
-		}
-		int32_t score = -abs(fmt->width - desired_width) + abs(fmt->height - desired_height);
-		if (score >= best_score) {
-			best_score = score;
-			best_format = *fmt;
-		}
-	}
-	return best_format;
-}
-
-static bool camera_setup_with_userp(Camera *camera) {
-	camera->access_method = CAMERA_ACCESS_USERP;
-	return false;
-/*
-TODO: test me with a camera that supports userptr i/o
-	struct v4l2_requestbuffers req = {0};
-	req.count = CAMERA_MAX_BUFFERS;
-	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	req.memory = V4L2_MEMORY_USERPTR;
-	if (v4l2_ioctl(camera->fd, VIDIOC_REQBUFS, &req) != 0) {
-		perror("v4l2_ioctl VIDIOC_REQBUFS");
-		return false;
-	}
-	for (int i = 0; i < CAMERA_MAX_BUFFERS; i++) {
-		camera->userp_frames[i] = calloc(1, camera->curr_format.fmt.pix.sizeimage);
-		struct v4l2_buffer buf = {0};
-		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		buf.memory = V4L2_MEMORY_USERPTR;
-		buf.index = i;
-		buf.m.userptr = (unsigned long)camera->userp_frames[i];
-		buf.length = camera->curr_format.fmt.pix.sizeimage;
-		if (v4l2_ioctl(camera->fd, VIDIOC_QBUF, &buf) != 0) {
-			perror("v4l2_ioctl VIDIOC_QBUF");
-		}
-	}
-	if (v4l2_ioctl(camera->fd,
-		VIDIOC_STREAMON,
-		(enum v4l2_buf_type[1]) { V4L2_BUF_TYPE_VIDEO_CAPTURE }) != 0) {
-		perror("v4l2_ioctl VIDIOC_STREAMON");
-		return false;
-	}
-	return true;*/
-}
-static bool camera_stop_io(Camera *camera) {
-	// Just doing VIDIOC_STREAMOFF doesn't seem to be enough to prevent EBUSY.
-	//  (Even if we dequeue all buffers afterwards)
-	// Re-opening doesn't seem to be necessary for read-based access for me,
-	// but idk if that's true on all cameras.
-	v4l2_close(camera->fd);
-	camera->fd = v4l2_open(camera->dev_path, O_RDWR);
-	if (camera->fd < 0) {
-		perror("v4l2_open");
-		return false;
-	}
-	return true;
-}
-int32_t camera_frame_width(Camera *camera) {
-	return camera->curr_format.fmt.pix.width;
-}
-int32_t camera_frame_height(Camera *camera) {
-	return camera->curr_format.fmt.pix.height;
-}
-PictureFormat camera_picture_format(Camera *camera) {
-	return (PictureFormat) {
-		.width = camera_frame_width(camera),
-		.height = camera_frame_height(camera),
-		.pixfmt = camera->curr_format.fmt.pix.pixelformat
-	};
-}
-
-static uint8_t *camera_curr_frame(Camera *camera) {
-	if (camera->read_frame)
-		return camera->read_frame;
-	if (camera->curr_frame_idx < 0)
-		return NULL;
-	if (camera->mmap_frames[camera->curr_frame_idx])
-		return camera->mmap_frames[camera->curr_frame_idx];
-	assert(camera->userp_frames[camera->curr_frame_idx]);
-	return camera->userp_frames[camera->curr_frame_idx];
-}
-void camera_write_jpg(Camera *camera, const char *name, int quality) {
-	uint8_t *frame = camera_curr_frame(camera);
-	if (frame) {
-		stbi_write_jpg(name, camera_frame_width(camera), camera_frame_height(camera), 3, frame, quality);
-	}
-}
-bool camera_next_frame(Camera *camera) {
-	struct pollfd pollfd = {.fd = camera->fd, .events = POLLIN};
-	// check whether there is any data available from camera
-	// NOTE: O_NONBLOCK on v4l2_camera doesn't seem to work, at least on my camera
-	if (poll(&pollfd, 1, 1) <= 0) {
-		return false;
-	}
-	switch (camera->access_method) {
-	uint32_t memory;
-	case CAMERA_ACCESS_NOT_SETUP:
-		return false;
-	case CAMERA_ACCESS_READ:
-		camera->frame_bytes_set = v4l2_read(camera->fd, camera->read_frame, camera->curr_format.fmt.pix.sizeimage);
-		return true;
-	case CAMERA_ACCESS_MMAP:
-		memory = V4L2_MEMORY_MMAP;
-		goto buf;
-	case CAMERA_ACCESS_USERP:
-		memory = V4L2_MEMORY_USERPTR;
-		goto buf;
-	buf: {
-		if (camera->frame_buffer.type) {
-			// queue back in previous buffer
-			v4l2_ioctl(camera->fd, VIDIOC_QBUF, &camera->frame_buffer);
-			camera->frame_buffer.type = 0;
-		}
-		struct v4l2_buffer buf = {0};
-		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		buf.memory = memory;
-		if (v4l2_ioctl(camera->fd, VIDIOC_DQBUF, &buf) != 0) {
-			static bool printed_error;
-			if (!printed_error) {
-				perror("v4l2_ioctl VIDIOC_DQBUF");
-				printed_error = true;
-			}
-			return false;
-		}
-		camera->frame_bytes_set = buf.bytesused;
-		camera->curr_frame_idx = buf.index;
-		camera->frame_buffer = buf;
-		return true;
-		}
-	default:
-		#if DEBUG
-		assert(false);
-		#endif
-		return false;
-	}
-}
-void camera_update_gl_texture_2d(Camera *camera) {
-	uint32_t frame_width = camera_frame_width(camera), frame_height = camera_frame_height(camera);
-	for (int align = 8; align >= 1; align >>= 1) {
-		if (frame_width % align == 0) {
-			gl_PixelStorei(GL_UNPACK_ALIGNMENT, align);
-			break;
-		}
-	}
-	uint8_t *curr_frame = camera_curr_frame(camera);
-	if (curr_frame) {
-		switch (camera->curr_format.fmt.pix.pixelformat) {
-		case V4L2_PIX_FMT_RGB24:
-			if (camera->frame_bytes_set >= frame_width * frame_height * 3)
-				gl_TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame_width, frame_height, 0, GL_RGB, GL_UNSIGNED_BYTE, curr_frame);
-			break;
-		case V4L2_PIX_FMT_BGR24:
-			if (camera->frame_bytes_set >= frame_width * frame_height * 3)
-				gl_TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame_width, frame_height, 0, GL_BGR, GL_UNSIGNED_BYTE, curr_frame);
-			break;
-		case V4L2_PIX_FMT_GREY:
-			if (camera->frame_bytes_set >= frame_width * frame_height)
-				gl_TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width, frame_height, 0, GL_RED, GL_UNSIGNED_BYTE, curr_frame);
-			break;
-		}
-	}
-}
-
-const char *camera_name(Camera *camera) {
-	return camera->name;
-}
-
-uint32_t camera_pixel_format(Camera *camera) {
-	return camera->curr_format.fmt.pix.pixelformat;
-}
-
-CameraAccessMethod camera_access_method(Camera *camera) {
-	return camera->access_method;
-}
-
-void camera_close(Camera *camera) {
-	free(camera->read_frame);
-	camera->read_frame = NULL;
-	for (int i = 0; i < CAMERA_MAX_BUFFERS; i++) {
-		if (camera->mmap_frames[i]) {
-			v4l2_munmap(camera->mmap_frames[i], camera->mmap_size[i]);
-			camera->mmap_frames[i] = NULL;
-		}
-		free(camera->userp_frames[i]);
-		camera->userp_frames[i] = NULL;
-	}
-	if (camera->fd >= 0)
-		v4l2_close(camera->fd);
-}
-
-void camera_free(Camera *camera) {
-	camera_close(camera);
-	free(camera);
-}
-
-bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod access, bool force) {
-	if (!force
-		&& camera->access_method == access
-		&& picture_format_cmp_qsort((PictureFormat[1]) { camera_picture_format(camera) }, &picfmt) == 0) {
-		// no changes needed
-		return true;
-	}
-	camera->access_method = access;
-	for (int i = 0; i < camera->buffer_count; i++) {
-		if (camera->mmap_frames[i]) {
-			v4l2_munmap(camera->mmap_frames[i], camera->mmap_size[i]);
-			camera->mmap_frames[i] = NULL;
-		}
-	}
-	free(camera->read_frame);
-	camera->read_frame = NULL;
-	struct v4l2_format format = {0};
-	camera_stop_io(camera); // prevent EBUSY when changing format
-	format.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	format.fmt.pix.field = V4L2_FIELD_ANY;
-	// v4l2 should be able to output rgb24 for all reasonable cameras
-	uint32_t pixfmt = V4L2_PIX_FMT_RGB24;
-	switch (picfmt.pixfmt) {
-	// we can actually handle these pixel formats
-	case V4L2_PIX_FMT_BGR24:
-	case V4L2_PIX_FMT_GREY:
-		pixfmt = picfmt.pixfmt;
-		break;
-	}
-	format.fmt.pix.pixelformat = pixfmt;
-	format.fmt.pix.width = picfmt.width;
-	format.fmt.pix.height = picfmt.height;
-	if (v4l2_ioctl(camera->fd, VIDIOC_S_FMT, &format) != 0) {
-		perror("v4l2_ioctl VIDIOC_S_FMT");
-		return false;
-	}
-	camera->curr_format = format;
-	//printf("image size = %uB\n",format.fmt.pix.sizeimage);
-	switch (camera->access_method) {
-	case CAMERA_ACCESS_READ:
-		return camera_setup_with_read(camera);
-	case CAMERA_ACCESS_MMAP:
-		return camera_setup_with_mmap(camera);
-	case CAMERA_ACCESS_USERP:
-		return camera_setup_with_userp(camera);
-	default:
-		#if DEBUG
-		assert(false);
-		#endif
-		return false;
-	}
-}
-
-bool camera_open(Camera *camera) {
-	if (!camera->access_method)
-		camera->access_method = CAMERA_ACCESS_MMAP;
-	// camera should not already be open
-	assert(!camera->read_frame);
-	assert(!camera->mmap_frames[0]);
-	assert(!camera->userp_frames[0]);
-	camera->fd = v4l2_open(camera->dev_path, O_RDWR);
-	if (camera->fd < 0) {
-		perror("v4l2_open");
-		return false;
-	}
-	if (v4l2_ioctl(camera->fd, VIDIOC_S_INPUT, &camera->input_idx) != 0) {
-		perror("v4l2_ioctl");
-		return false;
-	}
-	camera_set_format(camera, camera->best_format, camera->access_method, true);
-	return true;
-}
+static GlProcs gl;
 
 #if DEBUG
 static void APIENTRY gl_message_callback(GLenum source, GLenum type, unsigned int id, GLenum severity, 
@@ -659,33 +109,9 @@ static void debug_save_24bpp_bmp(const char *filename, const uint8_t *pixels, ui
 	fclose(fp);
 }
 
-char *va_sprintf(const char *fmt, va_list args) {
-	va_list args_copy;
-	va_copy(args_copy, args);
-	char fakebuf[2] = {0};
-	int ret = vsnprintf(fakebuf, 1, fmt, args_copy);
-	va_end(args_copy);
-	
-	if (ret < 0) return NULL; // bad format or something
-	size_t n = (size_t)ret;
-	char *str = calloc(1, n + 1);
-	vsnprintf(str, n + 1, fmt, args);
-	return str;
-}
-
-char *a_sprintf(PRINTF_FORMAT_STRING const char *fmt, ...) ATTRIBUTE_PRINTF(1, 2);
-char *a_sprintf(const char *fmt, ...) {
-	// idk if you can always just pass NULL to vsnprintf
-	va_list args;
-	va_start(args, fmt);
-	char *str = va_sprintf(fmt, args);
-	va_end(args);
-	return str;
-}
-
 // compile a GLSL shader
 GLuint gl_compile_shader(char error_buf[256], const char *code, GLenum shader_type) {
-	GLuint shader = gl_CreateShader(shader_type);
+	GLuint shader = gl.CreateShader(shader_type);
 	char header[128];
 	snprintf(header, sizeof header, "#version 130\n\
 #line 1\n");
@@ -693,13 +119,13 @@ GLuint gl_compile_shader(char error_buf[256], const char *code, GLenum shader_ty
 		header,
 		code
 	};
-	gl_ShaderSource(shader, 2, sources, NULL);
-	gl_CompileShader(shader);
+	gl.ShaderSource(shader, 2, sources, NULL);
+	gl.CompileShader(shader);
 	GLint status = 0;
-	gl_GetShaderiv(shader, GL_COMPILE_STATUS, &status);
+	gl.GetShaderiv(shader, GL_COMPILE_STATUS, &status);
 	if (status == GL_FALSE) {
 		char log[1024] = {0};
-		gl_GetShaderInfoLog(shader, sizeof log - 1, NULL, log);
+		gl.GetShaderInfoLog(shader, sizeof log - 1, NULL, log);
 		if (error_buf) {
 			snprintf(error_buf, 256, "Error compiling shader: %s", log);
 		} else {
@@ -712,27 +138,27 @@ GLuint gl_compile_shader(char error_buf[256], const char *code, GLenum shader_ty
 
 // link together GL shaders
 GLuint gl_link_program(char error_buf[256], GLuint *shaders, size_t count) {
-	GLuint program = gl_CreateProgram();
+	GLuint program = gl.CreateProgram();
 	if (program) {
 		for (size_t i = 0; i < count; ++i) {
 			if (!shaders[i]) {
-				gl_DeleteProgram(program);
+				gl.DeleteProgram(program);
 				return 0;
 			}
-			gl_AttachShader(program, shaders[i]);
+			gl.AttachShader(program, shaders[i]);
 		}
-		gl_LinkProgram(program);
+		gl.LinkProgram(program);
 		GLint status = 0;
-		gl_GetProgramiv(program, GL_LINK_STATUS, &status);
+		gl.GetProgramiv(program, GL_LINK_STATUS, &status);
 		if (status == GL_FALSE) {
 			char log[1024] = {0};
-			gl_GetProgramInfoLog(program, sizeof log - 1, NULL, log);
+			gl.GetProgramInfoLog(program, sizeof log - 1, NULL, log);
 			if (error_buf) {
 				snprintf(error_buf, 256, "Error linking shaders: %s", log);
 			} else {
 				printf("Error linking shaders: %s\n", log);
 			}
-			gl_DeleteProgram(program);
+			gl.DeleteProgram(program);
 			return 0;
 		}
 	}
@@ -744,122 +170,12 @@ GLuint gl_compile_and_link_shaders(char error_buf[256], const char *vshader_code
 	shaders[0] = gl_compile_shader(error_buf, vshader_code, GL_VERTEX_SHADER);
 	shaders[1] = gl_compile_shader(error_buf, fshader_code, GL_FRAGMENT_SHADER);
 	GLuint program = gl_link_program(error_buf, shaders, 2);
-	if (shaders[0]) gl_DeleteShader(shaders[0]);
-	if (shaders[1]) gl_DeleteShader(shaders[1]);
+	if (shaders[0]) gl.DeleteShader(shaders[0]);
+	if (shaders[1]) gl.DeleteShader(shaders[1]);
 	if (program) {
 		printf("Successfully linked program %u.\n", program);
 	}
 	return program;
-}
-
-
-void cameras_from_device(const char *dev_path, const char *serial, int fd, Camera ***cameras) {
-	struct v4l2_capability cap = {0};
-	v4l2_ioctl(fd, VIDIOC_QUERYCAP, &cap);
-	if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) return;
-	struct v4l2_input input = {0};
-	for (uint32_t input_idx = 0; ; input_idx++) {
-		input.index = input_idx;
-		if (v4l2_ioctl(fd, VIDIOC_ENUMINPUT, &input) == -1) break;
-		if (input.type != V4L2_INPUT_TYPE_CAMERA) continue;
-		Camera *camera = calloc(1, sizeof *camera);
-		if (!camera) {
-			perror("calloc");
-			return;
-		}
-		camera->fd = -1;
-		camera->curr_frame_idx = -1;
-		crypto_generichash_init(&camera->hash_state, NULL, 0, HASH_SIZE);
-		crypto_generichash_update(&camera->hash_state, cap.card, strlen((const char *)cap.card) + 1);
-		crypto_generichash_update(&camera->hash_state, input.name, strlen((const char *)input.name) + 1);
-		struct v4l2_fmtdesc fmtdesc = {0};
-		printf("-----\n");
-		for (uint32_t fmt_idx = 0; ; fmt_idx++) {
-			fmtdesc.index = fmt_idx;
-			fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-			if (v4l2_ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) == -1) break;
-			uint32_t fourcc[2] = {fmtdesc.pixelformat, 0};
-			printf("  - %s (%s)\n",fmtdesc.description, (const char *)fourcc);
-			struct v4l2_frmsizeenum frmsize = {0};
-			if (serial && *serial)
-				crypto_generichash_update(&camera->hash_state, (const uint8_t *)serial, strlen(serial) + 1);
-			const char *bus_info = (const char *)cap.bus_info;
-			int usb_busnum = 0;
-			int usb_devnum = 0;
-			int usb_devpath = 0;
-			if (strlen(bus_info) >= 18 && strlen(bus_info) <= 20 &&
-				// what are those mystery 0s in the bus_info referring to.. . who knows...
-				sscanf(bus_info, "usb-0000:%d:00.%d-%d", &usb_busnum, &usb_devnum, &usb_devpath) == 3) {
-				camera->usb_busnum = usb_busnum;
-				camera->usb_devnum = usb_devnum;
-				camera->usb_devpath = usb_devpath;
-			} else {
-				camera->usb_busnum = -1;
-				camera->usb_devnum = -1;
-				camera->usb_devpath = -1;
-			}
-			for (uint32_t frmsz_idx = 0; ; frmsz_idx++) {
-				frmsize.index = frmsz_idx;
-				frmsize.pixel_format = fmtdesc.pixelformat;
-				if (v4l2_ioctl(fd, VIDIOC_ENUM_FRAMESIZES, &frmsize) == -1) break;
-				// are there even any stepwise cameras out there?? who knows.
-				uint32_t frame_width = frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE ? frmsize.discrete.width : frmsize.stepwise.max_width;
-				uint32_t frame_height = frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE ? frmsize.discrete.height : frmsize.stepwise.max_height;
-				arr_add(camera->formats, ((PictureFormat) {
-					.width = frame_width,
-					.height = frame_height,
-					.pixfmt = fmtdesc.pixelformat,
-				}));
-			}
-		}
-		if (arr_len(camera->formats) == 0) {
-			free(camera);
-			continue;
-		}
-		arr_qsort(camera->formats, picture_format_cmp_qsort);
-		// deduplicate
-		{
-			int i, o;
-			for (o = 0, i = 0; i < (int)arr_len(camera->formats); i++) {
-				if (i == 0 || picture_format_cmp_qsort(&camera->formats[i-1], &camera->formats[i]) != 0) {
-					camera->formats[o++] = camera->formats[i];
-				}
-			}
-			arr_set_len(camera->formats, o);
-		}
-		camera->input_idx = input_idx;
-		camera->dev_path = strdup(dev_path);
-		// select best format
-		PictureFormat best_format = {0};
-		uint32_t desired_format = V4L2_PIX_FMT_RGB24;
-		crypto_generichash_update(&camera->hash_state, (const uint8_t *)(const uint32_t [1]){arr_len(camera->formats)}, 4);
-		arr_foreach_ptr(camera->formats, PictureFormat, fmt) {
-			// Now you might think do we really need this?
-			// Is it really not enough to use the device name, input name, and serial number to uniquely identify a camera??
-			// No. you fool. Of course there is a Logitech camera with an infrared sensor (for face recognition)
-			// that shows up as two video devices with identical names, capabilities, input names, etc. etc.
-			// and the only way to distinguish them is the picture formats they support.
-			// Oddly Windows doesn't show the infrared camera as an input device.
-			// I wonder if there is some way of detecting which one is the "normal" camera.
-			// Or perhaps Windows has its own special proprietary driver and we have no way of knowing.
-			crypto_generichash_update(&camera->hash_state, (const uint8_t *)&fmt->pixfmt, sizeof fmt->pixfmt);
-			crypto_generichash_update(&camera->hash_state, (const uint8_t *)&fmt->width, sizeof fmt->width);
-			crypto_generichash_update(&camera->hash_state, (const uint8_t *)&fmt->height, sizeof fmt->height);
-			if (best_format.pixfmt == desired_format && fmt->pixfmt != desired_format) {
-				continue;
-			}
-			if ((fmt->pixfmt == desired_format && best_format.pixfmt != desired_format)
-				|| fmt->width > best_format.width) {
-				best_format = *fmt;
-			}
-		}
-		camera->best_format = best_format;
-		camera->name = a_sprintf(
-			"%s %s (up to %" PRIu32 "x%" PRIu32 ")", (const char *)cap.card, (const char *)input.name,
-			best_format.width, best_format.height
-		);
-		arr_add(*cameras, camera);
-	}
 }
 
 static int menu_option_count(State *state) {
@@ -975,36 +291,37 @@ int main(void) {
 	#pragma GCC diagnostic push
 	#pragma GCC diagnostic ignored "-Wpedantic"
 	#endif
-	#define gl_get_proc(upper, lower) gl_##lower = (PFNGL##upper##PROC)SDL_GL_GetProcAddress("gl" #lower);
+	#define gl_get_proc(upper, lower) gl.lower = (PFNGL##upper##PROC)SDL_GL_GetProcAddress("gl" #lower);
 	gl_for_each_proc(gl_get_proc);
 	#if __GNUC__
 	#pragma GCC diagnostic pop
 	#endif
+	camera_init(&gl);
 	#if DEBUG
 	{
 		GLint flags = 0;
-		gl_GetIntegerv(GL_CONTEXT_FLAGS, &flags);
-		gl_Enable(GL_DEBUG_OUTPUT);
-		gl_Enable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
+		gl.GetIntegerv(GL_CONTEXT_FLAGS, &flags);
+		gl.Enable(GL_DEBUG_OUTPUT);
+		gl.Enable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
 		if (flags & GL_CONTEXT_FLAG_DEBUG_BIT) {
 			// set up debug message callback
-			gl_DebugMessageCallback(gl_message_callback, NULL);
-			gl_DebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, NULL, GL_TRUE);
+			gl.DebugMessageCallback(gl_message_callback, NULL);
+			gl.DebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, NULL, GL_TRUE);
 		}
 	}
 	#endif
-	gl_BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+	gl.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 	struct timespec ts = {0};
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	double last_time = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 	GLuint textures[3] = {0};
-	gl_GenTextures(SDL_arraysize(textures), textures);
+	gl.GenTextures(SDL_arraysize(textures), textures);
 	for (size_t i = 0; i < SDL_arraysize(textures); i++) {
-		gl_BindTexture(GL_TEXTURE_2D, textures[i]);
-		gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
-		gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-		gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
-		gl_TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+		gl.BindTexture(GL_TEXTURE_2D, textures[i]);
+		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	}
 	// texture for camera output
 	GLuint texture = textures[0];
@@ -1026,8 +343,8 @@ int main(void) {
 		render_text_to_surface_anchored(font, surf, w / 2, h / 2, (SDL_Color){255, 255, 255, 255},
 			"No Camera", 0, 0);
 		SDL_LockSurface(surf);
-		gl_BindTexture(GL_TEXTURE_2D, no_camera_texture);
-		gl_TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, surf->pixels);
+		gl.BindTexture(GL_TEXTURE_2D, no_camera_texture);
+		gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, surf->pixels);
 		SDL_UnlockSurface(surf);
 	}
 	const char *vshader_code = "attribute vec2 v_pos;\n\
@@ -1064,8 +381,8 @@ void main() {\n\
 	}
 	if (program == 0) return EXIT_FAILURE;
 	GLuint vbo = 0, vao = 0;
-	gl_GenBuffers(1, &vbo);
-	gl_GenVertexArrays(1, &vao);
+	gl.GenBuffers(1, &vbo);
+	gl.GenVertexArrays(1, &vao);
 	typedef struct {
 		float pos[2];
 		float tex_coord[2];
@@ -1080,19 +397,19 @@ void main() {\n\
 		{ {{-1, -1}, {0, 0}}, {{1, -1}, {1, 0}}, {{1, 1}, {1, 1}} },
 	};
 	int ntriangles = sizeof triangles / sizeof triangles[0];
-	GLuint u_sampler = gl_GetUniformLocation(program, "u_sampler");
-	GLuint u_pixel_format = gl_GetUniformLocation(program, "u_pixel_format");
-	GLuint u_scale = gl_GetUniformLocation(program, "u_scale");
-	GLuint u_opacity = gl_GetUniformLocation(program, "u_opacity");
-	GLint v_pos = gl_GetAttribLocation(program, "v_pos");
-	GLint v_tex_coord = gl_GetAttribLocation(program, "v_tex_coord");
-	gl_BindBuffer(GL_ARRAY_BUFFER, vbo);
-	gl_BindVertexArray(vao);
-	gl_BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(ntriangles * sizeof(Triangle)), triangles, GL_STATIC_DRAW);
-	gl_VertexAttribPointer(v_pos, 2, GL_FLOAT, 0, sizeof(Vertex), (void *)offsetof(Vertex, pos));
-	gl_EnableVertexAttribArray(v_pos);
-	gl_VertexAttribPointer(v_tex_coord, 2, GL_FLOAT, 0, sizeof(Vertex), (void *)offsetof(Vertex, tex_coord));
-	gl_EnableVertexAttribArray(v_tex_coord);
+	GLuint u_sampler = gl.GetUniformLocation(program, "u_sampler");
+	GLuint u_pixel_format = gl.GetUniformLocation(program, "u_pixel_format");
+	GLuint u_scale = gl.GetUniformLocation(program, "u_scale");
+	GLuint u_opacity = gl.GetUniformLocation(program, "u_opacity");
+	GLint v_pos = gl.GetAttribLocation(program, "v_pos");
+	GLint v_tex_coord = gl.GetAttribLocation(program, "v_tex_coord");
+	gl.BindBuffer(GL_ARRAY_BUFFER, vbo);
+	gl.BindVertexArray(vao);
+	gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(ntriangles * sizeof(Triangle)), triangles, GL_STATIC_DRAW);
+	gl.VertexAttribPointer(v_pos, 2, GL_FLOAT, 0, sizeof(Vertex), (void *)offsetof(Vertex, pos));
+	gl.EnableVertexAttribArray(v_pos);
+	gl.VertexAttribPointer(v_tex_coord, 2, GL_FLOAT, 0, sizeof(Vertex), (void *)offsetof(Vertex, tex_coord));
+	gl.EnableVertexAttribArray(v_tex_coord);
 	struct udev *udev = udev_new();
 	struct udev_monitor *udev_monitor = udev_monitor_new_from_netlink(udev, "udev");
 	udev_monitor_filter_add_match_subsystem_devtype(udev_monitor, "video4linux", NULL);
@@ -1113,7 +430,16 @@ void main() {\n\
 	{
 		struct udev_enumerate *enumerate = udev_enumerate_new(udev);
 		udev_enumerate_add_match_subsystem(enumerate, "video4linux");
+		/*
 		udev_enumerate_add_match_subsystem(enumerate, "usb");
+		udev_list_entry_foreach(device, devices) {
+			const char *serial = udev_device_get_sysattr_value(dev, "serial");
+			if (!serial || !*serial) continue;
+			TODO: walk through device directory here to see if it has any video4linux children.
+			NOTE: bus_info seems to be not a good way of identifying devices (it's a bit mysterious)
+			      and we'd have to support nested USB hubs which is a pain anyways.
+		}
+		*/
 		udev_enumerate_scan_devices(enumerate);
 		struct udev_list_entry *device = NULL, *devices = udev_enumerate_get_list_entry(enumerate);
 		udev_list_entry_foreach(device, devices) {
@@ -1130,52 +456,20 @@ void main() {\n\
 					goto cont;
 				}
 				if (status) break;
-				int fd = v4l2_open(devnode, O_RDWR);
-				if (fd < 0) {
-					perror("v4l2_open");
-					goto cont;
-				}
-				cameras_from_device(devnode, serial, fd, &state->cameras);
-				v4l2_close(fd);
+				printf("---%s\n",devnode);
+				cameras_from_device(devnode, serial, &state->cameras);
 			}
 			cont:
 			udev_device_unref(dev);
 		}
-		udev_list_entry_foreach(device, devices) {
-			struct udev_device *dev = udev_device_new_from_syspath(udev, udev_list_entry_get_name(device));
-			const char *busnum_str = udev_device_get_sysattr_value(dev, "busnum");
-			if (!busnum_str) continue;
-			const char *devnum_str = udev_device_get_sysattr_value(dev, "devnum");
-			if (!devnum_str) continue;
-			const char *devpath_str = udev_device_get_sysattr_value(dev, "devpath");
-			if (!devpath_str) continue;
-			const char *serial = udev_device_get_sysattr_value(dev, "serial");
-			if (!serial || !*serial) continue;
-			int busnum = atoi(busnum_str);
-			int devnum = atoi(devnum_str);
-			int devpath = atoi(devpath_str);
-			arr_foreach_ptr(state->cameras, Camera *, pcamera) {
-				Camera *camera = *pcamera;
-				// allows us to distinguish between different instances of the exact same model of camera
-				if (camera->usb_busnum == busnum && camera->usb_devnum == devnum && camera->usb_devpath == devpath) {
-					crypto_generichash_update(&camera->hash_state, (const uint8_t *)serial, strlen(serial) + 1);
-				}
-			}
-			udev_device_unref(dev);
-		}
 		udev_enumerate_unref(enumerate);
-		arr_foreach_ptr(state->cameras, Camera *, pcamera) {
-			Camera *camera = *pcamera;
-			memset(camera->hash.hash, 0, sizeof camera->hash.hash);
-			crypto_generichash_final(&camera->hash_state, camera->hash.hash, sizeof camera->hash.hash);
-		}
 		printf("---CAMERAS---\n");
 		for (size_t i = 0; i < arr_len(state->cameras); i++) {
 			Camera *camera = state->cameras[i];
-			printf("[%zu] %s ", i, camera->name);
-			for (size_t h = 0; h < sizeof camera->hash.hash; h++) {
-				printf("%02x", camera->hash.hash[h]);
-			}
+			printf("[%zu] %s ", i, camera_name(camera));
+			char buf[HASH_SIZE * 2 + 1] = {0};
+			camera_hash_str(camera, buf);
+			printf("%s", buf);
 			printf("\n");
 		}
 	}
@@ -1397,24 +691,24 @@ void main() {\n\
 			}
 			arr_free(pixfmts);
 			arr_free(resolutions);
-			gl_BindTexture(GL_TEXTURE_2D, menu_texture);
+			gl.BindTexture(GL_TEXTURE_2D, menu_texture);
 			SDL_LockSurface(menu);
-			gl_TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, menu_width, menu_height, 0, GL_RGB, GL_UNSIGNED_BYTE, menu->pixels);
+			gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, menu_width, menu_height, 0, GL_RGB, GL_UNSIGNED_BYTE, menu->pixels);
 			SDL_UnlockSurface(menu);
 			SDL_FreeSurface(menu);
 		}
-		gl_Viewport(0, 0, window_width, window_height);
-		gl_ClearColor(0, 0, 0, 1);
-		gl_Clear(GL_COLOR_BUFFER_BIT);
+		gl.Viewport(0, 0, window_width, window_height);
+		gl.ClearColor(0, 0, 0, 1);
+		gl.Clear(GL_COLOR_BUFFER_BIT);
 		clock_gettime(CLOCK_MONOTONIC, &ts);
 		double t = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 //		printf("%.1fms frame time\n",(t-last_time)*1000);
 		last_time = t; (void)last_time;
 		
-		gl_UseProgram(program);
-		gl_ActiveTexture(GL_TEXTURE0);
-		gl_Uniform1i(u_sampler, 0);
-		gl_Uniform1f(u_opacity, 1);
+		gl.UseProgram(program);
+		gl.ActiveTexture(GL_TEXTURE0);
+		gl.Uniform1i(u_sampler, 0);
+		gl.Uniform1f(u_opacity, 1);
 		{
 			// letterboxing
 			const uint32_t frame_width = state->camera ? camera_frame_width(state->camera) : no_camera_width;
@@ -1423,40 +717,40 @@ void main() {\n\
 				// window is wider than picture
 				float letterbox_size = window_width - (float)window_height / frame_height * frame_width;
 				letterbox_size /= window_width;
-				gl_Uniform2f(u_scale, 1-letterbox_size, 1);
+				gl.Uniform2f(u_scale, 1-letterbox_size, 1);
 			} else if ((uint64_t)window_width * frame_height < (uint64_t)frame_width * window_height) {
 				// window is narrower than picture
 				float letterbox_size = window_height - (float)window_width / frame_width * frame_height;
 				letterbox_size /= window_height;
-				gl_Uniform2f(u_scale, 1, 1-letterbox_size);
+				gl.Uniform2f(u_scale, 1, 1-letterbox_size);
 			} else {
 				// don't mess with fp inaccuracy
-				gl_Uniform2f(u_scale, 1, 1);
+				gl.Uniform2f(u_scale, 1, 1);
 			}
 		}
 		if (state->camera) {
-			gl_BindTexture(GL_TEXTURE_2D, texture);
+			gl.BindTexture(GL_TEXTURE_2D, texture);
 			if (camera_next_frame(state->camera)) {
 				camera_update_gl_texture_2d(state->camera);
 			}
-			gl_Uniform1i(u_pixel_format, camera_pixel_format(state->camera));
+			gl.Uniform1i(u_pixel_format, camera_pixel_format(state->camera));
 		} else {
-			gl_BindTexture(GL_TEXTURE_2D, no_camera_texture);
-			gl_Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
+			gl.BindTexture(GL_TEXTURE_2D, no_camera_texture);
+			gl.Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
 		}
-		gl_Disable(GL_BLEND);
-		gl_BindBuffer(GL_ARRAY_BUFFER, vbo);
-		gl_BindVertexArray(vao);
-		gl_DrawArrays(GL_TRIANGLES, 0, (GLsizei)(3 * ntriangles));
+		gl.Disable(GL_BLEND);
+		gl.BindBuffer(GL_ARRAY_BUFFER, vbo);
+		gl.BindVertexArray(vao);
+		gl.DrawArrays(GL_TRIANGLES, 0, (GLsizei)(3 * ntriangles));
 		if (state->curr_menu) {
-			gl_Enable(GL_BLEND);
-			gl_ActiveTexture(GL_TEXTURE0);
-			gl_BindTexture(GL_TEXTURE_2D, menu_texture);
-			gl_Uniform2f(u_scale, (float)menu_width / window_width, (float)menu_height / window_height);
-			gl_Uniform1i(u_sampler, 0);
-			gl_Uniform1f(u_opacity, 0.9f);
-			gl_Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
-			gl_DrawArrays(GL_TRIANGLES, 0, (GLsizei)(3 * ntriangles));
+			gl.Enable(GL_BLEND);
+			gl.ActiveTexture(GL_TEXTURE0);
+			gl.BindTexture(GL_TEXTURE_2D, menu_texture);
+			gl.Uniform2f(u_scale, (float)menu_width / window_width, (float)menu_height / window_height);
+			gl.Uniform1i(u_sampler, 0);
+			gl.Uniform1f(u_opacity, 0.9f);
+			gl.Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
+			gl.DrawArrays(GL_TRIANGLES, 0, (GLsizei)(3 * ntriangles));
 		}
 		SDL_GL_SwapWindow(window);
 	}

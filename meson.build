@@ -17,4 +17,4 @@ if get_option('debug')
 else
 	debug_def = '-DDEBUG=0'
 endif
-executable('camlet', 'main.c', 'lib/stb_image_write.c', dependencies: [v4l2, sdl2, sdl2_ttf, gl, udev, sodium, fontconfig], c_args: ['-Wno-unused-function', '-Wno-format-truncation', '-Wshadow', debug_def])
+executable('camlet', 'main.c', 'camera.c', '3rd_party/stb_image_write.c', dependencies: [v4l2, sdl2, sdl2_ttf, gl, udev, sodium, fontconfig], c_args: ['-Wno-unused-function', '-Wno-format-truncation', '-Wshadow', debug_def])
