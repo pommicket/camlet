@@ -298,10 +298,16 @@ static uint8_t *camera_curr_frame(Camera *camera) {
 	assert(camera->userp_frames[camera->curr_frame_idx]);
 	return camera->userp_frames[camera->curr_frame_idx];
 }
-void camera_write_jpg(Camera *camera, const char *name, int quality) {
+void camera_save_jpg(Camera *camera, const char *name, int quality) {
 	uint8_t *frame = camera_curr_frame(camera);
 	if (frame) {
 		stbi_write_jpg(name, camera_frame_width(camera), camera_frame_height(camera), 3, frame, quality);
+	}
+}
+void camera_save_png(Camera *camera, const char *name) {
+	uint8_t *frame = camera_curr_frame(camera);
+	if (frame) {
+		stbi_write_png(name, camera_frame_width(camera), camera_frame_height(camera), 3, frame, camera_frame_width(camera) * 3);
 	}
 }
 bool camera_next_frame(Camera *camera) {

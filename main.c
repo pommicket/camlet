@@ -43,16 +43,27 @@ enum {
 	MENU_OPT_RESOLUTION,
 	MENU_OPT_INPUT,
 	MENU_OPT_PIXFMT,
+	MENU_OPT_IMGFMT,
 };
 // use char for MenuOption type so that we can use strlen
 typedef char MenuOption;
 static const MenuOption main_menu[] = {
 	MENU_OPT_INPUT,
 	MENU_OPT_RESOLUTION,
+	MENU_OPT_IMGFMT,
 	MENU_OPT_PIXFMT,
 	MENU_OPT_QUIT,
 	0
 };
+
+typedef enum {
+	IMG_FMT_JPEG,
+	IMG_FMT_PNG,
+
+	IMG_FMT_COUNT,
+} ImageFormat;
+static const char *const image_format_names[IMG_FMT_COUNT] = {"JPEG", "PNG"};
+static const char *const image_format_extensions[IMG_FMT_COUNT] = {"jpg", "png"};
 
 typedef struct {
 	Menu curr_menu;
@@ -60,6 +71,7 @@ typedef struct {
 	bool show_fps;
 	Camera *camera;
 	Camera **cameras;
+	ImageFormat image_format;
 } State;
 
 #if crypto_generichash_BYTES_MIN > HASH_SIZE
@@ -516,9 +528,20 @@ void main() {\n\
 			case SDLK_SPACE: {
 				time_t t = time(NULL);
 				struct tm *tm = localtime(&t);
-				char name[256];
-				strftime(name, sizeof name, "%Y-%m-%d-%H-%M-%S.jpg", tm);
-				camera_write_jpg(state->camera, name, 90);
+				static char name[64];
+				strftime(name, sizeof name, "%Y-%m-%d-%H-%M-%S", tm);
+				sprintf(name + strlen(name), ".%s", image_format_extensions[state->image_format]);
+				switch (state->image_format) {
+				case IMG_FMT_JPEG:
+					camera_save_jpg(state->camera, name, 90);
+					break;
+				case IMG_FMT_PNG:
+					camera_save_png(state->camera, name);
+					break;
+				case IMG_FMT_COUNT:
+					assert(false);
+					break;
+				}
 				} break;
 			case SDLK_ESCAPE:
 				if (state->curr_menu == MENU_NONE) {
@@ -550,6 +573,12 @@ void main() {\n\
 				break;
 			case SDLK_F2:
 				state->show_fps = !state->show_fps;
+				break;
+			case SDLK_LEFT:
+				if (state->curr_menu == MENU_MAIN && state->menu_sel[MENU_MAIN] == MENU_OPT_IMGFMT) {
+					state->image_format = state->image_format == 0 ? IMG_FMT_COUNT - 1 : state->image_format - 1;
+					menu_needs_rerendering = true;
+				}
 				break;
 			case SDLK_RIGHT:
 			case SDLK_RETURN:
@@ -593,6 +622,10 @@ void main() {\n\
 							}
 						}
 						arr_free(pixfmts);
+						} break;
+					case MENU_OPT_IMGFMT: {
+						state->image_format = (state->image_format + 1) % IMG_FMT_COUNT;
+						menu_needs_rerendering = true;
 						} break;
 					}
 				} else if (state->curr_menu == MENU_RESOLUTION) {
@@ -684,6 +717,9 @@ void main() {\n\
 						option = a_sprintf("Picture format: %s",
 							state->camera ? pixfmt_to_string(camera_pixel_format(state->camera))
 								: "None");
+						break;
+					case MENU_OPT_IMGFMT:
+						option = a_sprintf("Image format: %s", image_format_names[state->image_format]);
 						break;
 					default:
 						assert(false);
