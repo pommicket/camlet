@@ -1,6 +1,5 @@
 /*
 TODO
--help menu
 -set saved image format
 -add support for more pixfmts
 -screen effect when picture is taken
@@ -26,12 +25,16 @@ TODO
 #include "ds.h"
 #include "camera.h"
 
+// pixel format used for convenience
+#define PIX_FMT_XXXGRAY 0x47585858
+
 typedef enum {
 	MENU_NONE,
 	MENU_MAIN,
 	MENU_RESOLUTION,
 	MENU_INPUT,
 	MENU_PIXFMT,
+	MENU_HELP,
 	MENU_COUNT
 } Menu;
 
@@ -54,6 +57,7 @@ static const MenuOption main_menu[] = {
 typedef struct {
 	Menu curr_menu;
 	int menu_sel[MENU_COUNT];
+	bool show_fps;
 	Camera *camera;
 	Camera **cameras;
 } State;
@@ -181,6 +185,7 @@ GLuint gl_compile_and_link_shaders(char error_buf[256], const char *vshader_code
 static int menu_option_count(State *state) {
 	switch (state->curr_menu) {
 	case MENU_NONE: return 0;
+	case MENU_HELP: return 1;
 	case MENU_MAIN: return strlen(main_menu);
 	case MENU_INPUT: return arr_len(state->cameras);
 	case MENU_RESOLUTION: {
@@ -314,7 +319,7 @@ int main(void) {
 	struct timespec ts = {0};
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	double last_time = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-	GLuint textures[3] = {0};
+	GLuint textures[4] = {0};
 	gl.GenTextures(SDL_arraysize(textures), textures);
 	for (size_t i = 0; i < SDL_arraysize(textures); i++) {
 		gl.BindTexture(GL_TEXTURE_2D, textures[i]);
@@ -327,6 +332,7 @@ int main(void) {
 	GLuint texture = textures[0];
 	GLuint menu_texture = textures[1];
 	GLuint no_camera_texture = textures[2];
+	GLuint fps_texture = textures[3];
 	static const int32_t no_camera_width = 1280, no_camera_height = 720;
 	{
 		// create no camera texture
@@ -350,10 +356,11 @@ int main(void) {
 	const char *vshader_code = "attribute vec2 v_pos;\n\
 attribute vec2 v_tex_coord;\n\
 uniform vec2 u_scale;\n\
+uniform vec2 u_offset;\n\
 out vec2 tex_coord;\n\
 void main() {\n\
 	tex_coord = vec2(v_tex_coord.x, 1.0 - v_tex_coord.y);\n\
-	gl_Position = vec4(u_scale * v_pos, 0.0, 1.0);\n\
+	gl_Position = vec4(u_scale * v_pos + u_offset, 0.0, 1.0);\n\
 }\n\
 ";
 	const char *fshader_code = "in vec4 color;\n\
@@ -363,15 +370,19 @@ uniform int u_pixel_format;\n\
 uniform float u_opacity;\n\
 void main() {\n\
 	vec3 color;\n\
+	float opacity = u_opacity;\n\
 	switch (u_pixel_format) {\n\
 	case 0x59455247: // GREY\n\
 		color = texture2D(u_sampler, tex_coord).xxx;\n\
+		break;\n\
+	case 0x47585858: // XXXGRAY (used for FPS display currently)\n\
+		color = vec3(texture2D(u_sampler, tex_coord).w);\n\
 		break;\n\
 	default:\n\
 		color = texture2D(u_sampler, tex_coord).xyz;\n\
 		break;\n\
 	}\n\
-	gl_FragColor = vec4(color, u_opacity);\n\
+	gl_FragColor = vec4(color, opacity);\n\
 }\n\
 ";
 	char err[256] = {0};
@@ -383,33 +394,36 @@ void main() {\n\
 	GLuint vbo = 0, vao = 0;
 	gl.GenBuffers(1, &vbo);
 	gl.GenVertexArrays(1, &vao);
-	typedef struct {
-		float pos[2];
-		float tex_coord[2];
-	} Vertex;
-	typedef struct {
-		Vertex v0;
-		Vertex v1;
-		Vertex v2;
-	} Triangle;
-	Triangle triangles[2] = {
-		{ {{-1, -1}, {0, 0}}, {{1, 1}, {1, 1}}, {{-1, 1}, {0, 1}} },
-		{ {{-1, -1}, {0, 0}}, {{1, -1}, {1, 0}}, {{1, 1}, {1, 1}} },
-	};
-	int ntriangles = sizeof triangles / sizeof triangles[0];
-	GLuint u_sampler = gl.GetUniformLocation(program, "u_sampler");
-	GLuint u_pixel_format = gl.GetUniformLocation(program, "u_pixel_format");
-	GLuint u_scale = gl.GetUniformLocation(program, "u_scale");
-	GLuint u_opacity = gl.GetUniformLocation(program, "u_opacity");
-	GLint v_pos = gl.GetAttribLocation(program, "v_pos");
-	GLint v_tex_coord = gl.GetAttribLocation(program, "v_tex_coord");
-	gl.BindBuffer(GL_ARRAY_BUFFER, vbo);
-	gl.BindVertexArray(vao);
-	gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(ntriangles * sizeof(Triangle)), triangles, GL_STATIC_DRAW);
-	gl.VertexAttribPointer(v_pos, 2, GL_FLOAT, 0, sizeof(Vertex), (void *)offsetof(Vertex, pos));
-	gl.EnableVertexAttribArray(v_pos);
-	gl.VertexAttribPointer(v_tex_coord, 2, GL_FLOAT, 0, sizeof(Vertex), (void *)offsetof(Vertex, tex_coord));
-	gl.EnableVertexAttribArray(v_tex_coord);
+	const GLuint u_sampler = gl.GetUniformLocation(program, "u_sampler");
+	const GLuint u_offset = gl.GetUniformLocation(program, "u_offset");
+	const GLuint u_pixel_format = gl.GetUniformLocation(program, "u_pixel_format");
+	const GLuint u_scale = gl.GetUniformLocation(program, "u_scale");
+	const GLuint u_opacity = gl.GetUniformLocation(program, "u_opacity");
+	const GLint v_pos = gl.GetAttribLocation(program, "v_pos");
+	const GLint v_tex_coord = gl.GetAttribLocation(program, "v_tex_coord");
+	{
+		typedef struct {
+			float pos[2];
+			float tex_coord[2];
+		} Vertex;
+		typedef struct {
+			Vertex v0;
+			Vertex v1;
+			Vertex v2;
+		} Triangle;
+		static const Triangle triangles[2] = {
+			{ {{-1, -1}, {0, 0}}, {{1, 1}, {1, 1}}, {{-1, 1}, {0, 1}} },
+			{ {{-1, -1}, {0, 0}}, {{1, -1}, {1, 0}}, {{1, 1}, {1, 1}} },
+		};
+		static const int ntriangles = sizeof triangles / sizeof triangles[0];
+		gl.BindBuffer(GL_ARRAY_BUFFER, vbo);
+		gl.BindVertexArray(vao);
+		gl.BufferData(GL_ARRAY_BUFFER, (GLsizeiptr)(ntriangles * sizeof(Triangle)), triangles, GL_STATIC_DRAW);
+		gl.VertexAttribPointer(v_pos, 2, GL_FLOAT, 0, sizeof(Vertex), (void *)offsetof(Vertex, pos));
+		gl.EnableVertexAttribArray(v_pos);
+		gl.VertexAttribPointer(v_tex_coord, 2, GL_FLOAT, 0, sizeof(Vertex), (void *)offsetof(Vertex, tex_coord));
+		gl.EnableVertexAttribArray(v_tex_coord);
+	}
 	struct udev *udev = udev_new();
 	struct udev_monitor *udev_monitor = udev_monitor_new_from_netlink(udev, "udev");
 	udev_monitor_filter_add_match_subsystem_devtype(udev_monitor, "video4linux", NULL);
@@ -507,7 +521,7 @@ void main() {\n\
 			case SDLK_ESCAPE:
 				if (state->curr_menu == MENU_NONE) {
 					state->curr_menu = MENU_MAIN;
-				} else if (state->curr_menu == MENU_MAIN) {
+				} else if (state->curr_menu == MENU_MAIN || state->curr_menu == MENU_HELP) {
 					state->curr_menu = MENU_NONE;
 				} else {
 					state->curr_menu = MENU_MAIN;
@@ -527,6 +541,13 @@ void main() {\n\
 					state->menu_sel[state->curr_menu] = 0;
 				menu_needs_rerendering = true;
 				}
+				break;
+			case SDLK_F1:
+				state->curr_menu = state->curr_menu == MENU_HELP ? 0 : MENU_HELP;
+				menu_needs_rerendering = true;
+				break;
+			case SDLK_F2:
+				state->show_fps = !state->show_fps;
 				break;
 			case SDLK_RIGHT:
 			case SDLK_RETURN:
@@ -597,6 +618,8 @@ void main() {\n\
 						new_picfmt,
 						camera_access_method(state->camera),
 						false);
+				} else if (state->curr_menu == MENU_HELP) {
+					state->curr_menu = 0;
 				}
 				break;
 			}
@@ -617,20 +640,20 @@ void main() {\n\
 			menu_width = window_width - 10;
 			menu_height = menu_width * 9 / 16;
 		}
-		if (menu_width <= 10 || menu_height <= 10) {
+		if (menu_width < 70 || menu_height < 40) {
 			// prevent division by zero, etc.
 			// (but the menu will not be legible)
-			menu_width = 16;
-			menu_height = 9;
+			menu_width = 64;
+			menu_height = 36;
 		}
 		menu_width = (menu_width + 7) / 8 * 8; // play nice with pixel store alignment
 		menu_needs_rerendering &= state->curr_menu != 0;
+		int font_size = menu_height / 20;
+		TTF_SetFontSize(font, font_size);	
 		if (menu_needs_rerendering) {
 			// render menu
 			SDL_Surface *menu = SDL_CreateRGBSurfaceWithFormat(0, menu_width, menu_height, 8, SDL_PIXELFORMAT_RGB24);
 			SDL_FillRect(menu, NULL, 0x332244);
-			int font_size = menu_height / 20;
-			TTF_SetFontSize(font, font_size);
 			SDL_Color text_color = {255, 255, 255, 255};
 			SDL_Color highlight_color = {255, 255, 0, 255};
 			size_t n_options = menu_option_count(state);
@@ -674,6 +697,9 @@ void main() {\n\
 				case MENU_PIXFMT:
 					option = a_sprintf("%s", pixfmt_to_string(pixfmts[opt_idx]));
 					break;
+				case MENU_HELP:
+					option = a_sprintf("Back");
+					break;
 				case MENU_NONE:
 				case MENU_COUNT:
 					assert(false);
@@ -689,6 +715,18 @@ void main() {\n\
 					: text_color, option);
 				free(option);
 			}
+			if (state->curr_menu == MENU_HELP) {
+				const char *text[] = {
+					"F1 - open this help screen",
+					"Space - take a picture",
+					"Escape - open/close settings",
+					"F2 - show frame rate",
+				};
+				for (size_t line = 0; line < SDL_arraysize(text); line++) {
+					render_text_to_surface(font, menu, 5, 5 + (5 + font_size) * (line + 1),
+						text_color, text[line]);
+				}
+			}
 			arr_free(pixfmts);
 			arr_free(resolutions);
 			gl.BindTexture(GL_TEXTURE_2D, menu_texture);
@@ -701,14 +739,15 @@ void main() {\n\
 		gl.ClearColor(0, 0, 0, 1);
 		gl.Clear(GL_COLOR_BUFFER_BIT);
 		clock_gettime(CLOCK_MONOTONIC, &ts);
-		double t = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-//		printf("%.1fms frame time\n",(t-last_time)*1000);
-		last_time = t; (void)last_time;
+		double curr_time = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+		double frame_time = curr_time - last_time;
+		last_time = curr_time;
 		
 		gl.UseProgram(program);
 		gl.ActiveTexture(GL_TEXTURE0);
 		gl.Uniform1i(u_sampler, 0);
 		gl.Uniform1f(u_opacity, 1);
+		gl.Uniform2f(u_offset, 0, 0);
 		{
 			// letterboxing
 			const uint32_t frame_width = state->camera ? camera_frame_width(state->camera) : no_camera_width;
@@ -741,7 +780,7 @@ void main() {\n\
 		gl.Disable(GL_BLEND);
 		gl.BindBuffer(GL_ARRAY_BUFFER, vbo);
 		gl.BindVertexArray(vao);
-		gl.DrawArrays(GL_TRIANGLES, 0, (GLsizei)(3 * ntriangles));
+		gl.DrawArrays(GL_TRIANGLES, 0, 6);
 		if (state->curr_menu) {
 			gl.Enable(GL_BLEND);
 			gl.ActiveTexture(GL_TEXTURE0);
@@ -749,8 +788,45 @@ void main() {\n\
 			gl.Uniform2f(u_scale, (float)menu_width / window_width, (float)menu_height / window_height);
 			gl.Uniform1i(u_sampler, 0);
 			gl.Uniform1f(u_opacity, 0.9f);
+			gl.Uniform2f(u_offset, 0, 0);
 			gl.Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
-			gl.DrawArrays(GL_TRIANGLES, 0, (GLsizei)(3 * ntriangles));
+			gl.DrawArrays(GL_TRIANGLES, 0, 6);
+		}
+		static double smoothed_frame_time;
+		if (smoothed_frame_time == 0)
+			smoothed_frame_time = frame_time;
+		// bias towards recent frame times
+		smoothed_frame_time = smoothed_frame_time * 0.9 + frame_time * 0.1;
+		if (state->show_fps) {
+			static double last_fps_update = -INFINITY;
+			gl.Enable(GL_BLEND);
+			gl.ActiveTexture(GL_TEXTURE0);
+			gl.BindTexture(GL_TEXTURE_2D, fps_texture);
+			static float gl_width, gl_height;
+			if (curr_time - last_fps_update > 0.5) {
+				last_fps_update = curr_time;
+				static char text[32];
+				snprintf(text, sizeof text, "FPS: %" PRId32,
+					smoothed_frame_time > 1e-9 && smoothed_frame_time < 1 ? (int32_t)(1/smoothed_frame_time)
+						: 0);
+				SDL_Surface *fps = TTF_RenderUTF8_Blended(font, text, (SDL_Color){255,255,255,255});
+				SDL_LockSurface(fps);
+				gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
+				assert(fps->pitch % 4 == 0);
+				gl.PixelStorei(GL_UNPACK_ROW_LENGTH, fps->pitch / 4);
+				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, fps->w, fps->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, fps->pixels);
+				gl.PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+				SDL_UnlockSurface(fps);
+				gl_width = (float)fps->w / window_width;
+				gl_height = (float)fps->h / window_height;
+				SDL_FreeSurface(fps);
+			}
+			gl.Uniform2f(u_scale, gl_width, gl_height);
+			gl.Uniform1i(u_sampler, 0);
+			gl.Uniform1f(u_opacity, 0.9f);
+			gl.Uniform2f(u_offset, 1 - gl_width, 1 - gl_height);
+			gl.Uniform1i(u_pixel_format, PIX_FMT_XXXGRAY);
+			gl.DrawArrays(GL_TRIANGLES, 0, 6);
 		}
 		SDL_GL_SwapWindow(window);
 	}
