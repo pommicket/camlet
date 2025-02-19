@@ -20,10 +20,14 @@
 #include "ds.h"
 #include "lib/stb_image_write.h"
 
+typedef struct Camera Camera;
 
 typedef enum {
 	MENU_NONE,
 	MENU_MAIN,
+	MENU_RESOLUTION,
+	MENU_INPUT,
+	MENU_PIXFMT,
 	MENU_COUNT
 } Menu;
 
@@ -42,10 +46,13 @@ static const MenuOption main_menu[] = {
 	MENU_OPT_QUIT,
 	0
 };
-static const MenuOption *const menus[MENU_COUNT] = {
-	NULL,
-	main_menu,
-};
+
+typedef struct {
+	Menu curr_menu;
+	int menu_sel[MENU_COUNT];
+	Camera *camera;
+	Camera **cameras;
+} State;
 
 #define HASH_SIZE 16
 #if crypto_generichash_BYTES_MIN > HASH_SIZE
@@ -163,7 +170,7 @@ typedef enum {
 } CameraAccessMethod;
 
 #define CAMERA_MAX_BUFFERS 4
-typedef struct {
+struct Camera {
 	char *dev_path;
 	char *name;
 	uint32_t input_idx;
@@ -187,7 +194,7 @@ typedef struct {
 	size_t mmap_size[CAMERA_MAX_BUFFERS];
 	uint8_t *mmap_frames[CAMERA_MAX_BUFFERS];
 	uint8_t *userp_frames[CAMERA_MAX_BUFFERS];
-} Camera;
+};
 
 
 /// macro trickery to avoid having to write every GL function multiple times
@@ -309,6 +316,47 @@ static bool camera_setup_with_mmap(Camera *camera) {
 	}
 	return true;
 }
+
+PictureFormat *camera_get_resolutions_with_pixfmt(Camera *camera, uint32_t pixfmt) {
+	PictureFormat *available = NULL;
+	arr_foreach_ptr(camera->formats, PictureFormat, fmt) {
+		if (fmt->pixfmt == pixfmt) {
+			arr_add(available, *fmt);
+		}
+	}
+	return available;
+}
+uint32_t *camera_get_pixfmts(Camera *camera) {
+	uint32_t *available = NULL;
+	arr_add(available, V4L2_PIX_FMT_RGB24);
+	arr_foreach_ptr(camera->formats, const PictureFormat, fmt) {
+		if (!pix_fmt_supported(fmt->pixfmt))
+			continue;
+		arr_foreach_ptr(available, uint32_t, prev) {
+			if (*prev == fmt->pixfmt) goto skip;
+		}
+		arr_add(available, fmt->pixfmt);
+		skip:;
+	}
+	arr_qsort(available, uint32_cmp_qsort);
+	return available;
+}
+PictureFormat camera_closest_resolution(Camera *camera, uint32_t pixfmt, int32_t desired_width, int32_t desired_height) {
+	PictureFormat best_format = {.pixfmt = pixfmt};
+	int32_t best_score = INT32_MIN;
+	arr_foreach_ptr(camera->formats, const PictureFormat, fmt) {
+		if (fmt->pixfmt != pixfmt) {
+			continue;
+		}
+		int32_t score = -abs(fmt->width - desired_width) + abs(fmt->height - desired_height);
+		if (score >= best_score) {
+			best_score = score;
+			best_format = *fmt;
+		}
+	}
+	return best_format;
+}
+
 static bool camera_setup_with_userp(Camera *camera) {
 	camera->access_method = CAMERA_ACCESS_USERP;
 	return false;
@@ -461,23 +509,41 @@ void camera_update_gl_texture_2d(Camera *camera) {
 	}
 }
 
+const char *camera_name(Camera *camera) {
+	return camera->name;
+}
+
 uint32_t camera_pixel_format(Camera *camera) {
 	return camera->curr_format.fmt.pix.pixelformat;
 }
 
-void camera_free(Camera *camera) {
-	free(camera->read_frame);
-	for (int i = 0; i < CAMERA_MAX_BUFFERS; i++) {
-		if (camera->mmap_frames[i])
-			v4l2_munmap(camera->mmap_frames[i], camera->mmap_size[i]);
-		free(camera->userp_frames[i]);
-	}
-	v4l2_close(camera->fd);
-	memset(camera, 0, sizeof *camera);
+CameraAccessMethod camera_access_method(Camera *camera) {
+	return camera->access_method;
 }
 
-bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod access) {
-	if (camera->access_method == access
+void camera_close(Camera *camera) {
+	free(camera->read_frame);
+	camera->read_frame = NULL;
+	for (int i = 0; i < CAMERA_MAX_BUFFERS; i++) {
+		if (camera->mmap_frames[i]) {
+			v4l2_munmap(camera->mmap_frames[i], camera->mmap_size[i]);
+			camera->mmap_frames[i] = NULL;
+		}
+		free(camera->userp_frames[i]);
+		camera->userp_frames[i] = NULL;
+	}
+	if (camera->fd >= 0)
+		v4l2_close(camera->fd);
+}
+
+void camera_free(Camera *camera) {
+	camera_close(camera);
+	free(camera);
+}
+
+bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod access, bool force) {
+	if (!force
+		&& camera->access_method == access
 		&& picture_format_cmp_qsort((PictureFormat[1]) { camera_picture_format(camera) }, &picfmt) == 0) {
 		// no changes needed
 		return true;
@@ -526,6 +592,26 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod 
 		#endif
 		return false;
 	}
+}
+
+bool camera_open(Camera *camera) {
+	if (!camera->access_method)
+		camera->access_method = CAMERA_ACCESS_MMAP;
+	// camera should not already be open
+	assert(!camera->read_frame);
+	assert(!camera->mmap_frames[0]);
+	assert(!camera->userp_frames[0]);
+	camera->fd = v4l2_open(camera->dev_path, O_RDWR);
+	if (camera->fd < 0) {
+		perror("v4l2_open");
+		return false;
+	}
+	if (v4l2_ioctl(camera->fd, VIDIOC_S_INPUT, &camera->input_idx) != 0) {
+		perror("v4l2_ioctl");
+		return false;
+	}
+	camera_set_format(camera, camera->best_format, camera->access_method, true);
+	return true;
 }
 
 #if DEBUG
@@ -667,7 +753,7 @@ GLuint gl_compile_and_link_shaders(char error_buf[256], const char *vshader_code
 }
 
 
-void get_cameras_from_device(const char *dev_path, const char *serial, int fd, Camera **cameras) {
+void cameras_from_device(const char *dev_path, const char *serial, int fd, Camera ***cameras) {
 	struct v4l2_capability cap = {0};
 	v4l2_ioctl(fd, VIDIOC_QUERYCAP, &cap);
 	if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) return;
@@ -676,10 +762,16 @@ void get_cameras_from_device(const char *dev_path, const char *serial, int fd, C
 		input.index = input_idx;
 		if (v4l2_ioctl(fd, VIDIOC_ENUMINPUT, &input) == -1) break;
 		if (input.type != V4L2_INPUT_TYPE_CAMERA) continue;
-		Camera camera = {.curr_frame_idx = -1};
-		crypto_generichash_init(&camera.hash_state, NULL, 0, HASH_SIZE);
-		crypto_generichash_update(&camera.hash_state, cap.card, strlen((const char *)cap.card) + 1);
-		crypto_generichash_update(&camera.hash_state, input.name, strlen((const char *)input.name) + 1);
+		Camera *camera = calloc(1, sizeof *camera);
+		if (!camera) {
+			perror("calloc");
+			return;
+		}
+		camera->fd = -1;
+		camera->curr_frame_idx = -1;
+		crypto_generichash_init(&camera->hash_state, NULL, 0, HASH_SIZE);
+		crypto_generichash_update(&camera->hash_state, cap.card, strlen((const char *)cap.card) + 1);
+		crypto_generichash_update(&camera->hash_state, input.name, strlen((const char *)input.name) + 1);
 		struct v4l2_fmtdesc fmtdesc = {0};
 		printf("-----\n");
 		for (uint32_t fmt_idx = 0; ; fmt_idx++) {
@@ -690,7 +782,7 @@ void get_cameras_from_device(const char *dev_path, const char *serial, int fd, C
 			printf("  - %s (%s)\n",fmtdesc.description, (const char *)fourcc);
 			struct v4l2_frmsizeenum frmsize = {0};
 			if (serial && *serial)
-				crypto_generichash_update(&camera.hash_state, (const uint8_t *)serial, strlen(serial) + 1);
+				crypto_generichash_update(&camera->hash_state, (const uint8_t *)serial, strlen(serial) + 1);
 			const char *bus_info = (const char *)cap.bus_info;
 			int usb_busnum = 0;
 			int usb_devnum = 0;
@@ -698,13 +790,13 @@ void get_cameras_from_device(const char *dev_path, const char *serial, int fd, C
 			if (strlen(bus_info) >= 18 && strlen(bus_info) <= 20 &&
 				// what are those mystery 0s in the bus_info referring to.. . who knows...
 				sscanf(bus_info, "usb-0000:%d:00.%d-%d", &usb_busnum, &usb_devnum, &usb_devpath) == 3) {
-				camera.usb_busnum = usb_busnum;
-				camera.usb_devnum = usb_devnum;
-				camera.usb_devpath = usb_devpath;
+				camera->usb_busnum = usb_busnum;
+				camera->usb_devnum = usb_devnum;
+				camera->usb_devpath = usb_devpath;
 			} else {
-				camera.usb_busnum = -1;
-				camera.usb_devnum = -1;
-				camera.usb_devpath = -1;
+				camera->usb_busnum = -1;
+				camera->usb_devnum = -1;
+				camera->usb_devpath = -1;
 			}
 			for (uint32_t frmsz_idx = 0; ; frmsz_idx++) {
 				frmsize.index = frmsz_idx;
@@ -713,34 +805,35 @@ void get_cameras_from_device(const char *dev_path, const char *serial, int fd, C
 				// are there even any stepwise cameras out there?? who knows.
 				uint32_t frame_width = frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE ? frmsize.discrete.width : frmsize.stepwise.max_width;
 				uint32_t frame_height = frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE ? frmsize.discrete.height : frmsize.stepwise.max_height;
-				arr_add(camera.formats, ((PictureFormat) {
+				arr_add(camera->formats, ((PictureFormat) {
 					.width = frame_width,
 					.height = frame_height,
 					.pixfmt = fmtdesc.pixelformat,
 				}));
 			}
 		}
-		if (arr_len(camera.formats) == 0) {
-			arr_free(camera.formats);
+		if (arr_len(camera->formats) == 0) {
+			free(camera);
 			continue;
 		}
-		arr_qsort(camera.formats, picture_format_cmp_qsort);
+		arr_qsort(camera->formats, picture_format_cmp_qsort);
 		// deduplicate
 		{
 			int i, o;
-			for (o = 0, i = 0; i < (int)arr_len(camera.formats); i++) {
-				if (i == 0 || picture_format_cmp_qsort(&camera.formats[i-1], &camera.formats[i]) != 0) {
-					camera.formats[o++] = camera.formats[i];
+			for (o = 0, i = 0; i < (int)arr_len(camera->formats); i++) {
+				if (i == 0 || picture_format_cmp_qsort(&camera->formats[i-1], &camera->formats[i]) != 0) {
+					camera->formats[o++] = camera->formats[i];
 				}
 			}
-			arr_set_len(camera.formats, o);
+			arr_set_len(camera->formats, o);
 		}
-		camera.input_idx = input_idx;
-		camera.dev_path = strdup(dev_path);
+		camera->input_idx = input_idx;
+		camera->dev_path = strdup(dev_path);
 		// select best format
 		PictureFormat best_format = {0};
 		uint32_t desired_format = V4L2_PIX_FMT_RGB24;
-		arr_foreach_ptr(camera.formats, PictureFormat, fmt) {
+		crypto_generichash_update(&camera->hash_state, (const uint8_t *)(const uint32_t [1]){arr_len(camera->formats)}, 4);
+		arr_foreach_ptr(camera->formats, PictureFormat, fmt) {
 			// Now you might think do we really need this?
 			// Is it really not enough to use the device name, input name, and serial number to uniquely identify a camera??
 			// No. you fool. Of course there is a Logitech camera with an infrared sensor (for face recognition)
@@ -749,9 +842,9 @@ void get_cameras_from_device(const char *dev_path, const char *serial, int fd, C
 			// Oddly Windows doesn't show the infrared camera as an input device.
 			// I wonder if there is some way of detecting which one is the "normal" camera.
 			// Or perhaps Windows has its own special proprietary driver and we have no way of knowing.
-			crypto_generichash_update(&camera.hash_state, (const uint8_t *)&fmt->pixfmt, sizeof fmt->pixfmt);
-			crypto_generichash_update(&camera.hash_state, (const uint8_t *)&fmt->width, sizeof fmt->width);
-			crypto_generichash_update(&camera.hash_state, (const uint8_t *)&fmt->height, sizeof fmt->height);
+			crypto_generichash_update(&camera->hash_state, (const uint8_t *)&fmt->pixfmt, sizeof fmt->pixfmt);
+			crypto_generichash_update(&camera->hash_state, (const uint8_t *)&fmt->width, sizeof fmt->width);
+			crypto_generichash_update(&camera->hash_state, (const uint8_t *)&fmt->height, sizeof fmt->height);
 			if (best_format.pixfmt == desired_format && fmt->pixfmt != desired_format) {
 				continue;
 			}
@@ -760,13 +853,38 @@ void get_cameras_from_device(const char *dev_path, const char *serial, int fd, C
 				best_format = *fmt;
 			}
 		}
-		camera.best_format = best_format;
-		camera.name = a_sprintf(
+		camera->best_format = best_format;
+		camera->name = a_sprintf(
 			"%s %s (up to %" PRIu32 "x%" PRIu32 ")", (const char *)cap.card, (const char *)input.name,
 			best_format.width, best_format.height
 		);
 		arr_add(*cameras, camera);
 	}
+}
+
+static int menu_option_count(State *state) {
+	switch (state->curr_menu) {
+	case MENU_NONE: return 0;
+	case MENU_MAIN: return strlen(main_menu);
+	case MENU_INPUT: return arr_len(state->cameras);
+	case MENU_RESOLUTION: {
+		PictureFormat *resolutions = camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera));
+		int n = (int)arr_len(resolutions);
+		arr_free(resolutions);
+		return n;
+		}
+		break;
+	case MENU_PIXFMT: {
+		uint32_t *pixfmts = camera_get_pixfmts(state->camera);
+		int n = (int)arr_len(pixfmts);
+		arr_free(pixfmts);
+		return n;
+		}
+		break;
+	case MENU_COUNT: break;
+	}
+	assert(false);
+	return 0;
 }
 
 static void render_text_to_surface(TTF_Font *font, SDL_Surface *dest, int x, int y, SDL_Color color, const char *str) {
@@ -776,6 +894,8 @@ static void render_text_to_surface(TTF_Font *font, SDL_Surface *dest, int x, int
 }
 
 int main(void) {
+	static State state_data;
+	State *state = &state_data;
 	SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1"); // if this program is sent a SIGTERM/SIGINT, don't turn it into a quit event
 	if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
 		fprintf(stderr, "couldn't initialize SDL\n");
@@ -867,6 +987,7 @@ int main(void) {
 		}
 	}
 	#endif
+	gl_BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 	struct timespec ts = {0};
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	double last_time = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
@@ -895,6 +1016,7 @@ void main() {\n\
 in vec2 tex_coord;\n\
 uniform sampler2D u_sampler;\n\
 uniform int u_pixel_format;\n\
+uniform float u_opacity;\n\
 void main() {\n\
 	vec3 color;\n\
 	switch (u_pixel_format) {\n\
@@ -905,7 +1027,7 @@ void main() {\n\
 		color = texture2D(u_sampler, tex_coord).xyz;\n\
 		break;\n\
 	}\n\
-	gl_FragColor = vec4(color, 1.0);\n\
+	gl_FragColor = vec4(color, u_opacity);\n\
 }\n\
 ";
 	char err[256] = {0};
@@ -934,6 +1056,7 @@ void main() {\n\
 	GLuint u_sampler = gl_GetUniformLocation(program, "u_sampler");
 	GLuint u_pixel_format = gl_GetUniformLocation(program, "u_pixel_format");
 	GLuint u_scale = gl_GetUniformLocation(program, "u_scale");
+	GLuint u_opacity = gl_GetUniformLocation(program, "u_opacity");
 	GLint v_pos = gl_GetAttribLocation(program, "v_pos");
 	GLint v_tex_coord = gl_GetAttribLocation(program, "v_tex_coord");
 	gl_BindBuffer(GL_ARRAY_BUFFER, vbo);
@@ -960,7 +1083,6 @@ void main() {\n\
 		// enable monitor
 		udev_monitor_enable_receiving(udev_monitor);
 	}
-	Camera *cameras = NULL;
 	{
 		struct udev_enumerate *enumerate = udev_enumerate_new(udev);
 		udev_enumerate_add_match_subsystem(enumerate, "video4linux");
@@ -986,7 +1108,7 @@ void main() {\n\
 					perror("v4l2_open");
 					goto cont;
 				}
-				get_cameras_from_device(devnode, serial, fd, &cameras);
+				cameras_from_device(devnode, serial, fd, &state->cameras);
 				v4l2_close(fd);
 			}
 			cont:
@@ -1005,7 +1127,8 @@ void main() {\n\
 			int busnum = atoi(busnum_str);
 			int devnum = atoi(devnum_str);
 			int devpath = atoi(devpath_str);
-			arr_foreach_ptr(cameras, Camera, camera) {
+			arr_foreach_ptr(state->cameras, Camera *, pcamera) {
+				Camera *camera = *pcamera;
 				// allows us to distinguish between different instances of the exact same model of camera
 				if (camera->usb_busnum == busnum && camera->usb_devnum == devnum && camera->usb_devpath == devpath) {
 					crypto_generichash_update(&camera->hash_state, (const uint8_t *)serial, strlen(serial) + 1);
@@ -1014,13 +1137,14 @@ void main() {\n\
 			udev_device_unref(dev);
 		}
 		udev_enumerate_unref(enumerate);
-		arr_foreach_ptr(cameras, Camera, camera) {
+		arr_foreach_ptr(state->cameras, Camera *, pcamera) {
+			Camera *camera = *pcamera;
 			memset(camera->hash.hash, 0, sizeof camera->hash.hash);
 			crypto_generichash_final(&camera->hash_state, camera->hash.hash, sizeof camera->hash.hash);
 		}
 		printf("---CAMERAS---\n");
-		for (size_t i = 0; i < arr_len(cameras); i++) {
-			Camera *camera = &cameras[i];
+		for (size_t i = 0; i < arr_len(state->cameras); i++) {
+			Camera *camera = state->cameras[i];
 			printf("[%zu] %s ", i, camera->name);
 			for (size_t h = 0; h < sizeof camera->hash.hash; h++) {
 				printf("%02x", camera->hash.hash[h]);
@@ -1028,25 +1152,13 @@ void main() {\n\
 			printf("\n");
 		}
 	}
-	int choice = 0;
-	if (arr_len(cameras) == 0) {
+	if (arr_len(state->cameras) == 0) {
 		printf("no cameras\n");
 		return EXIT_FAILURE;
 	}
-	Camera *camera = &cameras[choice];
-	camera->fd = v4l2_open(camera->dev_path, O_RDWR);
-	if (camera->fd < 0) {
-		perror("v4l2_open");
+	state->camera = state->cameras[0];
+	if (!camera_open(state->camera))
 		return EXIT_FAILURE;
-	}
-	if (v4l2_ioctl(camera->fd, VIDIOC_S_INPUT, &camera->input_idx) != 0) {
-		perror("v4l2_ioctl");
-		return EXIT_FAILURE;
-	}
-	camera_set_format(camera, camera->best_format, CAMERA_ACCESS_MMAP);
-	Menu curr_menu = false;
-	int menu_sel = 0;
-	PictureFormat desired_fmt = {0};
 	while(true) {
 		struct udev_device *dev = NULL;
 		while (udev_monitor && (dev = udev_monitor_receive_device(udev_monitor))) {
@@ -1069,106 +1181,98 @@ void main() {\n\
 				struct tm *tm = localtime(&t);
 				char name[256];
 				strftime(name, sizeof name, "%Y-%m-%d-%H-%M-%S.jpg", tm);
-				camera_write_jpg(camera, name, 90);
+				camera_write_jpg(state->camera, name, 90);
 				} break;
 			case SDLK_ESCAPE:
-				if (curr_menu == MENU_NONE) {
-					curr_menu = MENU_MAIN;
-				} else if (curr_menu == MENU_MAIN) {
-					curr_menu = MENU_NONE;
-					camera_set_format(camera, desired_fmt, camera->access_method);
+				if (state->curr_menu == MENU_NONE) {
+					state->curr_menu = MENU_MAIN;
+				} else if (state->curr_menu == MENU_MAIN) {
+					state->curr_menu = MENU_NONE;
 				} else {
-					curr_menu = MENU_MAIN;
+					state->curr_menu = MENU_MAIN;
 				}
-				desired_fmt = camera_picture_format(camera);
 				menu_needs_rerendering = true;
 				break;
-			case SDLK_UP: if (curr_menu) {
-				menu_sel--;
-				if (menu_sel < 0)
-					menu_sel += strlen(menus[curr_menu]);
-				menu_needs_rerendering = true;
-				}
-				break;
-			case SDLK_DOWN: if (curr_menu) {
-				menu_sel++;
-				menu_sel %= strlen(menus[curr_menu]);
+			case SDLK_UP: if (menu_option_count(state)) {
+				state->menu_sel[state->curr_menu]--;
+				if (state->menu_sel[state->curr_menu] < 0)
+					state->menu_sel[state->curr_menu] += menu_option_count(state);
 				menu_needs_rerendering = true;
 				}
 				break;
-			case SDLK_LEFT:
-			case SDLK_RIGHT: if (curr_menu) {
-				int direction = event.key.keysym.sym == SDLK_LEFT ? -1 : 1;
-				switch (menus[curr_menu][menu_sel]) {
-				case MENU_OPT_QUIT:
-					goto quit;
-				case MENU_OPT_RESOLUTION: if (camera) {
-					// change desired_resolution
-					PictureFormat *available = NULL;
-					int curr_idx = -1;
-					arr_foreach_ptr(camera->formats, PictureFormat, fmt) {
-						if (fmt->pixfmt == desired_fmt.pixfmt) {
-							if (picture_format_cmp_resolution(fmt, &desired_fmt) == 0) {
-								curr_idx = arr_len(available);
+			case SDLK_DOWN: if (menu_option_count(state)) {
+				state->menu_sel[state->curr_menu]++;
+				if (state->menu_sel[state->curr_menu] >= menu_option_count(state))
+					state->menu_sel[state->curr_menu] = 0;
+				menu_needs_rerendering = true;
+				}
+				break;
+			case SDLK_RIGHT:
+			case SDLK_RETURN:
+				if (state->curr_menu == MENU_MAIN) {
+					switch (main_menu[state->menu_sel[MENU_MAIN]]) {
+					case MENU_OPT_QUIT:
+						goto quit;
+					case MENU_OPT_RESOLUTION: {
+						state->curr_menu = MENU_RESOLUTION;
+						menu_needs_rerendering = true;
+						// set menu_sel
+						PictureFormat *resolutions = camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera));
+						arr_foreach_ptr(resolutions, PictureFormat, resolution) {
+							if (resolution->width == camera_frame_width(state->camera)
+								&& resolution->height == camera_frame_height(state->camera)) {
+								state->menu_sel[MENU_RESOLUTION] = (int)(resolution - resolutions);
 							}
-							arr_add(available, *fmt);
 						}
-					}
-					assert(curr_idx >= 0);
-					int new_idx = (curr_idx + direction + arr_len(available)) % arr_len(available);
-					assert(new_idx >= 0 && new_idx < (int)arr_len(available));
-					desired_fmt = available[new_idx];
-					arr_free(available);
-					menu_needs_rerendering = true;
-					}
-					break;
-				case MENU_OPT_PIXFMT: if (camera) {
-					uint32_t *available = NULL;
-					arr_add(available, V4L2_PIX_FMT_RGB24);
-					arr_foreach_ptr(camera->formats, PictureFormat, fmt) {
-						if (!pix_fmt_supported(fmt->pixfmt))
-							continue;
-						arr_foreach_ptr(available, uint32_t, prev) {
-							if (*prev == fmt->pixfmt) goto skip;
+						arr_free(resolutions);
+						} break;
+					case MENU_OPT_INPUT:
+						state->curr_menu = MENU_INPUT;
+						menu_needs_rerendering = true;
+						arr_foreach_ptr(state->cameras, Camera *, pcam) {
+							if (*pcam == state->camera) {
+								state->menu_sel[MENU_INPUT] = (int)(pcam - state->cameras);
+							}
 						}
-						arr_add(available, fmt->pixfmt);
-						skip:;
-					}
-					arr_qsort(available, uint32_cmp_qsort);
-					int curr_idx = -1;
-					arr_foreach_ptr(available, uint32_t, x) {
-						if (*x == desired_fmt.pixfmt) {
-							curr_idx = (int)(x - available);
+						break;
+					case MENU_OPT_PIXFMT:
+						state->curr_menu = MENU_PIXFMT;
+						menu_needs_rerendering = true;
+						// set menu_sel
+						uint32_t *pixfmts = camera_get_pixfmts(state->camera);
+						arr_foreach_ptr(pixfmts, uint32_t, pixfmt) {
+							if (*pixfmt == camera_pixel_format(state->camera)) {
+								state->menu_sel[MENU_PIXFMT] = (int)(pixfmt - pixfmts);
+							}
 						}
+						arr_free(pixfmts);
+						break;
 					}
-					assert(curr_idx >= 0);
-					int new_idx = (curr_idx + direction + arr_len(available)) % arr_len(available);
-					assert(new_idx >= 0 && new_idx < (int)arr_len(available));
-					uint32_t desired_pixfmt = available[new_idx];
-					PictureFormat best_format = {.pixfmt = desired_pixfmt};
-					int32_t best_score = INT32_MIN;
-					arr_foreach_ptr(camera->formats, PictureFormat, fmt) {
-						if (fmt->pixfmt != desired_pixfmt) {
-							continue;
-						}
-						int32_t score = -abs(fmt->width - desired_fmt.width) + abs(fmt->height - desired_fmt.height);
-						if (score >= best_score) {
-							best_score = score;
-							best_format = *fmt;
-						}
+				} else if (state->curr_menu == MENU_RESOLUTION) {
+					PictureFormat *resolutions = camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera));
+					camera_set_format(state->camera,
+						resolutions[state->menu_sel[state->curr_menu]],
+						camera_access_method(state->camera),
+						false);
+					arr_free(resolutions);
+				} else if (state->curr_menu == MENU_INPUT) {
+					Camera *new_camera = state->cameras[state->menu_sel[MENU_INPUT]];
+					if (state->camera == new_camera) {
+						// already using this camera
+					} else {
+						camera_close(state->camera);
+						state->camera = new_camera;
+						camera_open(state->camera);
 					}
-					desired_fmt = best_format;
-					menu_needs_rerendering = true;
-				}
-				}
-				}
-				break;
-			case SDLK_RETURN: if (curr_menu) switch (menus[curr_menu][menu_sel]) {
-				case MENU_OPT_QUIT:
-					goto quit;
-				case MENU_OPT_RESOLUTION:
-				case MENU_OPT_PIXFMT:
-					camera_set_format(camera, desired_fmt, camera->access_method);
+				} else if (state->curr_menu == MENU_PIXFMT) {
+					uint32_t *pixfmts = camera_get_pixfmts(state->camera);
+					uint32_t pixfmt = pixfmts[state->menu_sel[state->curr_menu]];
+					PictureFormat new_picfmt = camera_closest_resolution(state->camera, pixfmt, camera_frame_width(state->camera), camera_frame_height(state->camera));
+					arr_free(pixfmts);
+					camera_set_format(state->camera,
+						new_picfmt,
+						camera_access_method(state->camera),
+						false);
 				}
 				break;
 			}
@@ -1182,8 +1286,21 @@ void main() {\n\
 		prev_window_width = window_width;
 		prev_window_height = window_height;
 		int menu_width = window_width / 2, menu_height = window_height / 2;
+		if (window_height * 16 > window_width * 9) {
+			menu_width = menu_height * 16 / 9;
+		}
+		if (menu_width > window_width - 10) {
+			menu_width = window_width - 10;
+			menu_height = menu_width * 9 / 16;
+		}
+		if (menu_width <= 10 || menu_height <= 10) {
+			// prevent division by zero, etc.
+			// (but the menu will not be legible)
+			menu_width = 16;
+			menu_height = 9;
+		}
 		menu_width = (menu_width + 7) / 8 * 8; // play nice with pixel store alignment
-		menu_needs_rerendering &= curr_menu != 0;
+		menu_needs_rerendering &= state->curr_menu != 0;
 		if (menu_needs_rerendering) {
 			// render menu
 			SDL_Surface *menu = SDL_CreateRGBSurfaceWithFormat(0, menu_width, menu_height, 8, SDL_PIXELFORMAT_RGB24);
@@ -1192,34 +1309,58 @@ void main() {\n\
 			TTF_SetFontSize(font, font_size);
 			SDL_Color text_color = {255, 255, 255, 255};
 			SDL_Color highlight_color = {255, 255, 0, 255};
-			size_t n_options = strlen(menus[curr_menu]);
+			size_t n_options = menu_option_count(state);
+			uint32_t *pixfmts = camera_get_pixfmts(state->camera);
+			PictureFormat *resolutions = camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera));
 			for (int opt_idx = 0; opt_idx < (int)n_options; opt_idx++) {
 				char *option = NULL;
-				switch (menus[curr_menu][opt_idx]) {
-				case MENU_OPT_QUIT:
-					option = strdup("Quit");
+				switch (state->curr_menu) {
+				case MENU_MAIN:
+					switch (main_menu[opt_idx]) {
+					case MENU_OPT_QUIT:
+						option = strdup("Quit");
+						break;
+					case MENU_OPT_RESOLUTION:
+						option = a_sprintf("Resolution: %" PRId32 "x%" PRId32,
+							camera_frame_width(state->camera), camera_frame_height(state->camera));
+						break;
+					case MENU_OPT_INPUT:
+						option = a_sprintf("Input: %s", camera_name(state->camera));
+						break;
+					case MENU_OPT_PIXFMT:
+						option = a_sprintf("Picture format: %s", pixfmt_to_string(camera_pixel_format(state->camera)));
+						break;
+					default:
+						assert(false);
+						option = strdup("???");
+					}
 					break;
-				case MENU_OPT_RESOLUTION:
-					option = a_sprintf("Resolution: %" PRIu32 "x%" PRIu32,
-						desired_fmt.width, desired_fmt.height);
+				case MENU_RESOLUTION:
+					option = a_sprintf("%" PRId32 "x%" PRId32, resolutions[opt_idx].width, resolutions[opt_idx].height);
 					break;
-				case MENU_OPT_INPUT:
-					option = a_sprintf("Input: %s", camera->name);
+				case MENU_INPUT:
+					option = strdup(camera_name(state->cameras[opt_idx]));
 					break;
-				case MENU_OPT_PIXFMT:
-					option = a_sprintf("Picture format: %s", pixfmt_to_string(desired_fmt.pixfmt));
+				case MENU_PIXFMT:
+					option = a_sprintf("%s", pixfmt_to_string(pixfmts[opt_idx]));
 					break;
-				default:
+				case MENU_NONE:
+				case MENU_COUNT:
 					assert(false);
-					option = strdup("???");
+					break;
 				}
-				render_text_to_surface(font, menu, 5, 5 + opt_idx * (5 + font_size),
-					menu_sel == opt_idx
+				int options_per_column = 10;
+				int n_columns = (n_options + options_per_column - 1) / options_per_column;
+				int column_spacing = (menu_width - 10) / n_columns;
+				render_text_to_surface(font, menu, 5 + (opt_idx / options_per_column) * column_spacing,
+					5 + (opt_idx % options_per_column) * (5 + font_size),
+					state->menu_sel[state->curr_menu] == opt_idx
 					? highlight_color
 					: text_color, option);
 				free(option);
 			}
-			render_text_to_surface(font, menu, 5, menu_height - 10 - font_size, text_color, "UP/DOWN to select option, LEFT/RIGHT to change value, ENTER to apply");
+			arr_free(pixfmts);
+			arr_free(resolutions);
 			gl_BindTexture(GL_TEXTURE_2D, menu_texture);
 			SDL_LockSurface(menu);
 			gl_TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, menu_width, menu_height, 0, GL_RGB, GL_UNSIGNED_BYTE, menu->pixels);
@@ -1233,39 +1374,48 @@ void main() {\n\
 		double t = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 //		printf("%.1fms frame time\n",(t-last_time)*1000);
 		last_time = t; (void)last_time;
-		uint32_t frame_width = camera_frame_width(camera);
-		uint32_t frame_height = camera_frame_height(camera);
 		
 		gl_UseProgram(program);
 		gl_ActiveTexture(GL_TEXTURE0);
-		gl_BindTexture(GL_TEXTURE_2D, texture);
-		if (camera_next_frame(camera)) {
-			camera_update_gl_texture_2d(camera);
-		}
-		if ((uint64_t)window_width * frame_height > (uint64_t)frame_width * window_height) {
-			// window is wider than picture
-			float letterbox_size = window_width - (float)window_height / frame_height * frame_width;
-			letterbox_size /= window_width;
-			gl_Uniform2f(u_scale, 1-letterbox_size, 1);
-		} else if ((uint64_t)window_width * frame_height < (uint64_t)frame_width * window_height) {
-			// window is narrower than picture
-			float letterbox_size = window_height - (float)window_width / frame_width * frame_height;
-			letterbox_size /= window_height;
-			gl_Uniform2f(u_scale, 1, 1-letterbox_size);
+		gl_Uniform1i(u_sampler, 0);
+		gl_Uniform1f(u_opacity, 1);
+		if (state->camera) {
+			const uint32_t frame_width = camera_frame_width(state->camera);
+			const uint32_t frame_height = camera_frame_height(state->camera);
+			gl_BindTexture(GL_TEXTURE_2D, texture);
+			if (camera_next_frame(state->camera)) {
+				camera_update_gl_texture_2d(state->camera);
+			}
+			if ((uint64_t)window_width * frame_height > (uint64_t)frame_width * window_height) {
+				// window is wider than picture
+				float letterbox_size = window_width - (float)window_height / frame_height * frame_width;
+				letterbox_size /= window_width;
+				gl_Uniform2f(u_scale, 1-letterbox_size, 1);
+			} else if ((uint64_t)window_width * frame_height < (uint64_t)frame_width * window_height) {
+				// window is narrower than picture
+				float letterbox_size = window_height - (float)window_width / frame_width * frame_height;
+				letterbox_size /= window_height;
+				gl_Uniform2f(u_scale, 1, 1-letterbox_size);
+			} else {
+				// don't mess with fp inaccuracy
+				gl_Uniform2f(u_scale, 1, 1);
+			}
+			gl_Uniform1i(u_pixel_format, camera_pixel_format(state->camera));
 		} else {
-			// don't mess with fp inaccuracy
-			gl_Uniform2f(u_scale, 1, 1);
+			assert(!*"TODO");
+			gl_Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
 		}
+		gl_Disable(GL_BLEND);
 		gl_BindBuffer(GL_ARRAY_BUFFER, vbo);
 		gl_BindVertexArray(vao);
-		gl_Uniform1i(u_sampler, 0);
-		gl_Uniform1i(u_pixel_format, camera_pixel_format(camera));
 		gl_DrawArrays(GL_TRIANGLES, 0, (GLsizei)(3 * ntriangles));
-		if (curr_menu) {
+		if (state->curr_menu) {
+			gl_Enable(GL_BLEND);
 			gl_ActiveTexture(GL_TEXTURE0);
 			gl_BindTexture(GL_TEXTURE_2D, menu_texture);
-			gl_Uniform2f(u_scale, 0.5f, 0.5f);
+			gl_Uniform2f(u_scale, (float)menu_width / window_width, (float)menu_height / window_height);
 			gl_Uniform1i(u_sampler, 0);
+			gl_Uniform1f(u_opacity, 0.9f);
 			gl_Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
 			gl_DrawArrays(GL_TRIANGLES, 0, (GLsizei)(3 * ntriangles));
 		}
@@ -1275,7 +1425,10 @@ void main() {\n\
 	udev_monitor_unref(udev_monitor);
 	udev_unref(udev);
 	//debug_save_24bpp_bmp("out.bmp", buf, camera->best_format.fmt.pix.width, camera->best_format.fmt.pix.height);
-	camera_free(camera);
+	arr_foreach_ptr(state->cameras, Camera *, pcamera) {
+		camera_free(*pcamera);
+	}
+	arr_free(state->cameras);
 	SDL_Quit();
 	return 0;
 }
