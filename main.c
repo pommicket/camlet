@@ -886,11 +886,17 @@ static int menu_option_count(State *state) {
 	assert(false);
 	return 0;
 }
-
-static void render_text_to_surface(TTF_Font *font, SDL_Surface *dest, int x, int y, SDL_Color color, const char *str) {
+static void render_text_to_surface_anchored(TTF_Font *font, SDL_Surface *dest, int x, int y, SDL_Color color, const char *str,
+	int xanchor, int yanchor) {
 	SDL_Surface *text = TTF_RenderUTF8_Blended(font, str, color);
+	x -= (xanchor + 1) * text->w / 2;
+	y -= (yanchor + 1) * text->h / 2;
 	SDL_BlitSurface(text, NULL, dest, (SDL_Rect[1]){{x, y, 0, 0}});
 	SDL_FreeSurface(text);
+}
+
+static void render_text_to_surface(TTF_Font *font, SDL_Surface *dest, int x, int y, SDL_Color color, const char *str) {
+	render_text_to_surface_anchored(font, dest, x, y, color, str, -1, -1);
 }
 
 int main(void) {
@@ -942,7 +948,7 @@ int main(void) {
 		FcPatternDestroy(font);
 		FcLangSetDestroy(langs);
 	}
-	TTF_Font *font = TTF_OpenFont(font_path, 18);
+	TTF_Font *font = TTF_OpenFont(font_path, 72);
 	if (!font) {
 		fprintf(stderr, "couldn't open font %s: %s\n", font_path, TTF_GetError());
 		return EXIT_FAILURE;
@@ -991,7 +997,7 @@ int main(void) {
 	struct timespec ts = {0};
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	double last_time = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-	GLuint textures[2] = {0};
+	GLuint textures[3] = {0};
 	gl_GenTextures(SDL_arraysize(textures), textures);
 	for (size_t i = 0; i < SDL_arraysize(textures); i++) {
 		gl_BindTexture(GL_TEXTURE_2D, textures[i]);
@@ -1003,6 +1009,27 @@ int main(void) {
 	// texture for camera output
 	GLuint texture = textures[0];
 	GLuint menu_texture = textures[1];
+	GLuint no_camera_texture = textures[2];
+	static const int32_t no_camera_width = 1280, no_camera_height = 720;
+	{
+		// create no camera texture
+		int32_t w = no_camera_width, h = no_camera_height;
+		SDL_Surface *surf = SDL_CreateRGBSurfaceWithFormat(0, w, h, 8, SDL_PIXELFORMAT_RGB24);
+		SDL_LockSurface(surf);
+		for (int32_t y = 0; y < h; y++) {
+			uint8_t *row = &((uint8_t *)surf->pixels)[y * surf->pitch];
+			uint8_t color = (uint8_t)(y * 255 / h);
+			for (int32_t x = 0; x < w; x++, row += 3)
+				*row = color;
+		}
+		SDL_UnlockSurface(surf);
+		render_text_to_surface_anchored(font, surf, w / 2, h / 2, (SDL_Color){255, 255, 255, 255},
+			"No Camera", 0, 0);
+		SDL_LockSurface(surf);
+		gl_BindTexture(GL_TEXTURE_2D, no_camera_texture);
+		gl_TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, surf->pixels);
+		SDL_UnlockSurface(surf);
+	}
 	const char *vshader_code = "attribute vec2 v_pos;\n\
 attribute vec2 v_tex_coord;\n\
 uniform vec2 u_scale;\n\
@@ -1153,12 +1180,12 @@ void main() {\n\
 		}
 	}
 	if (arr_len(state->cameras) == 0) {
-		printf("no cameras\n");
-		return EXIT_FAILURE;
+		state->camera = NULL;
+	} else {
+		state->camera = state->cameras[0];
+		if (!camera_open(state->camera))
+			return EXIT_FAILURE;
 	}
-	state->camera = state->cameras[0];
-	if (!camera_open(state->camera))
-		return EXIT_FAILURE;
 	while(true) {
 		struct udev_device *dev = NULL;
 		while (udev_monitor && (dev = udev_monitor_receive_device(udev_monitor))) {
@@ -1213,7 +1240,7 @@ void main() {\n\
 					switch (main_menu[state->menu_sel[MENU_MAIN]]) {
 					case MENU_OPT_QUIT:
 						goto quit;
-					case MENU_OPT_RESOLUTION: {
+					case MENU_OPT_RESOLUTION: if (state->camera) {
 						state->curr_menu = MENU_RESOLUTION;
 						menu_needs_rerendering = true;
 						// set menu_sel
@@ -1227,15 +1254,18 @@ void main() {\n\
 						arr_free(resolutions);
 						} break;
 					case MENU_OPT_INPUT:
-						state->curr_menu = MENU_INPUT;
-						menu_needs_rerendering = true;
-						arr_foreach_ptr(state->cameras, Camera *, pcam) {
-							if (*pcam == state->camera) {
-								state->menu_sel[MENU_INPUT] = (int)(pcam - state->cameras);
+						if (state->cameras) {
+							state->curr_menu = MENU_INPUT;
+							menu_needs_rerendering = true;
+							state->menu_sel[MENU_INPUT] = 0;
+							arr_foreach_ptr(state->cameras, Camera *, pcam) {
+								if (*pcam == state->camera) {
+									state->menu_sel[MENU_INPUT] = (int)(pcam - state->cameras);
+								}
 							}
 						}
 						break;
-					case MENU_OPT_PIXFMT:
+					case MENU_OPT_PIXFMT: if (state->camera) {
 						state->curr_menu = MENU_PIXFMT;
 						menu_needs_rerendering = true;
 						// set menu_sel
@@ -1246,7 +1276,7 @@ void main() {\n\
 							}
 						}
 						arr_free(pixfmts);
-						break;
+						} break;
 					}
 				} else if (state->curr_menu == MENU_RESOLUTION) {
 					PictureFormat *resolutions = camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera));
@@ -1310,8 +1340,8 @@ void main() {\n\
 			SDL_Color text_color = {255, 255, 255, 255};
 			SDL_Color highlight_color = {255, 255, 0, 255};
 			size_t n_options = menu_option_count(state);
-			uint32_t *pixfmts = camera_get_pixfmts(state->camera);
-			PictureFormat *resolutions = camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera));
+			uint32_t *pixfmts = state->camera ? camera_get_pixfmts(state->camera) : NULL;
+			PictureFormat *resolutions = state->camera ? camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera)) : NULL;
 			for (int opt_idx = 0; opt_idx < (int)n_options; opt_idx++) {
 				char *option = NULL;
 				switch (state->curr_menu) {
@@ -1321,14 +1351,20 @@ void main() {\n\
 						option = strdup("Quit");
 						break;
 					case MENU_OPT_RESOLUTION:
-						option = a_sprintf("Resolution: %" PRId32 "x%" PRId32,
-							camera_frame_width(state->camera), camera_frame_height(state->camera));
+						if (state->camera) {
+							option = a_sprintf("Resolution: %" PRId32 "x%" PRId32,
+								camera_frame_width(state->camera), camera_frame_height(state->camera));
+						} else {
+							option = a_sprintf("Resolution: None");
+						}
 						break;
 					case MENU_OPT_INPUT:
-						option = a_sprintf("Input: %s", camera_name(state->camera));
+						option = a_sprintf("Input: %s", state->camera ? camera_name(state->camera) : "None");
 						break;
 					case MENU_OPT_PIXFMT:
-						option = a_sprintf("Picture format: %s", pixfmt_to_string(camera_pixel_format(state->camera)));
+						option = a_sprintf("Picture format: %s",
+							state->camera ? pixfmt_to_string(camera_pixel_format(state->camera))
+								: "None");
 						break;
 					default:
 						assert(false);
@@ -1379,13 +1415,10 @@ void main() {\n\
 		gl_ActiveTexture(GL_TEXTURE0);
 		gl_Uniform1i(u_sampler, 0);
 		gl_Uniform1f(u_opacity, 1);
-		if (state->camera) {
-			const uint32_t frame_width = camera_frame_width(state->camera);
-			const uint32_t frame_height = camera_frame_height(state->camera);
-			gl_BindTexture(GL_TEXTURE_2D, texture);
-			if (camera_next_frame(state->camera)) {
-				camera_update_gl_texture_2d(state->camera);
-			}
+		{
+			// letterboxing
+			const uint32_t frame_width = state->camera ? camera_frame_width(state->camera) : no_camera_width;
+			const uint32_t frame_height = state->camera ? camera_frame_height(state->camera) : no_camera_height;
 			if ((uint64_t)window_width * frame_height > (uint64_t)frame_width * window_height) {
 				// window is wider than picture
 				float letterbox_size = window_width - (float)window_height / frame_height * frame_width;
@@ -1400,9 +1433,15 @@ void main() {\n\
 				// don't mess with fp inaccuracy
 				gl_Uniform2f(u_scale, 1, 1);
 			}
+		}
+		if (state->camera) {
+			gl_BindTexture(GL_TEXTURE_2D, texture);
+			if (camera_next_frame(state->camera)) {
+				camera_update_gl_texture_2d(state->camera);
+			}
 			gl_Uniform1i(u_pixel_format, camera_pixel_format(state->camera));
 		} else {
-			assert(!*"TODO");
+			gl_BindTexture(GL_TEXTURE_2D, no_camera_texture);
 			gl_Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
 		}
 		gl_Disable(GL_BLEND);
