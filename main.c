@@ -3,7 +3,6 @@ TODO
 -adjustable camera framerate
 -view previous pictures (thumbnails)
 -click in menus
--left/right in resolution menu
 -save/restore settings
 */
 #define _GNU_SOURCE
@@ -569,6 +568,7 @@ void main() {\n\
 	}
 	double flash_time = -INFINITY;
 	uint32_t last_frame_pixfmt = 0;
+	const int menu_options_per_column = 10;
 	while(true) {
 		struct udev_device *dev = NULL;
 		while (udev_monitor && (dev = udev_monitor_receive_device(udev_monitor))) {
@@ -645,9 +645,29 @@ void main() {\n\
 				if (state->curr_menu == MENU_MAIN && state->menu_sel[MENU_MAIN] == MENU_OPT_IMGFMT) {
 					state->image_format = state->image_format == 0 ? IMG_FMT_COUNT - 1 : state->image_format - 1;
 					menu_needs_rerendering = true;
+				} else if (menu_option_count(state) > menu_options_per_column) {
+					int sel = state->menu_sel[state->curr_menu] - menu_options_per_column;
+					if (sel < 0) {
+						sel += (menu_option_count(state) + menu_options_per_column - 1)
+							/ menu_options_per_column * menu_options_per_column;
+					}
+					while (sel >= menu_option_count(state))
+						sel -= menu_options_per_column;
+					state->menu_sel[state->curr_menu] = sel;
+					menu_needs_rerendering = true;
 				}
 				break;
 			case SDLK_RIGHT:
+				if (menu_option_count(state) > menu_options_per_column) {
+					int sel = state->menu_sel[state->curr_menu] + menu_options_per_column;
+					if (sel >= menu_option_count(state))
+						sel %= menu_options_per_column;
+					state->menu_sel[state->curr_menu] = sel;
+					menu_needs_rerendering = true;
+					break;
+				}
+				if (state->curr_menu != MENU_MAIN) break;
+				// fallthrough
 			case SDLK_RETURN:
 				if (state->curr_menu == MENU_MAIN) {
 					switch (main_menu[state->menu_sel[MENU_MAIN]]) {
@@ -810,11 +830,10 @@ void main() {\n\
 					assert(false);
 					break;
 				}
-				int options_per_column = 10;
-				int n_columns = (n_options + options_per_column - 1) / options_per_column;
+				int n_columns = (n_options + menu_options_per_column - 1) / menu_options_per_column;
 				int column_spacing = (menu_width - 10) / n_columns;
-				render_text_to_surface(font, menu, 5 + (opt_idx / options_per_column) * column_spacing,
-					5 + (opt_idx % options_per_column) * (5 + font_size),
+				render_text_to_surface(font, menu, 5 + (opt_idx / menu_options_per_column) * column_spacing,
+					5 + (opt_idx % menu_options_per_column) * (5 + font_size),
 					state->menu_sel[state->curr_menu] == opt_idx
 					? highlight_color
 					: text_color, option);
