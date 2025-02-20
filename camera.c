@@ -302,22 +302,59 @@ static uint8_t *camera_curr_frame(Camera *camera) {
 	assert(camera->userp_frames[camera->curr_frame_idx]);
 	return camera->userp_frames[camera->curr_frame_idx];
 }
+
+static uint8_t *curr_frame_rgb24(Camera *camera) {
+	uint8_t *curr_frame = camera_curr_frame(camera);
+	if (camera_pixel_format(camera) == V4L2_PIX_FMT_RGB24)
+		return curr_frame;
+	if (camera_pixel_format(camera) == V4L2_PIX_FMT_MJPEG) {
+		int w, h, c;
+		return stbi_load_from_memory(curr_frame, camera->frame_bytes_set, &w, &h, &c, 3);
+	}
+	int32_t frame_width = camera_frame_width(camera), frame_height = camera_frame_height(camera);
+	uint8_t *rgb24 = calloc(3 * frame_width, frame_height);
+	switch (camera_pixel_format(camera)) {
+	case V4L2_PIX_FMT_BGR24: {
+		for (int32_t y = 0; y < frame_height; y++) {
+			const uint8_t *in = &curr_frame[y * 3 * frame_width];
+			uint8_t *out = &rgb24[y * 3 * frame_width];
+			for (int32_t x = 0; x < frame_width; x++) {
+				*out++ = in[2];
+				*out++ = in[1];
+				*out++ = in[0];
+				in += 3;
+			}
+		}
+		return rgb24;
+		} break;
+	case V4L2_PIX_FMT_YUYV:
+		assert(!*"TODO");
+		return NULL;
+	}
+	assert(false);
+	return NULL;
+}
+
 bool camera_save_jpg(Camera *camera, const char *name, int quality) {
-	uint8_t *frame = camera_curr_frame(camera);
+	uint8_t *frame = curr_frame_rgb24(camera);
 	if (frame) {
 		uint32_t frame_width = camera_frame_width(camera);
 		uint32_t frame_height = camera_frame_height(camera);
-		return stbi_write_jpg(name, frame_width, frame_height, 3, frame, quality) != 0;
+		bool ret = stbi_write_jpg(name, frame_width, frame_height, 3, frame, quality) != 0;
+		free(camera_curr_frame(camera) == frame ? NULL : frame);
+		return ret;
 	} else {
 		return false;
 	}
 }
 bool camera_save_png(Camera *camera, const char *name) {
-	uint8_t *frame = camera_curr_frame(camera);
+	uint8_t *frame = curr_frame_rgb24(camera);
 	if (frame) {
 		uint32_t frame_width = camera_frame_width(camera);
 		uint32_t frame_height = camera_frame_height(camera);
-		return stbi_write_png(name, frame_width, frame_height, 3, frame, frame_width * 3) != 0;
+		bool ret = stbi_write_png(name, frame_width, frame_height, 3, frame, frame_width * 3) != 0;
+		free(camera_curr_frame(camera) == frame ? NULL : frame);
+		return ret;
 	} else {
 		return false;
 	}
