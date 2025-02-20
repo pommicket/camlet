@@ -8,6 +8,8 @@
 #include <fcntl.h>
 #include "ds.h"
 #include "3rd_party/stb_image_write.h"
+#define STBI_ONLY_JPEG
+#include "3rd_party/stb_image.h"
 
 #define CAMERA_MAX_BUFFERS 4
 struct Camera {
@@ -125,6 +127,7 @@ bool pix_fmt_supported(uint32_t pixfmt) {
 	case V4L2_PIX_FMT_BGR24:
 	case V4L2_PIX_FMT_YUYV:
 	case V4L2_PIX_FMT_GREY:
+	case V4L2_PIX_FMT_MJPEG:
 		return true;
 	}
 	return false;
@@ -398,6 +401,13 @@ void camera_update_gl_textures(Camera *camera, const GLuint textures[3]) {
 			if (camera->frame_bytes_set >= frame_width * frame_height * 2)
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, frame_width / 2, frame_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, curr_frame);
 			break;
+		case V4L2_PIX_FMT_MJPEG: {
+			// "motion jpeg" is actually just a series of jpegs
+			int w = 0, h = 0, c = 0;
+			uint8_t *data = stbi_load_from_memory(curr_frame, camera->frame_bytes_set, &w, &h, &c, 3);
+			gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
+			free(data);
+			} break;
 		}
 	}
 	gl.PixelStorei(GL_UNPACK_ALIGNMENT, prev_align);

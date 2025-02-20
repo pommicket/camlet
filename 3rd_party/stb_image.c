@@ -1,4 +1,3 @@
-
 #ifdef __GNUC__
 #define no_warn_start _Pragma("GCC diagnostic push") \
 	_Pragma("GCC diagnostic ignored \"-Wpedantic\"") \
@@ -15,10 +14,12 @@
 #define no_warn_end
 #endif
 
-#define STB_IMAGE_WRITE_IMPLEMENTATION
+#define STB_IMAGE_IMPLEMENTATION
+#define STBI_ONLY_JPEG
+#define STBI_NO_STDIO
 #if __TINYC__
 #define STBI_NO_SIMD
 #endif
 no_warn_start
-#include "stb_image_write.h"
+#include "stb_image.h"
 no_warn_end

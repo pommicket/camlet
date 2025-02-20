@@ -1,4 +1,4 @@
-camlet.debug: meson.build *.[ch] debug/setup
+camlet.debug: meson.build *.[ch] 3rd_party/*.[ch] debug/setup
 	meson compile -C debug
 	ln -sf debug/camlet camlet.debug
 	cp debug/compile_commands.json .
