@@ -1,6 +1,5 @@
 /*
 TODO
--add support for more pixfmts
 -adjustable camera framerate
 -view previous pictures (thumbnails)
 -click in menus
@@ -439,6 +438,16 @@ void main() {\n\
 		float cb = texture2D(u_sampler2, tex_coord).x;\n\
 		float cr = texture2D(u_sampler3, tex_coord).x;\n\
 		color = ycbcr_ITU_R_601_to_rgb(vec3(y,cb,cr));\n\
+		} break;\n\
+	case 0x3231564e: {// YUV 4:2:0 with a Y plane and a UV plane\n\
+		float y = texture2D(u_sampler, tex_coord).x;\n\
+		vec2 cbcr = texture2D(u_sampler2, tex_coord).xy;\n\
+		color = ycbcr_ITU_R_601_to_rgb(vec3(y,cbcr));\n\
+		} break;\n\
+	case 0x3132564e: {// YVU 4:2:0 with a Y plane and a VU plane\n\
+		float y = texture2D(u_sampler, tex_coord).x;\n\
+		vec2 cbcr = texture2D(u_sampler2, tex_coord).yx;\n\
+		color = ycbcr_ITU_R_601_to_rgb(vec3(y,cbcr));\n\
 		} break;\n\
 	default:\n\
 		color = texture2D(u_sampler, tex_coord).xyz;\n\

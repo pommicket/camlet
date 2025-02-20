@@ -147,6 +147,8 @@ bool pix_fmt_supported(uint32_t pixfmt) {
 	case V4L2_PIX_FMT_MJPEG:
 	case V4L2_PIX_FMT_YUV420:
 	case V4L2_PIX_FMT_YVU420:
+	case V4L2_PIX_FMT_NV12:
+	case V4L2_PIX_FMT_NV21:
 		return true;
 	}
 	return false;
@@ -347,9 +349,10 @@ static uint8_t *curr_frame_rgb24(Camera *camera) {
 	}
 	int32_t frame_width = camera_frame_width(camera);
 	int32_t frame_height = camera_frame_height(camera);
-	const uint8_t *in = curr_frame, *in_y = NULL, *in_cb = NULL, *in_cr = NULL;
+	const uint8_t *in = curr_frame, *in_y = NULL, *in_cb = NULL, *in_cr = NULL, *in_cbcr = NULL;
 	uint8_t *out = camera->decompression_buf;
-	switch (camera_pixel_format(camera)) {
+	uint32_t pixfmt = camera_pixel_format(camera);
+	switch (pixfmt) {
 	case V4L2_PIX_FMT_BGR24: {
 		for (int32_t y = 0; y < frame_height; y++) {
 			for (int32_t x = 0; x < frame_width; x++) {
@@ -422,6 +425,30 @@ static uint8_t *curr_frame_rgb24(Camera *camera) {
 				// go back to start of cb, cr row
 				in_cb -= frame_width / 2;
 				in_cr -= frame_width / 2;
+			}
+		}
+		return camera->decompression_buf;
+	case V4L2_PIX_FMT_NV12:
+	case V4L2_PIX_FMT_NV21:
+		in_y = curr_frame;
+		in_cbcr = curr_frame + (size_t)frame_width * (size_t)frame_height;
+		for (int32_t row = 0; row < frame_height; row++) {
+			for (int32_t col = 0; col < frame_width; col++) {
+				float y = (float)(*in_y++) * (1.0f / 255.0f);
+				float cb = (float)(in_cbcr[pixfmt == V4L2_PIX_FMT_NV21]) * (1.0f / 255.0f);
+				float cr = (float)(in_cbcr[pixfmt == V4L2_PIX_FMT_NV12]) * (1.0f / 255.0f);
+				if (col % 2 == 1) {
+					in_cbcr += 2;
+				}
+				float rgb[3];
+				ycbcr_ITU_R_601_to_rgb(y, cb, cr, rgb);
+				*out++ = (uint8_t)roundf(rgb[0] * 255);
+				*out++ = (uint8_t)roundf(rgb[1] * 255);
+				*out++ = (uint8_t)roundf(rgb[2] * 255);
+			}
+			if (row % 2 == 0) {
+				// go back to start of cbcr row
+				in_cbcr -= frame_width;
 			}
 		}
 		return camera->decompression_buf;
@@ -598,10 +625,13 @@ void camera_update_gl_textures(Camera *camera, const GLuint textures[3]) {
 			break;
 		case V4L2_PIX_FMT_YUV420:
 			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 3 / 2) {
+				// Y plane
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width, frame_height, 0, GL_RED, GL_UNSIGNED_BYTE, curr_frame);
+				// Cb plane
 				gl.BindTexture(GL_TEXTURE_2D, textures[1]);
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width / 2, frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE,
 					curr_frame + (size_t)frame_width * (size_t)frame_height);
+				// Cr plane
 				gl.BindTexture(GL_TEXTURE_2D, textures[2]);
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width / 2, frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE,
 					curr_frame + (size_t)frame_width * (size_t)frame_height * 5 / 4);
@@ -610,13 +640,27 @@ void camera_update_gl_textures(Camera *camera, const GLuint textures[3]) {
 		case V4L2_PIX_FMT_YVU420:
 			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 3 / 2) {
 				// same as above, but swap textures[1] and textures[2] so that we only have to handle one case in the shader
+				// Y plane
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width, frame_height, 0, GL_RED, GL_UNSIGNED_BYTE, curr_frame);
+				// Cr plane
 				gl.BindTexture(GL_TEXTURE_2D, textures[2]);
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width / 2, frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE,
 					curr_frame + (size_t)frame_width * (size_t)frame_height);
+				// Cb plane
 				gl.BindTexture(GL_TEXTURE_2D, textures[1]);
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width / 2, frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE,
 					curr_frame + (size_t)frame_width * (size_t)frame_height * 5 / 4);
+			}
+			break;
+		case V4L2_PIX_FMT_NV12:
+		case V4L2_PIX_FMT_NV21:
+			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 3 / 2) {
+				// Y plane
+				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width, frame_height, 0, GL_RED, GL_UNSIGNED_BYTE, curr_frame);
+				// CbCr or CrCb plane
+				gl.BindTexture(GL_TEXTURE_2D, textures[1]);
+				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RG, frame_width / 2, frame_height / 2, 0, GL_RG, GL_UNSIGNED_BYTE,
+					curr_frame + (size_t)frame_width * (size_t)frame_height);
 			}
 			break;
 		case V4L2_PIX_FMT_MJPEG: {
