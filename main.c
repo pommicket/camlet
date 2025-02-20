@@ -391,6 +391,41 @@ void main() {\n\
 	case 0x47585858: // XXXGRAY (used for FPS display currently)\n\
 		color = vec3(texture2D(u_sampler, tex_coord).w);\n\
 		break;\n\
+	case 0x56595559: { // YUYV (YUV 4:2:2)\n\
+		ivec2 texsize = textureSize(u_sampler, 0);\n\
+		vec2 tc = tex_coord * vec2(texsize);\n\
+		ivec2 tc00 = ivec2(tc);\n\
+		ivec2 tc10 = clamp(tc00 + ivec2(1, 0), ivec2(0), texsize - ivec2(1, 1));\n\
+		ivec2 tc01 = clamp(tc00 + ivec2(0, 1), ivec2(0), texsize - ivec2(1, 1));\n\
+		ivec2 tc11 = clamp(tc00 + ivec2(1, 1), ivec2(0), texsize - ivec2(1, 1));\n\
+		vec2 tcfrac = tc - vec2(tc00);\n\
+		vec4 t00 = texelFetch(u_sampler, tc00, 0);\n\
+		vec4 t10 = texelFetch(u_sampler, tc10, 0);\n\
+		vec4 t01 = texelFetch(u_sampler, tc01, 0);\n\
+		vec4 t11 = texelFetch(u_sampler, tc11, 0);\n\
+		vec2 cbcr0 = mix(t00.yw, t01.yw, tcfrac.y);\n\
+		vec2 cbcr1 = mix(t10.yw, t11.yw, tcfrac.y);\n\
+		vec2 cbcr = mix(cbcr0, cbcr1, tcfrac.x);\n\
+		float y0, y1;\n\
+		if (tcfrac.x < 0.5) {\n\
+			y0 = mix(t00.x, t00.z, tcfrac.x * 2.0);\n\
+			y1 = mix(t01.x, t01.z, tcfrac.x * 2.0);\n\
+		} else {\n\
+			y0 = mix(t00.z, t10.x, tcfrac.x * 2.0 - 1.0);\n\
+			y1 = mix(t01.z, t11.x, tcfrac.x * 2.0 - 1.0);\n\
+		}\n\
+		float y = mix(y0, y1, tcfrac.y);\n\
+		//y = t00.x;\n\
+		//cbcr = t00.yw;\n\
+		y -= 16.0 / 255.0;\n\
+		float cb = cbcr.x - 128.0 / 255.0;\n\
+		float cr = cbcr.y - 128.0 / 255.0;\n\
+		color = vec3(y+255.0/224.0*1.402*cr,\n\
+			255.0/219.0*y-255.0/224.0*1.772*0.11/0.587*cb-255.0/224.0*1.402*0.299/0.587*cr,\n\
+			255.0/219.0*y+255.0/224.0*1.772*cb);\n\
+		//color = vec3(y);\n\
+		color = clamp(color, 0.0, 1.0);\n\
+		} break;\n\
 	default:\n\
 		color = texture2D(u_sampler, tex_coord).xyz;\n\
 		break;\n\
@@ -812,8 +847,16 @@ void main() {\n\
 				gl.Uniform2f(u_scale, 1, 1);
 			}
 		}
+		static double last_camera_time;
+		if (last_camera_time == 0) last_camera_time = curr_time;
+		static double smoothed_camera_time;
 		if (state->camera) {
 			if (camera_next_frame(state->camera)) {
+				if (smoothed_camera_time == 0)
+					smoothed_camera_time = curr_time - last_camera_time;
+				// bias towards recent frame times
+				smoothed_camera_time = smoothed_camera_time * 0.9 + (curr_time - last_camera_time) * 0.1;
+				last_camera_time = curr_time;
 				camera_update_gl_textures(state->camera, camera_textures);
 			}
 			gl.Uniform1i(u_pixel_format, camera_pixel_format(state->camera));
@@ -845,12 +888,12 @@ void main() {\n\
 			gl.Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
 			gl.DrawArrays(GL_TRIANGLES, 0, 6);
 		}
-		static double smoothed_frame_time;
-		if (smoothed_frame_time == 0)
-			smoothed_frame_time = frame_time;
-		// bias towards recent frame times
-		smoothed_frame_time = smoothed_frame_time * 0.9 + frame_time * 0.1;
 		if (state->show_fps) {
+			static double smoothed_frame_time;
+			if (smoothed_frame_time == 0)
+				smoothed_frame_time = frame_time;
+			// bias towards recent frame times
+			smoothed_frame_time = smoothed_frame_time * 0.9 + frame_time * 0.1;
 			static double last_fps_update = -INFINITY;
 			gl.Enable(GL_BLEND);
 			gl.ActiveTexture(GL_TEXTURE0);
@@ -859,9 +902,9 @@ void main() {\n\
 			if (curr_time - last_fps_update > 0.5) {
 				last_fps_update = curr_time;
 				static char text[32];
-				snprintf(text, sizeof text, "FPS: %" PRId32,
-					smoothed_frame_time > 1e-9 && smoothed_frame_time < 1 ? (int32_t)(1/smoothed_frame_time)
-						: 0);
+				snprintf(text, sizeof text, "Camera FPS: %" PRId32 "  Render FPS: %" PRId32,
+					smoothed_camera_time > 1e-9 && smoothed_camera_time < 1 ? (int32_t)(1/smoothed_camera_time) : 0,
+					smoothed_frame_time > 1e-9 && smoothed_frame_time < 1 ? (int32_t)(1/smoothed_frame_time) : 0);
 				SDL_Surface *fps = TTF_RenderUTF8_Blended(font, text, (SDL_Color){255,255,255,255});
 				SDL_LockSurface(fps);
 				gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);

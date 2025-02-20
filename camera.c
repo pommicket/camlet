@@ -123,6 +123,7 @@ bool pix_fmt_supported(uint32_t pixfmt) {
 	switch (pixfmt) {
 	case V4L2_PIX_FMT_RGB24:
 	case V4L2_PIX_FMT_BGR24:
+	case V4L2_PIX_FMT_YUYV:
 	case V4L2_PIX_FMT_GREY:
 		return true;
 	}
@@ -393,6 +394,10 @@ void camera_update_gl_textures(Camera *camera, const GLuint textures[3]) {
 			if (camera->frame_bytes_set >= frame_width * frame_height)
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width, frame_height, 0, GL_RED, GL_UNSIGNED_BYTE, curr_frame);
 			break;
+		case V4L2_PIX_FMT_YUYV:
+			if (camera->frame_bytes_set >= frame_width * frame_height * 2)
+				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, frame_width / 2, frame_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, curr_frame);
+			break;
 		}
 	}
 	gl.PixelStorei(GL_UNPACK_ALIGNMENT, prev_align);
@@ -452,12 +457,9 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod 
 	format.fmt.pix.field = V4L2_FIELD_ANY;
 	// v4l2 should be able to output rgb24 for all reasonable cameras
 	uint32_t pixfmt = V4L2_PIX_FMT_RGB24;
-	switch (picfmt.pixfmt) {
-	// we can actually handle these pixel formats
-	case V4L2_PIX_FMT_BGR24:
-	case V4L2_PIX_FMT_GREY:
+	if (pix_fmt_supported(picfmt.pixfmt)) {
+		// we can handle this format actually
 		pixfmt = picfmt.pixfmt;
-		break;
 	}
 	format.fmt.pix.pixelformat = pixfmt;
 	format.fmt.pix.width = picfmt.width;
@@ -465,6 +467,9 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod 
 	if (v4l2_ioctl(camera->fd, VIDIOC_S_FMT, &format) != 0) {
 		perror("v4l2_ioctl VIDIOC_S_FMT");
 		return false;
+	}
+	if (pixfmt == V4L2_PIX_FMT_YUYV) {
+		printf("%u\n",format.fmt.pix.ycbcr_enc);
 	}
 	camera->curr_format = format;
 	//printf("image size = %uB\n",format.fmt.pix.sizeimage);
