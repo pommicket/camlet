@@ -381,6 +381,11 @@ uniform sampler2D u_sampler;\n\
 uniform int u_pixel_format;\n\
 uniform float u_flash;\n\
 uniform float u_opacity;\n\
+vec3 ycbcr_ITU_R_601_to_rgb(vec3 ycbcr) {\n\
+	mat4x3 cool_matrix = mat4x3(1.0,1.164,1.164,0.0,-0.378,2.107,1.596,-0.813,0.0,-0.864,0.525,-1.086);\n\
+	vec3 gamma = vec3(0.9,1.1,1.3); // made up number tuned to my camera. probably can be inferred from v4l2_pix_format::xfer_func but that sounds annoying. \n\
+	return clamp(pow(cool_matrix * vec4(ycbcr,1.0), gamma), 0.0, 1.0);\n\
+}\n\
 void main() {\n\
 	vec3 color;\n\
 	float opacity = u_opacity;\n\
@@ -415,13 +420,8 @@ void main() {\n\
 			y1 = mix(t01.z, t11.x, tcfrac.x * 2.0 - 1.0);\n\
 		}\n\
 		float y = mix(y0, y1, tcfrac.y);\n\
-		float cb = cbcr.x;\n\
-		float cr = cbcr.y;\n\
-		color = vec3((y-0.0627)+255.0/224.0*1.402*(cr-0.502),\n\
-			255.0/219.0*(y-0.0627)-255.0/224.0*1.772*0.11/0.587*(cb-0.502)-255.0/224.0*1.402*0.299/0.587*(cr-0.502),\n\
-			255.0/219.0*(y-0.0627)+255.0/224.0*1.772*(cb-0.502));\n\
-		//color = vec3(y);\n\
-		color = clamp(color, 0.0, 1.0);\n\
+		// technically we should check v4l2_pix_format::ycbcr_enc, but whatever.\n\
+		color = ycbcr_ITU_R_601_to_rgb(vec3(y,cbcr));\n\
 		} break;\n\
 	default:\n\
 		color = texture2D(u_sampler, tex_coord).xyz;\n\
@@ -541,6 +541,7 @@ void main() {\n\
 			return EXIT_FAILURE;
 	}
 	double flash_time = INFINITY;
+	uint32_t last_frame_pixfmt = 0;
 	while(true) {
 		struct udev_device *dev = NULL;
 		while (udev_monitor && (dev = udev_monitor_receive_device(udev_monitor))) {
@@ -849,6 +850,7 @@ void main() {\n\
 		static double smoothed_camera_time;
 		if (state->camera) {
 			if (camera_next_frame(state->camera)) {
+				last_frame_pixfmt = camera_pixel_format(state->camera);
 				if (smoothed_camera_time == 0)
 					smoothed_camera_time = curr_time - last_camera_time;
 				// bias towards recent frame times
@@ -856,7 +858,7 @@ void main() {\n\
 				last_camera_time = curr_time;
 				camera_update_gl_textures(state->camera, camera_textures);
 			}
-			gl.Uniform1i(u_pixel_format, camera_pixel_format(state->camera));
+			gl.Uniform1i(u_pixel_format, last_frame_pixfmt);
 			gl.ActiveTexture(GL_TEXTURE0);
 			gl.BindTexture(GL_TEXTURE_2D, camera_textures[0]);
 			gl.ActiveTexture(GL_TEXTURE1);

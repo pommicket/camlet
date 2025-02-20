@@ -468,9 +468,6 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod 
 		perror("v4l2_ioctl VIDIOC_S_FMT");
 		return false;
 	}
-	if (pixfmt == V4L2_PIX_FMT_YUYV) {
-		printf("%u\n",format.fmt.pix.ycbcr_enc);
-	}
 	camera->curr_format = format;
 	//printf("image size = %uB\n",format.fmt.pix.sizeimage);
 	switch (camera->access_method) {
