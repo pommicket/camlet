@@ -7,9 +7,9 @@ debug/setup:
 	meson setup debug
 	touch debug/setup
 release: release/camlet
-release/camlet: meson.build main.c release/setup
+release/camlet: meson.build *.[ch] 3rd_party/*.[ch] release/setup2
 	meson compile -C release
-release/setup:
+release/setup2:
 	rm -rf release
-	meson setup release
-	touch release/setup
+	meson setup --buildtype=release release
+	touch release/setup2

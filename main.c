@@ -230,6 +230,12 @@ static void render_text_to_surface(TTF_Font *font, SDL_Surface *dest, int x, int
 	render_text_to_surface_anchored(font, dest, x, y, color, str, -1, -1);
 }
 
+static double get_time_double(void) {
+	struct timespec ts = {0};
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
 int main(void) {
 	static State state_data;
 	State *state = &state_data;
@@ -326,9 +332,7 @@ int main(void) {
 	}
 	#endif
 	gl.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
-	struct timespec ts = {0};
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	double last_time = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+	double last_time = get_time_double();
 	GLuint textures[6] = {0};
 	gl.GenTextures(SDL_arraysize(textures), textures);
 	for (size_t i = 0; i < SDL_arraysize(textures); i++) {
@@ -381,9 +385,11 @@ uniform sampler2D u_sampler;\n\
 uniform int u_pixel_format;\n\
 uniform float u_flash;\n\
 uniform float u_opacity;\n\
+// SEE ALSO: identically-named function in camera.c\n\
 vec3 ycbcr_ITU_R_601_to_rgb(vec3 ycbcr) {\n\
 	mat4x3 cool_matrix = mat4x3(1.0,1.164,1.164,0.0,-0.378,2.107,1.596,-0.813,0.0,-0.864,0.525,-1.086);\n\
-	vec3 gamma = vec3(0.9,1.1,1.3); // made up number tuned to my camera. probably can be inferred from v4l2_pix_format::xfer_func but that sounds annoying. \n\
+	// made up number tuned to my camera. probably can be inferred from v4l2_pix_format::xfer_func but that sounds annoying.\n\
+	vec3 gamma = vec3(0.9,1.1,1.3);  \n\
 	return clamp(pow(cool_matrix * vec4(ycbcr,1.0), gamma), 0.0, 1.0);\n\
 }\n\
 void main() {\n\
@@ -540,7 +546,7 @@ void main() {\n\
 		if (!camera_open(state->camera))
 			return EXIT_FAILURE;
 	}
-	double flash_time = INFINITY;
+	double flash_time = -INFINITY;
 	uint32_t last_frame_pixfmt = 0;
 	while(true) {
 		struct udev_device *dev = NULL;
@@ -578,8 +584,9 @@ void main() {\n\
 						assert(false);
 						break;
 					}
-					if (success)
-						flash_time = 0;
+					if (success) {
+						flash_time = get_time_double();
+					}
 				}
 				break;
 			case SDLK_ESCAPE:
@@ -815,10 +822,8 @@ void main() {\n\
 		gl.Viewport(0, 0, window_width, window_height);
 		gl.ClearColor(0, 0, 0, 1);
 		gl.Clear(GL_COLOR_BUFFER_BIT);
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		double curr_time = (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+		double curr_time = get_time_double();
 		double frame_time = curr_time - last_time;
-		flash_time += frame_time;
 		last_time = curr_time;
 		
 		gl.UseProgram(program);
@@ -873,7 +878,7 @@ void main() {\n\
 		gl.Disable(GL_BLEND);
 		gl.BindBuffer(GL_ARRAY_BUFFER, vbo);
 		gl.BindVertexArray(vao);
-		gl.Uniform1f(u_flash, expf(-flash_time * 3));
+		gl.Uniform1f(u_flash, expf(-(curr_time - flash_time) * 3));
 		gl.DrawArrays(GL_TRIANGLES, 0, 6);
 		gl.Uniform1f(u_flash, 0);
 		if (state->curr_menu) {

@@ -5,3 +5,4 @@ camlet.debug
 compile_commands.json
 out.bmp
 *.jpg
+*.png

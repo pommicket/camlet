@@ -6,10 +6,11 @@
 #include <sys/mman.h>
 #include <poll.h>
 #include <fcntl.h>
+#include <time.h>
+#include <tgmath.h>
 #include "ds.h"
 #include "3rd_party/stb_image_write.h"
-#define STBI_ONLY_JPEG
-#include "3rd_party/stb_image.h"
+#include <jpeglib.h>
 
 #define CAMERA_MAX_BUFFERS 4
 struct Camera {
@@ -24,6 +25,7 @@ struct Camera {
 	// number of bytes actually read into current frame.
 	// this can be variable for compressed formats, and doesn't match v4l2_format sizeimage for grayscale for example
 	size_t frame_bytes_set;
+	bool any_frames;
 	int curr_frame_idx;
 	int buffer_count;
 	struct v4l2_buffer frame_buffer;
@@ -33,6 +35,9 @@ struct Camera {
 	size_t mmap_size[CAMERA_MAX_BUFFERS];
 	uint8_t *mmap_frames[CAMERA_MAX_BUFFERS];
 	uint8_t *userp_frames[CAMERA_MAX_BUFFERS];
+	// buffer used for jpeg decompression and format conversion for saving images
+	// should always be big enough for a 8bpc RGB frame
+	uint8_t *decompression_buf;
 };
 
 static GlProcs gl;
@@ -293,31 +298,46 @@ PictureFormat camera_picture_format(Camera *camera) {
 }
 
 static uint8_t *camera_curr_frame(Camera *camera) {
+	if (!camera->any_frames)
+		return NULL;
 	if (camera->read_frame)
 		return camera->read_frame;
-	if (camera->curr_frame_idx < 0)
-		return NULL;
 	if (camera->mmap_frames[camera->curr_frame_idx])
 		return camera->mmap_frames[camera->curr_frame_idx];
 	assert(camera->userp_frames[camera->curr_frame_idx]);
 	return camera->userp_frames[camera->curr_frame_idx];
 }
 
+static float clampf(float x, float min, float max) {
+	if (x < min) return min;
+	if (x > max) return max;
+	return x;
+}
+
+// SEE ALSO: identically named function in fragment shader
+static void ycbcr_ITU_R_601_to_rgb(float y, float cb, float cr, float rgb[3]) {
+	rgb[0] = clampf(powf(y + 1.596f * cr - 0.864f, 0.9f), 0, 1);
+	rgb[1] = clampf(powf(1.164f * y - 0.378f * cb - 0.813f * cr + 0.525f, 1.1f), 0, 1);
+	rgb[2] = clampf(powf(1.164f * y + 2.107f * cb - 1.086f, 1.3f), 0, 1);
+}
+
 static uint8_t *curr_frame_rgb24(Camera *camera) {
 	uint8_t *curr_frame = camera_curr_frame(camera);
-	if (camera_pixel_format(camera) == V4L2_PIX_FMT_RGB24)
+	if (!curr_frame || !camera->decompression_buf)
+		return NULL;
+	if (camera_pixel_format(camera) == V4L2_PIX_FMT_RGB24) {
 		return curr_frame;
-	if (camera_pixel_format(camera) == V4L2_PIX_FMT_MJPEG) {
-		int w, h, c;
-		return stbi_load_from_memory(curr_frame, camera->frame_bytes_set, &w, &h, &c, 3);
 	}
-	int32_t frame_width = camera_frame_width(camera), frame_height = camera_frame_height(camera);
-	uint8_t *rgb24 = calloc(3 * frame_width, frame_height);
+	if (camera_pixel_format(camera) == V4L2_PIX_FMT_MJPEG) {
+		return camera->decompression_buf;
+	}
+	int32_t frame_width = camera_frame_width(camera);
+	int32_t frame_height = camera_frame_height(camera);
 	switch (camera_pixel_format(camera)) {
 	case V4L2_PIX_FMT_BGR24: {
+		const uint8_t *in = curr_frame;
+		uint8_t *out = camera->decompression_buf;
 		for (int32_t y = 0; y < frame_height; y++) {
-			const uint8_t *in = &curr_frame[y * 3 * frame_width];
-			uint8_t *out = &rgb24[y * 3 * frame_width];
 			for (int32_t x = 0; x < frame_width; x++) {
 				*out++ = in[2];
 				*out++ = in[1];
@@ -325,11 +345,30 @@ static uint8_t *curr_frame_rgb24(Camera *camera) {
 				in += 3;
 			}
 		}
-		return rgb24;
+		return camera->decompression_buf;
 		} break;
-	case V4L2_PIX_FMT_YUYV:
-		assert(!*"TODO");
-		return NULL;
+	case V4L2_PIX_FMT_YUYV: {
+		const uint8_t *in = curr_frame;
+		uint8_t *out = camera->decompression_buf;
+		for (int32_t y = 0; y < frame_height; y++) {
+			for (int32_t x = 0; x < frame_width / 2; x++) {
+				float y0 = (float)(*in++) * (1.0f / 255.0f);
+				float cb = (float)(*in++) * (1.0f / 255.0f);
+				float y1 = (float)(*in++) * (1.0f / 255.0f);
+				float cr = (float)(*in++) * (1.0f / 255.0f);
+				float rgb0[3], rgb1[3];
+				ycbcr_ITU_R_601_to_rgb(y0, cb, cr, rgb0);
+				ycbcr_ITU_R_601_to_rgb(y1, cb, cr, rgb1);
+				*out++ = (uint8_t)roundf(rgb0[0] * 255);
+				*out++ = (uint8_t)roundf(rgb0[1] * 255);
+				*out++ = (uint8_t)roundf(rgb0[2] * 255);
+				*out++ = (uint8_t)roundf(rgb1[0] * 255);
+				*out++ = (uint8_t)roundf(rgb1[1] * 255);
+				*out++ = (uint8_t)roundf(rgb1[2] * 255);
+			}
+		}
+		return camera->decompression_buf;
+		}
 	}
 	assert(false);
 	return NULL;
@@ -351,7 +390,6 @@ bool camera_save_jpg(Camera *camera, const char *name, int quality) {
 		uint32_t frame_width = camera_frame_width(camera);
 		uint32_t frame_height = camera_frame_height(camera);
 		bool ret = stbi_write_jpg(name, frame_width, frame_height, 3, frame, quality) != 0;
-		free(camera_curr_frame(camera) == frame ? NULL : frame);
 		return ret;
 	} else {
 		return false;
@@ -362,13 +400,21 @@ bool camera_save_png(Camera *camera, const char *name) {
 	if (frame) {
 		uint32_t frame_width = camera_frame_width(camera);
 		uint32_t frame_height = camera_frame_height(camera);
-		bool ret = stbi_write_png(name, frame_width, frame_height, 3, frame, frame_width * 3) != 0;
-		free(camera_curr_frame(camera) == frame ? NULL : frame);
-		return ret;
+		return stbi_write_png(name, frame_width, frame_height, 3, frame, 0) != 0;
 	} else {
 		return false;
 	}
 }
+
+typedef struct {
+	struct jpeg_error_mgr base;
+	bool error;
+} JpegErrorMessenger;
+static void jpeg_error_handler(j_common_ptr cinfo) {
+	((JpegErrorMessenger *)cinfo->err)->error = true;
+	cinfo->err->output_message(cinfo);
+}
+
 bool camera_next_frame(Camera *camera) {
 	struct pollfd pollfd = {.fd = camera->fd, .events = POLLIN};
 	// check whether there is any data available from camera
@@ -382,7 +428,8 @@ bool camera_next_frame(Camera *camera) {
 		return false;
 	case CAMERA_ACCESS_READ:
 		camera->frame_bytes_set = v4l2_read(camera->fd, camera->read_frame, camera->curr_format.fmt.pix.sizeimage);
-		return true;
+		camera->any_frames = true;
+		break;
 	case CAMERA_ACCESS_MMAP:
 		memory = V4L2_MEMORY_MMAP;
 		goto buf;
@@ -409,7 +456,8 @@ bool camera_next_frame(Camera *camera) {
 		camera->frame_bytes_set = buf.bytesused;
 		camera->curr_frame_idx = buf.index;
 		camera->frame_buffer = buf;
-		return true;
+		camera->any_frames = true;
+		break;
 		}
 	default:
 		#if DEBUG
@@ -417,12 +465,56 @@ bool camera_next_frame(Camera *camera) {
 		#endif
 		return false;
 	}
+	const uint8_t *curr_frame = camera_curr_frame(camera);
+	const int32_t frame_width = camera_frame_width(camera);
+	const int32_t frame_height = camera_frame_height(camera);
+	if (camera_pixel_format(camera) == V4L2_PIX_FMT_MJPEG) {
+		// decompress the jpeg
+		// NOTE: libjpeg is ~2x as fast as stb_image
+		JpegErrorMessenger messenger = {.base = {.error_exit = jpeg_error_handler}};
+		struct jpeg_decompress_struct cinfo = {0};
+		cinfo.err = jpeg_std_error(&messenger.base);
+		jpeg_create_decompress(&cinfo);
+		if (!messenger.error)
+			jpeg_mem_src(&cinfo, curr_frame, camera->frame_bytes_set);
+		if (!messenger.error)
+			jpeg_read_header(&cinfo, true);
+		if (!messenger.error)
+			jpeg_start_decompress(&cinfo);
+		if (!messenger.error && cinfo.output_components != 3) {
+			fprintf(stderr, "JPEG has %d components, instead of 3. That's messed up.\n",
+				cinfo.output_components);
+			messenger.error = true;
+		}
+		if (!messenger.error && (int32_t)cinfo.output_width != frame_width) {
+			fprintf(stderr, "JPEG from camera has width %" PRId32 ", but I was expecting %" PRId32 "\n",
+				(int32_t)cinfo.output_width, frame_width);
+		}
+		if (!messenger.error && (int32_t)cinfo.output_height != frame_height) {
+			fprintf(stderr, "JPEG from camera has height %" PRId32 ", but I was expecting %" PRId32 "\n",
+				(int32_t)cinfo.output_height, frame_height);
+		}
+		if (!messenger.error) {
+			for (int32_t y = 0; y < frame_height; y++) {
+				jpeg_read_scanlines(&cinfo, (uint8_t*[1]){ &camera->decompression_buf[(size_t)y*frame_width*3] }, 1);
+			}
+		}
+		if (!messenger.error)
+			jpeg_finish_decompress(&cinfo);
+		jpeg_destroy_decompress(&cinfo);
+		if (messenger.error) {
+			camera->any_frames = false;
+			return false;
+		}
+	}
+	return true;
 }
+
 void camera_update_gl_textures(Camera *camera, const GLuint textures[3]) {
 	int prev_align = 1;
 	gl.BindTexture(GL_TEXTURE_2D, textures[0]);
 	gl.GetIntegerv(GL_UNPACK_ALIGNMENT, &prev_align);
-	uint32_t frame_width = camera_frame_width(camera), frame_height = camera_frame_height(camera);
+	int32_t frame_width = camera_frame_width(camera), frame_height = camera_frame_height(camera);
 	for (int align = 8; align >= 1; align >>= 1) {
 		if (frame_width % align == 0) {
 			gl.PixelStorei(GL_UNPACK_ALIGNMENT, align);
@@ -433,27 +525,25 @@ void camera_update_gl_textures(Camera *camera, const GLuint textures[3]) {
 	if (curr_frame) {
 		switch (camera->curr_format.fmt.pix.pixelformat) {
 		case V4L2_PIX_FMT_RGB24:
-			if (camera->frame_bytes_set >= frame_width * frame_height * 3)
+			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 3)
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame_width, frame_height, 0, GL_RGB, GL_UNSIGNED_BYTE, curr_frame);
 			break;
 		case V4L2_PIX_FMT_BGR24:
-			if (camera->frame_bytes_set >= frame_width * frame_height * 3)
+			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 3)
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame_width, frame_height, 0, GL_BGR, GL_UNSIGNED_BYTE, curr_frame);
 			break;
 		case V4L2_PIX_FMT_GREY:
-			if (camera->frame_bytes_set >= frame_width * frame_height)
+			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height)
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width, frame_height, 0, GL_RED, GL_UNSIGNED_BYTE, curr_frame);
 			break;
 		case V4L2_PIX_FMT_YUYV:
-			if (camera->frame_bytes_set >= frame_width * frame_height * 2)
+			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 2)
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, frame_width / 2, frame_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, curr_frame);
 			break;
 		case V4L2_PIX_FMT_MJPEG: {
 			// "motion jpeg" is actually just a series of jpegs
-			int w = 0, h = 0, c = 0;
-			uint8_t *data = stbi_load_from_memory(curr_frame, camera->frame_bytes_set, &w, &h, &c, 3);
-			gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, w, h, 0, GL_RGB, GL_UNSIGNED_BYTE, data);
-			free(data);
+			gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame_width, frame_height, 0, GL_RGB, GL_UNSIGNED_BYTE,
+				camera->decompression_buf);
 			} break;
 		}
 	}
@@ -475,6 +565,8 @@ CameraAccessMethod camera_access_method(Camera *camera) {
 void camera_close(Camera *camera) {
 	free(camera->read_frame);
 	camera->read_frame = NULL;
+	free(camera->decompression_buf);
+	camera->decompression_buf = NULL;
 	for (int i = 0; i < CAMERA_MAX_BUFFERS; i++) {
 		if (camera->mmap_frames[i]) {
 			v4l2_munmap(camera->mmap_frames[i], camera->mmap_size[i]);
@@ -499,6 +591,7 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod 
 		// no changes needed
 		return true;
 	}
+	camera->any_frames = false;
 	camera->access_method = access;
 	for (int i = 0; i < camera->buffer_count; i++) {
 		if (camera->mmap_frames[i]) {
@@ -521,6 +614,11 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod 
 	format.fmt.pix.pixelformat = pixfmt;
 	format.fmt.pix.width = picfmt.width;
 	format.fmt.pix.height = picfmt.height;
+	camera->decompression_buf = realloc(camera->decompression_buf, (size_t)3 * picfmt.width * picfmt.height);
+	if (!camera->decompression_buf) {
+		perror("realloc");
+		return false;
+	}
 	if (v4l2_ioctl(camera->fd, VIDIOC_S_FMT, &format) != 0) {
 		perror("v4l2_ioctl VIDIOC_S_FMT");
 		return false;
@@ -578,7 +676,6 @@ static void cameras_from_device_with_fd(const char *dev_path, const char *serial
 			return;
 		}
 		camera->fd = -1;
-		camera->curr_frame_idx = -1;
 		crypto_generichash_init(&camera->hash_state, NULL, 0, HASH_SIZE);
 		crypto_generichash_update(&camera->hash_state, cap.card, strlen((const char *)cap.card) + 1);
 		crypto_generichash_update(&camera->hash_state, input.name, strlen((const char *)input.name) + 1);

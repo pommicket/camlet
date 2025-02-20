@@ -12,6 +12,7 @@ udev = dependency('libudev')
 gl = dependency('GL')
 sodium = dependency('libsodium')
 fontconfig = dependency('fontconfig')
+jpeg = dependency('libjpeg')
 m_dep = cc.find_library('m', required: false)
 if m_dep.found()
 	add_project_link_arguments('-lm', language: 'c')
@@ -21,6 +22,6 @@ if get_option('debug')
 else
 	debug_def = '-DDEBUG=0'
 endif
-executable('camlet', 'main.c', 'camera.c', '3rd_party/stb_image_write.c', '3rd_party/stb_image.c',
-	dependencies: [v4l2, sdl2, sdl2_ttf, gl, udev, sodium, fontconfig],
+executable('camlet', 'main.c', 'camera.c', '3rd_party/stb_image_write.c',
+	dependencies: [v4l2, sdl2, sdl2_ttf, gl, udev, sodium, fontconfig, jpeg],
 	c_args: ['-Wno-unused-function', '-Wno-format-truncation', '-Wshadow', debug_def])
