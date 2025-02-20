@@ -336,6 +336,16 @@ static uint8_t *curr_frame_rgb24(Camera *camera) {
 }
 
 bool camera_save_jpg(Camera *camera, const char *name, int quality) {
+	if (camera_pixel_format(camera) == V4L2_PIX_FMT_MJPEG && camera_curr_frame(camera)) {
+		// frame is already in jpeg format
+		FILE *fp = fopen(name, "wb");
+		if (!fp) {
+			perror("fopen");
+			return false;
+		}
+		fwrite(camera_curr_frame(camera), 1, camera->frame_bytes_set, fp);
+		fclose(fp);
+	}
 	uint8_t *frame = curr_frame_rgb24(camera);
 	if (frame) {
 		uint32_t frame_width = camera_frame_width(camera);
