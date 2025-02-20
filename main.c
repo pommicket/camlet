@@ -1,8 +1,8 @@
 /*
 TODO
--adjustable camera framerate
 -view previous pictures (thumbnails)
--click in menus
+-video
+-adjustable camera framerate
 -save/restore settings
 */
 #define _GNU_SOURCE
@@ -67,9 +67,12 @@ typedef struct {
 	Menu curr_menu;
 	int menu_sel[MENU_COUNT];
 	bool show_fps;
+	bool menu_needs_rerendering;
+	bool quit;
 	Camera *camera;
 	Camera **cameras;
 	ImageFormat image_format;
+	SDL_Rect *menu_option_rects;
 } State;
 
 #if crypto_generichash_BYTES_MIN > HASH_SIZE
@@ -197,17 +200,17 @@ static int menu_option_count(State *state) {
 	case MENU_NONE: return 0;
 	case MENU_HELP: return 1;
 	case MENU_MAIN: return strlen(main_menu);
-	case MENU_INPUT: return arr_len(state->cameras);
+	case MENU_INPUT: return (int)arr_len(state->cameras) + 1;
 	case MENU_RESOLUTION: {
 		PictureFormat *resolutions = camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera));
-		int n = (int)arr_len(resolutions);
+		int n = (int)arr_len(resolutions) + 1;
 		arr_free(resolutions);
 		return n;
 		}
 		break;
 	case MENU_PIXFMT: {
 		uint32_t *pixfmts = camera_get_pixfmts(state->camera);
-		int n = (int)arr_len(pixfmts);
+		int n = (int)arr_len(pixfmts) + 1;
 		arr_free(pixfmts);
 		return n;
 		}
@@ -217,23 +220,133 @@ static int menu_option_count(State *state) {
 	assert(false);
 	return 0;
 }
-static void render_text_to_surface_anchored(TTF_Font *font, SDL_Surface *dest, int x, int y, SDL_Color color, const char *str,
+static SDL_Rect render_text_to_surface_anchored(TTF_Font *font, SDL_Surface *dest, int x, int y, SDL_Color color, const char *str,
 	int xanchor, int yanchor) {
 	SDL_Surface *text = TTF_RenderUTF8_Blended(font, str, color);
 	x -= (xanchor + 1) * text->w / 2;
 	y -= (yanchor + 1) * text->h / 2;
 	SDL_BlitSurface(text, NULL, dest, (SDL_Rect[1]){{x, y, 0, 0}});
+	int w = text->w, h = text->h;
 	SDL_FreeSurface(text);
+	return (SDL_Rect){x, y, w, h};
 }
 
-static void render_text_to_surface(TTF_Font *font, SDL_Surface *dest, int x, int y, SDL_Color color, const char *str) {
-	render_text_to_surface_anchored(font, dest, x, y, color, str, -1, -1);
+static SDL_Rect render_text_to_surface(TTF_Font *font, SDL_Surface *dest, int x, int y, SDL_Color color, const char *str) {
+	return render_text_to_surface_anchored(font, dest, x, y, color, str, -1, -1);
 }
 
 static double get_time_double(void) {
 	struct timespec ts = {0};
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void menu_select(State *state) {
+	if (state->curr_menu == MENU_MAIN) {
+		switch (main_menu[state->menu_sel[MENU_MAIN]]) {
+		case MENU_OPT_QUIT:
+			state->quit = true;
+			break;
+		case MENU_OPT_RESOLUTION: if (state->camera) {
+			state->curr_menu = MENU_RESOLUTION;
+			state->menu_needs_rerendering = true;
+			// set menu_sel
+			PictureFormat *resolutions = camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera));
+			arr_foreach_ptr(resolutions, PictureFormat, resolution) {
+				if (resolution->width == camera_frame_width(state->camera)
+					&& resolution->height == camera_frame_height(state->camera)) {
+					state->menu_sel[MENU_RESOLUTION] = (int)(resolution - resolutions) + 1;
+				}
+			}
+			arr_free(resolutions);
+			} break;
+		case MENU_OPT_INPUT:
+			if (state->cameras) {
+				state->curr_menu = MENU_INPUT;
+				state->menu_needs_rerendering = true;
+				state->menu_sel[MENU_INPUT] = 0;
+				arr_foreach_ptr(state->cameras, Camera *, pcam) {
+					if (*pcam == state->camera) {
+						state->menu_sel[MENU_INPUT] = (int)(pcam - state->cameras) + 1;
+					}
+				}
+			}
+			break;
+		case MENU_OPT_PIXFMT: if (state->camera) {
+			state->curr_menu = MENU_PIXFMT;
+			state->menu_needs_rerendering = true;
+			// set menu_sel
+			uint32_t *pixfmts = camera_get_pixfmts(state->camera);
+			arr_foreach_ptr(pixfmts, uint32_t, pixfmt) {
+				if (*pixfmt == camera_pixel_format(state->camera)) {
+					state->menu_sel[MENU_PIXFMT] = (int)(pixfmt - pixfmts) + 1;
+				}
+			}
+			arr_free(pixfmts);
+			} break;
+		case MENU_OPT_IMGFMT: {
+			state->image_format = (state->image_format + 1) % IMG_FMT_COUNT;
+			state->menu_needs_rerendering = true;
+			} break;
+		}
+	} else if (state->curr_menu == MENU_RESOLUTION) {
+		int sel = state->menu_sel[state->curr_menu];
+		if (sel == 0) {
+			state->curr_menu = MENU_MAIN;
+			state->menu_needs_rerendering = true;
+			return;
+		}
+		PictureFormat *resolutions = camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera));
+		camera_set_format(state->camera,
+			resolutions[sel-1],
+			camera_access_method(state->camera),
+			false);
+		arr_free(resolutions);
+	} else if (state->curr_menu == MENU_INPUT) {
+		int sel = state->menu_sel[state->curr_menu];
+		if (sel == 0) {
+			state->curr_menu = MENU_MAIN;
+			state->menu_needs_rerendering = true;
+			return;
+		}
+		Camera *new_camera = state->cameras[sel-1];
+		if (state->camera == new_camera) {
+			// already using this camera
+		} else {
+			camera_close(state->camera);
+			state->camera = new_camera;
+			camera_open(state->camera);
+		}
+	} else if (state->curr_menu == MENU_PIXFMT) {
+		uint32_t *pixfmts = camera_get_pixfmts(state->camera);
+		int sel = state->menu_sel[state->curr_menu];
+		if (sel == 0) {
+			state->curr_menu = MENU_MAIN;
+			state->menu_needs_rerendering = true;
+			return;
+		}
+		uint32_t pixfmt = pixfmts[sel-1];
+		PictureFormat new_picfmt = camera_closest_resolution(state->camera, pixfmt, camera_frame_width(state->camera), camera_frame_height(state->camera));
+		arr_free(pixfmts);
+		camera_set_format(state->camera,
+			new_picfmt,
+			camera_access_method(state->camera),
+			false);
+	} else if (state->curr_menu == MENU_HELP) {
+		state->curr_menu = 0;
+	}
+}
+
+int menu_get_option_at_pos(State *state, int x, int y) {
+	// technically this may be wrong for a single frame when the menu options change, but who cares.
+	arr_foreach_ptr(state->menu_option_rects, SDL_Rect, r) {
+		if (SDL_PointInRect((const SDL_Point[1]){{x, y}}, r)) {
+			int n = (int)(r - state->menu_option_rects);
+			// important that we check this since rects may be out of date
+			return n < menu_option_count(state) ? n : -1;
+		}
+	}
+	return -1;
 }
 
 int main(void) {
@@ -569,7 +682,8 @@ void main() {\n\
 	double flash_time = -INFINITY;
 	uint32_t last_frame_pixfmt = 0;
 	const int menu_options_per_column = 10;
-	while(true) {
+	while (!state->quit) {
+		state->menu_needs_rerendering = false;
 		struct udev_device *dev = NULL;
 		while (udev_monitor && (dev = udev_monitor_receive_device(udev_monitor))) {
 			printf("%s %s\n",udev_device_get_sysname(dev),udev_device_get_action(dev));
@@ -581,8 +695,7 @@ void main() {\n\
 			}
 			udev_device_unref(dev);
 		}
-		SDL_Event event={0};
-		bool menu_needs_rerendering = false;
+		SDL_Event event = {0};
 		while (SDL_PollEvent(&event)) {
 			if (event.type == SDL_QUIT) goto quit;
 			if (event.type == SDL_KEYDOWN) switch (event.key.keysym.sym) {
@@ -618,25 +731,25 @@ void main() {\n\
 				} else {
 					state->curr_menu = MENU_MAIN;
 				}
-				menu_needs_rerendering = true;
+				state->menu_needs_rerendering = true;
 				break;
 			case SDLK_UP: if (menu_option_count(state)) {
 				state->menu_sel[state->curr_menu]--;
 				if (state->menu_sel[state->curr_menu] < 0)
 					state->menu_sel[state->curr_menu] += menu_option_count(state);
-				menu_needs_rerendering = true;
+				state->menu_needs_rerendering = true;
 				}
 				break;
 			case SDLK_DOWN: if (menu_option_count(state)) {
 				state->menu_sel[state->curr_menu]++;
 				if (state->menu_sel[state->curr_menu] >= menu_option_count(state))
 					state->menu_sel[state->curr_menu] = 0;
-				menu_needs_rerendering = true;
+				state->menu_needs_rerendering = true;
 				}
 				break;
 			case SDLK_F1:
 				state->curr_menu = state->curr_menu == MENU_HELP ? 0 : MENU_HELP;
-				menu_needs_rerendering = true;
+				state->menu_needs_rerendering = true;
 				break;
 			case SDLK_F2:
 				state->show_fps = !state->show_fps;
@@ -644,7 +757,7 @@ void main() {\n\
 			case SDLK_LEFT:
 				if (state->curr_menu == MENU_MAIN && state->menu_sel[MENU_MAIN] == MENU_OPT_IMGFMT) {
 					state->image_format = state->image_format == 0 ? IMG_FMT_COUNT - 1 : state->image_format - 1;
-					menu_needs_rerendering = true;
+					state->menu_needs_rerendering = true;
 				} else if (menu_option_count(state) > menu_options_per_column) {
 					int sel = state->menu_sel[state->curr_menu] - menu_options_per_column;
 					if (sel < 0) {
@@ -654,7 +767,7 @@ void main() {\n\
 					while (sel >= menu_option_count(state))
 						sel -= menu_options_per_column;
 					state->menu_sel[state->curr_menu] = sel;
-					menu_needs_rerendering = true;
+					state->menu_needs_rerendering = true;
 				}
 				break;
 			case SDLK_RIGHT:
@@ -663,95 +776,34 @@ void main() {\n\
 					if (sel >= menu_option_count(state))
 						sel %= menu_options_per_column;
 					state->menu_sel[state->curr_menu] = sel;
-					menu_needs_rerendering = true;
+					state->menu_needs_rerendering = true;
 					break;
 				}
-				if (state->curr_menu != MENU_MAIN) break;
-				// fallthrough
+				if (state->curr_menu == MENU_MAIN)
+					menu_select(state);
+				break;
 			case SDLK_RETURN:
-				if (state->curr_menu == MENU_MAIN) {
-					switch (main_menu[state->menu_sel[MENU_MAIN]]) {
-					case MENU_OPT_QUIT:
-						goto quit;
-					case MENU_OPT_RESOLUTION: if (state->camera) {
-						state->curr_menu = MENU_RESOLUTION;
-						menu_needs_rerendering = true;
-						// set menu_sel
-						PictureFormat *resolutions = camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera));
-						arr_foreach_ptr(resolutions, PictureFormat, resolution) {
-							if (resolution->width == camera_frame_width(state->camera)
-								&& resolution->height == camera_frame_height(state->camera)) {
-								state->menu_sel[MENU_RESOLUTION] = (int)(resolution - resolutions);
-							}
-						}
-						arr_free(resolutions);
-						} break;
-					case MENU_OPT_INPUT:
-						if (state->cameras) {
-							state->curr_menu = MENU_INPUT;
-							menu_needs_rerendering = true;
-							state->menu_sel[MENU_INPUT] = 0;
-							arr_foreach_ptr(state->cameras, Camera *, pcam) {
-								if (*pcam == state->camera) {
-									state->menu_sel[MENU_INPUT] = (int)(pcam - state->cameras);
-								}
-							}
-						}
-						break;
-					case MENU_OPT_PIXFMT: if (state->camera) {
-						state->curr_menu = MENU_PIXFMT;
-						menu_needs_rerendering = true;
-						// set menu_sel
-						uint32_t *pixfmts = camera_get_pixfmts(state->camera);
-						arr_foreach_ptr(pixfmts, uint32_t, pixfmt) {
-							if (*pixfmt == camera_pixel_format(state->camera)) {
-								state->menu_sel[MENU_PIXFMT] = (int)(pixfmt - pixfmts);
-							}
-						}
-						arr_free(pixfmts);
-						} break;
-					case MENU_OPT_IMGFMT: {
-						state->image_format = (state->image_format + 1) % IMG_FMT_COUNT;
-						menu_needs_rerendering = true;
-						} break;
-					}
-				} else if (state->curr_menu == MENU_RESOLUTION) {
-					PictureFormat *resolutions = camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera));
-					camera_set_format(state->camera,
-						resolutions[state->menu_sel[state->curr_menu]],
-						camera_access_method(state->camera),
-						false);
-					arr_free(resolutions);
-				} else if (state->curr_menu == MENU_INPUT) {
-					Camera *new_camera = state->cameras[state->menu_sel[MENU_INPUT]];
-					if (state->camera == new_camera) {
-						// already using this camera
-					} else {
-						camera_close(state->camera);
-						state->camera = new_camera;
-						camera_open(state->camera);
-					}
-				} else if (state->curr_menu == MENU_PIXFMT) {
-					uint32_t *pixfmts = camera_get_pixfmts(state->camera);
-					uint32_t pixfmt = pixfmts[state->menu_sel[state->curr_menu]];
-					PictureFormat new_picfmt = camera_closest_resolution(state->camera, pixfmt, camera_frame_width(state->camera), camera_frame_height(state->camera));
-					arr_free(pixfmts);
-					camera_set_format(state->camera,
-						new_picfmt,
-						camera_access_method(state->camera),
-						false);
-				} else if (state->curr_menu == MENU_HELP) {
-					state->curr_menu = 0;
-				}
+				menu_select(state);
 				break;
 			}
+			if (event.type == SDL_MOUSEBUTTONDOWN && event.button.button == SDL_BUTTON_LEFT) {
+				int mouse_x = event.button.x, mouse_y = event.button.y;
+				if (state->curr_menu) {
+					int opt = menu_get_option_at_pos(state, mouse_x, mouse_y);
+					if (opt >= 0) {
+						state->menu_sel[state->curr_menu] = opt;
+						menu_select(state);
+					}
+				}
+			}
+			if (state->quit) goto quit;
 		}
 		static int prev_window_width, prev_window_height;
 		int window_width = 0, window_height = 0;
 		SDL_GetWindowSize(window, &window_width, &window_height);
 		// not all window size changes seem to generate WINDOWEVENT_RESIZED.
-		menu_needs_rerendering |= window_width != prev_window_width;
-		menu_needs_rerendering |= window_height != prev_window_height;
+		state->menu_needs_rerendering |= window_width != prev_window_width;
+		state->menu_needs_rerendering |= window_height != prev_window_height;
 		prev_window_width = window_width;
 		prev_window_height = window_height;
 		int menu_width = window_width / 2, menu_height = window_height / 2;
@@ -769,15 +821,30 @@ void main() {\n\
 			menu_height = 36;
 		}
 		menu_width = (menu_width + 7) / 8 * 8; // play nice with pixel store alignment
-		menu_needs_rerendering &= state->curr_menu != 0;
+		state->menu_needs_rerendering &= state->curr_menu != 0;
 		int font_size = menu_height / 20;
-		TTF_SetFontSize(font, font_size);	
-		if (menu_needs_rerendering) {
+		TTF_SetFontSize(font, font_size);
+		static int prev_hover_option = -1;
+		int hover_option = -1;
+		if (state->curr_menu) {
+			// check if user is hovering over an option
+			int mouse_x = 0, mouse_y = 0;
+			SDL_GetMouseState(&mouse_x, &mouse_y);
+			hover_option = menu_get_option_at_pos(state, mouse_x, mouse_y);
+		} else {
+			prev_hover_option = -1;
+			arr_clear(state->menu_option_rects);
+		}
+		state->menu_needs_rerendering |= hover_option != prev_hover_option;
+		prev_hover_option = hover_option;
+		if (state->menu_needs_rerendering) {
 			// render menu
+			arr_clear(state->menu_option_rects);
 			SDL_Surface *menu = SDL_CreateRGBSurfaceWithFormat(0, menu_width, menu_height, 8, SDL_PIXELFORMAT_RGB24);
 			SDL_FillRect(menu, NULL, 0x332244);
 			SDL_Color text_color = {255, 255, 255, 255};
 			SDL_Color highlight_color = {255, 255, 0, 255};
+			SDL_Color hover_color = {0, 255, 255, 255};
 			size_t n_options = menu_option_count(state);
 			uint32_t *pixfmts = state->camera ? camera_get_pixfmts(state->camera) : NULL;
 			PictureFormat *resolutions = state->camera ? camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera)) : NULL;
@@ -814,13 +881,25 @@ void main() {\n\
 					}
 					break;
 				case MENU_RESOLUTION:
-					option = a_sprintf("%" PRId32 "x%" PRId32, resolutions[opt_idx].width, resolutions[opt_idx].height);
+					if (opt_idx == 0) {
+						option = strdup("Back");
+					} else {
+						option = a_sprintf("%" PRId32 "x%" PRId32, resolutions[opt_idx-1].width, resolutions[opt_idx-1].height);
+					}
 					break;
 				case MENU_INPUT:
-					option = strdup(camera_name(state->cameras[opt_idx]));
+					if (opt_idx == 0) {
+						option = strdup("Back");
+					} else {
+						option = strdup(camera_name(state->cameras[opt_idx-1]));
+					}
 					break;
 				case MENU_PIXFMT:
-					option = a_sprintf("%s", pixfmt_to_string(pixfmts[opt_idx]));
+					if (opt_idx == 0) {
+						option = strdup("Back");
+					} else {
+						option = a_sprintf("%s", pixfmt_to_string(pixfmts[opt_idx-1]));
+					}
 					break;
 				case MENU_HELP:
 					option = a_sprintf("Back");
@@ -832,11 +911,17 @@ void main() {\n\
 				}
 				int n_columns = (n_options + menu_options_per_column - 1) / menu_options_per_column;
 				int column_spacing = (menu_width - 10) / n_columns;
-				render_text_to_surface(font, menu, 5 + (opt_idx / menu_options_per_column) * column_spacing,
+				SDL_Rect rect = render_text_to_surface(font, menu, 5 + (opt_idx / menu_options_per_column) * column_spacing,
 					5 + (opt_idx % menu_options_per_column) * (5 + font_size),
-					state->menu_sel[state->curr_menu] == opt_idx
+					hover_option == opt_idx
+					? hover_color
+					: state->menu_sel[state->curr_menu] == opt_idx
 					? highlight_color
 					: text_color, option);
+				// add menu position on screen
+				rect.x += (window_width - menu_width) / 2;
+				rect.y += (window_height - menu_height) / 2;
+				arr_add(state->menu_option_rects, rect);
 				free(option);
 			}
 			if (state->curr_menu == MENU_HELP) {
