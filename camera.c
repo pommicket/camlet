@@ -118,6 +118,18 @@ const char *pixfmt_to_string(uint32_t pixfmt) {
 	case V4L2_PIX_FMT_MPEG2: return "MPEG2";
 	case V4L2_PIX_FMT_MPEG4: return "MPEG4";
 	case V4L2_PIX_FMT_XVID: return "XVID";
+	case V4L2_PIX_FMT_NV12: return "Y/CbCr 4:2:0";
+	case V4L2_PIX_FMT_NV21: return "Y/CrCb 4:2:0";
+	case V4L2_PIX_FMT_NV16: return "Y/CbCr 4:2:2";
+	case V4L2_PIX_FMT_NV61: return "Y/CrCb 4:2:2";
+	case V4L2_PIX_FMT_NV24: return "Y/CbCr 4:4:4";
+	case V4L2_PIX_FMT_NV42: return "Y/CrCb 4:4:4";
+	case V4L2_PIX_FMT_YUV410: return "Y/Cb/Cr 4:1:0";
+	case V4L2_PIX_FMT_YVU410: return "Y/Cr/Cb 4:1:0";
+	case V4L2_PIX_FMT_YUV411P: return "Y/Cb/Cr 4:1:1";
+	case V4L2_PIX_FMT_YUV420: return "Y/Cb/Cr 4:2:0";
+	case V4L2_PIX_FMT_YVU420: return "Y/Cr/Cb 4:2:0";
+	case V4L2_PIX_FMT_YUV422P: return "Y/Cb/Cr 4:2:2";
 	default: {
 		static char s[5];
 		memcpy(s, &pixfmt, 4);

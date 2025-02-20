@@ -1,9 +1,11 @@
 /*
 TODO
 -add support for more pixfmts
+-adjustable camera framerate
 -view previous pictures (thumbnails)
 -click in menus
 -left/right in resolution menu
+-save/restore settings
 */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -522,7 +524,6 @@ void main() {\n\
 					goto cont;
 				}
 				if (status) break;
-				printf("---%s\n",devnode);
 				cameras_from_device(devnode, serial, &state->cameras);
 			}
 			cont:
