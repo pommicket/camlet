@@ -384,6 +384,8 @@ void main() {\n\
 	const char *fshader_code = "in vec4 color;\n\
 in vec2 tex_coord;\n\
 uniform sampler2D u_sampler;\n\
+uniform sampler2D u_sampler2;\n\
+uniform sampler2D u_sampler3;\n\
 uniform int u_pixel_format;\n\
 uniform float u_flash;\n\
 uniform float u_opacity;\n\
@@ -404,7 +406,7 @@ void main() {\n\
 	case 0x47585858: // XXXGRAY (used for FPS display currently)\n\
 		color = vec3(texture2D(u_sampler, tex_coord).w);\n\
 		break;\n\
-	case 0x56595559: { // YUYV (YUV 4:2:2)\n\
+	case 0x56595559: { // YUYV 4:2:2 interleaved\n\
 		ivec2 texsize = textureSize(u_sampler, 0);\n\
 		vec2 tc = tex_coord * vec2(texsize);\n\
 		ivec2 tc00 = ivec2(tc);\n\
@@ -431,6 +433,13 @@ void main() {\n\
 		// technically we should check v4l2_pix_format::ycbcr_enc, but whatever.\n\
 		color = ycbcr_ITU_R_601_to_rgb(vec3(y,cbcr));\n\
 		} break;\n\
+	case 0x32315559: // YUV 4:2:0 with separate planes\n\
+	case 0x32315659: { // YVU 4:2:0 with separate planes (planes are reordered to YUV in camera.c)\n\
+		float y = texture2D(u_sampler, tex_coord).x;\n\
+		float cb = texture2D(u_sampler2, tex_coord).x;\n\
+		float cr = texture2D(u_sampler3, tex_coord).x;\n\
+		color = ycbcr_ITU_R_601_to_rgb(vec3(y,cb,cr));\n\
+		} break;\n\
 	default:\n\
 		color = texture2D(u_sampler, tex_coord).xyz;\n\
 		break;\n\
@@ -448,6 +457,8 @@ void main() {\n\
 	gl.GenBuffers(1, &vbo);
 	gl.GenVertexArrays(1, &vao);
 	const GLuint u_sampler = gl.GetUniformLocation(program, "u_sampler");
+	const GLuint u_sampler2 = gl.GetUniformLocation(program, "u_sampler2");
+	const GLuint u_sampler3 = gl.GetUniformLocation(program, "u_sampler3");
 	const GLuint u_offset = gl.GetUniformLocation(program, "u_offset");
 	const GLuint u_flash = gl.GetUniformLocation(program, "u_flash");
 	const GLuint u_pixel_format = gl.GetUniformLocation(program, "u_pixel_format");
@@ -828,8 +839,9 @@ void main() {\n\
 		last_time = curr_time;
 		
 		gl.UseProgram(program);
-		gl.ActiveTexture(GL_TEXTURE0);
 		gl.Uniform1i(u_sampler, 0);
+		gl.Uniform1i(u_sampler2, 1);
+		gl.Uniform1i(u_sampler3, 2);
 		gl.Uniform1f(u_opacity, 1);
 		gl.Uniform2f(u_offset, 0, 0);
 		{

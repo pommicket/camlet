@@ -145,6 +145,8 @@ bool pix_fmt_supported(uint32_t pixfmt) {
 	case V4L2_PIX_FMT_YUYV:
 	case V4L2_PIX_FMT_GREY:
 	case V4L2_PIX_FMT_MJPEG:
+	case V4L2_PIX_FMT_YUV420:
+	case V4L2_PIX_FMT_YVU420:
 		return true;
 	}
 	return false;
@@ -345,10 +347,10 @@ static uint8_t *curr_frame_rgb24(Camera *camera) {
 	}
 	int32_t frame_width = camera_frame_width(camera);
 	int32_t frame_height = camera_frame_height(camera);
+	const uint8_t *in = curr_frame, *in_y = NULL, *in_cb = NULL, *in_cr = NULL;
+	uint8_t *out = camera->decompression_buf;
 	switch (camera_pixel_format(camera)) {
 	case V4L2_PIX_FMT_BGR24: {
-		const uint8_t *in = curr_frame;
-		uint8_t *out = camera->decompression_buf;
 		for (int32_t y = 0; y < frame_height; y++) {
 			for (int32_t x = 0; x < frame_width; x++) {
 				*out++ = in[2];
@@ -359,9 +361,18 @@ static uint8_t *curr_frame_rgb24(Camera *camera) {
 		}
 		return camera->decompression_buf;
 		} break;
+	case V4L2_PIX_FMT_GREY: {
+		for (int32_t y = 0; y < frame_height; y++) {
+			for (int32_t x = 0; x < frame_width; x++) {
+				uint8_t b = *in++;
+				*out++ = b;
+				*out++ = b;
+				*out++ = b;
+			}
+		}
+		return camera->decompression_buf;
+		} break;
 	case V4L2_PIX_FMT_YUYV: {
-		const uint8_t *in = curr_frame;
-		uint8_t *out = camera->decompression_buf;
 		for (int32_t y = 0; y < frame_height; y++) {
 			for (int32_t x = 0; x < frame_width / 2; x++) {
 				float y0 = (float)(*in++) * (1.0f / 255.0f);
@@ -381,6 +392,39 @@ static uint8_t *curr_frame_rgb24(Camera *camera) {
 		}
 		return camera->decompression_buf;
 		}
+	case V4L2_PIX_FMT_YUV420:
+		in_y = curr_frame;
+		in_cb = curr_frame + (size_t)frame_width * (size_t)frame_height;
+		in_cr = curr_frame + (size_t)frame_width * (size_t)frame_height * 5 / 4;
+		goto yuv420_planar;
+	case V4L2_PIX_FMT_YVU420:
+		in_y = curr_frame;
+		in_cr = curr_frame + (size_t)frame_width * (size_t)frame_height;
+		in_cb = curr_frame + (size_t)frame_width * (size_t)frame_height * 5 / 4;
+		goto yuv420_planar;
+	yuv420_planar:
+		for (int32_t row = 0; row < frame_height; row++) {
+			for (int32_t col = 0; col < frame_width; col++) {
+				float y = (float)(*in_y++) * (1.0f / 255.0f);
+				float cb = (float)(*in_cb) * (1.0f / 255.0f);
+				float cr = (float)(*in_cr) * (1.0f / 255.0f);
+				if (col % 2 == 1) {
+					in_cb++;
+					in_cr++;
+				}
+				float rgb[3];
+				ycbcr_ITU_R_601_to_rgb(y, cb, cr, rgb);
+				*out++ = (uint8_t)roundf(rgb[0] * 255);
+				*out++ = (uint8_t)roundf(rgb[1] * 255);
+				*out++ = (uint8_t)roundf(rgb[2] * 255);
+			}
+			if (row % 2 == 0) {
+				// go back to start of cb, cr row
+				in_cb -= frame_width / 2;
+				in_cr -= frame_width / 2;
+			}
+		}
+		return camera->decompression_buf;
 	}
 	assert(false);
 	return NULL;
@@ -552,6 +596,29 @@ void camera_update_gl_textures(Camera *camera, const GLuint textures[3]) {
 			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 2)
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, frame_width / 2, frame_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, curr_frame);
 			break;
+		case V4L2_PIX_FMT_YUV420:
+			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 3 / 2) {
+				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width, frame_height, 0, GL_RED, GL_UNSIGNED_BYTE, curr_frame);
+				gl.BindTexture(GL_TEXTURE_2D, textures[1]);
+				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width / 2, frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE,
+					curr_frame + (size_t)frame_width * (size_t)frame_height);
+				gl.BindTexture(GL_TEXTURE_2D, textures[2]);
+				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width / 2, frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE,
+					curr_frame + (size_t)frame_width * (size_t)frame_height * 5 / 4);
+			}
+			break;
+		case V4L2_PIX_FMT_YVU420:
+			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 3 / 2) {
+				// same as above, but swap textures[1] and textures[2] so that we only have to handle one case in the shader
+				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width, frame_height, 0, GL_RED, GL_UNSIGNED_BYTE, curr_frame);
+				gl.BindTexture(GL_TEXTURE_2D, textures[2]);
+				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width / 2, frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE,
+					curr_frame + (size_t)frame_width * (size_t)frame_height);
+				gl.BindTexture(GL_TEXTURE_2D, textures[1]);
+				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width / 2, frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE,
+					curr_frame + (size_t)frame_width * (size_t)frame_height * 5 / 4);
+			}
+			break;
 		case V4L2_PIX_FMT_MJPEG: {
 			// "motion jpeg" is actually just a series of jpegs
 			gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame_width, frame_height, 0, GL_RGB, GL_UNSIGNED_BYTE,
@@ -709,6 +776,11 @@ static void cameras_from_device_with_fd(const char *dev_path, const char *serial
 				// are there even any stepwise cameras out there?? who knows.
 				uint32_t frame_width = frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE ? frmsize.discrete.width : frmsize.stepwise.max_width;
 				uint32_t frame_height = frmsize.type == V4L2_FRMSIZE_TYPE_DISCRETE ? frmsize.discrete.height : frmsize.stepwise.max_height;
+				if (frame_width % 4 || frame_height % 4) {
+					// fucked up frame size
+					// (would probably break some YUV pixel formats)
+					continue;
+				}
 				arr_add(camera->formats, ((PictureFormat) {
 					.width = frame_width,
 					.height = frame_height,
