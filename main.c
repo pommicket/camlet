@@ -1,9 +1,9 @@
 /*
 TODO
+-handle dis/connecting devices
 -timer
 -video
 -adjustable camera framerate
--configurable picture directory (default ~/Pictures/Webcam)
 -open picture directory
 -save/restore settings
 */
@@ -22,11 +22,14 @@ TODO
 #include <fcntl.h>
 #include <unistd.h>
 #include <dirent.h>
+#include <pwd.h>
 #include "ds.h"
 #include "camera.h"
 
 // pixel format used for convenience
 #define PIX_FMT_XXXGRAY 0x47585858
+
+static const char *const DEFAULT_OUTPUT_DIR = "~/Pictures/Webcam";
 
 typedef enum {
 	MENU_NONE,
@@ -35,6 +38,7 @@ typedef enum {
 	MENU_INPUT,
 	MENU_PIXFMT,
 	MENU_HELP,
+	MENU_SET_OUTPUT_DIR,
 	MENU_COUNT
 } Menu;
 
@@ -44,6 +48,7 @@ enum {
 	MENU_OPT_VIDEO_INPUT,
 	MENU_OPT_PIXFMT,
 	MENU_OPT_IMGFMT,
+	MENU_OPT_SET_OUTPUT_DIR,
 };
 // use char for MenuOption type so that we can use strlen
 typedef char MenuOption;
@@ -52,6 +57,7 @@ static const MenuOption main_menu[] = {
 	MENU_OPT_RESOLUTION,
 	MENU_OPT_IMGFMT,
 	MENU_OPT_PIXFMT,
+	MENU_OPT_SET_OUTPUT_DIR,
 	MENU_OPT_QUIT,
 	0
 };
@@ -71,6 +77,7 @@ typedef struct {
 	bool show_fps;
 	bool menu_needs_rerendering;
 	bool quit;
+	char *output_dir;
 	Camera *camera;
 	Camera **cameras;
 	ImageFormat image_format;
@@ -218,13 +225,22 @@ static int menu_option_count(State *state) {
 		return n;
 		}
 		break;
+	case MENU_SET_OUTPUT_DIR: return 1;
 	case MENU_COUNT: break;
 	}
 	assert(false);
 	return 0;
 }
+
+static uint32_t sdl_color_to_u32(SDL_Color color) {
+	return (uint32_t)color.r << 24 | (uint32_t)color.g << 16 | (uint32_t)color.b << 8 | color.a;
+}
+
 static SDL_Rect render_text_to_surface_anchored(TTF_Font *font, SDL_Surface *dest, int x, int y, SDL_Color color, const char *str,
 	int xanchor, int yanchor) {
+	if (!str[0]) {
+		return (SDL_Rect){.x = x, .y = y, .w = 0, .h = TTF_FontLineSkip(font)};
+	}
 	SDL_Surface *text = TTF_RenderUTF8_Blended(font, str, color);
 	x -= (xanchor + 1) * text->w / 2;
 	y -= (yanchor + 1) * text->h / 2;
@@ -291,6 +307,10 @@ static void menu_select(State *state) {
 			state->image_format = (state->image_format + 1) % IMG_FMT_COUNT;
 			state->menu_needs_rerendering = true;
 			} break;
+		case MENU_OPT_SET_OUTPUT_DIR:
+			state->curr_menu = MENU_SET_OUTPUT_DIR;
+			state->menu_needs_rerendering = true;
+			break;
 		}
 	} else if (state->curr_menu == MENU_RESOLUTION) {
 		int sel = state->menu_sel[state->curr_menu];
@@ -337,6 +357,9 @@ static void menu_select(State *state) {
 			false);
 	} else if (state->curr_menu == MENU_HELP) {
 		state->curr_menu = 0;
+	} else if (state->curr_menu == MENU_SET_OUTPUT_DIR) {
+		state->curr_menu = MENU_MAIN;
+		state->menu_needs_rerendering = true;
 	}
 }
 
@@ -372,6 +395,34 @@ int menu_get_option_at_pos(State *state, int x, int y) {
 	return -1;
 }
 
+bool mkdir_with_parents(const char *path) {
+	if (mkdir(path, 0755) == 0
+		|| errno == EEXIST)
+		return true;
+	char *buf = strdup(path);
+	while (true) {
+		size_t i;
+		for (i = strlen(buf) - 1; i > 1; i--) {
+			bool end = buf[i] == '/';
+			buf[i] = '\0';
+			if (end) break;
+		}
+		if (i == 1) {
+			free(buf);
+			return false;
+		}
+		if (mkdir(buf, 0755) == 0 || errno == EEXIST) {
+			free(buf);
+			return mkdir_with_parents(path);
+		}
+		if (errno != ENOENT) {
+			perror("mkdir");
+			free(buf);
+			return false;
+		}
+	}
+}
+
 int main(void) {
 	static State state_data;
 	State *state = &state_data;
@@ -392,6 +443,20 @@ int main(void) {
 	if (TTF_Init() < 0) {
 		fprintf(stderr, "couldn't initialize SDL2_ttf: %s\n", TTF_GetError());
 		return EXIT_FAILURE;
+	}
+	static char home_dir[PATH_MAX];
+	{
+		const char *home = getenv("HOME");
+		if (home) {
+			snprintf(home_dir, sizeof home_dir, "%s", home);
+		} else {
+			struct passwd *pwd = getpwuid(getuid());
+			if (!pwd) {
+				perror("getpwuid");
+				return EXIT_FAILURE;
+			}
+			snprintf(home_dir, sizeof home_dir, "%s", pwd->pw_dir);
+		}
 	}
 	char *font_path = NULL;
 	{
@@ -711,6 +776,7 @@ void main() {\n\
 			printf("\n");
 		}
 	}
+	state->output_dir = strdup(DEFAULT_OUTPUT_DIR);
 	state->camera = NULL;
 	if (arr_len(state->cameras) != 0) {
 		select_camera(state);
@@ -735,20 +801,44 @@ void main() {\n\
 		while (SDL_PollEvent(&event)) {
 			if (event.type == SDL_QUIT) goto quit;
 			if (event.type == SDL_KEYDOWN) switch (event.key.keysym.sym) {
+			case SDLK_v:
+				if (state->curr_menu == MENU_SET_OUTPUT_DIR && (event.key.keysym.mod & KMOD_CTRL) && state->output_dir) {
+					char *text = SDL_GetClipboardText();
+					state->output_dir = realloc(state->output_dir, strlen(state->output_dir) + 2 + strlen(text));
+					strcat(state->output_dir, text);
+					state->menu_needs_rerendering = true;
+					SDL_free(text);
+				}
+				break;
 			case SDLK_SPACE:
 				if (state->camera) {
 					time_t t = time(NULL);
 					struct tm *tm = localtime(&t);
-					static char name[64];
-					strftime(name, sizeof name, "%Y-%m-%d-%H-%M-%S", tm);
-					sprintf(name + strlen(name), ".%s", image_format_extensions[state->image_format]);
+					static char path[PATH_MAX];
+					while (state->output_dir && state->output_dir[0] &&
+						state->output_dir[strlen(state->output_dir) - 1] == '/') {
+						state->output_dir[strlen(state->output_dir) - 1] = 0;
+					}
+					if (!state->output_dir || !state->output_dir[0]) {
+						free(state->output_dir);
+						state->output_dir = strdup(DEFAULT_OUTPUT_DIR);
+					}
+					if (state->output_dir[0] == '~' && state->output_dir[1] == '/') {
+						snprintf(path, sizeof path, "%s/%s", home_dir, &state->output_dir[2]);
+					} else {
+						snprintf(path, sizeof path, "%s", state->output_dir);
+					}
+					if (!mkdir_with_parents(path))
+						break;
+					strftime(path + strlen(path), sizeof path - strlen(path), "/%Y-%m-%d-%H-%M-%S", tm);
+					snprintf(path + strlen(path), sizeof path - strlen(path), ".%s", image_format_extensions[state->image_format]);
 					bool success = false;
 					switch (state->image_format) {
 					case IMG_FMT_JPEG:
-						success = camera_save_jpg(state->camera, name, 90);
+						success = camera_save_jpg(state->camera, path, 90);
 						break;
 					case IMG_FMT_PNG:
-						success = camera_save_png(state->camera, name);
+						success = camera_save_png(state->camera, path);
 						break;
 					case IMG_FMT_COUNT:
 						assert(false);
@@ -757,6 +847,16 @@ void main() {\n\
 					if (success) {
 						flash_time = get_time_double();
 					}
+				}
+				break;
+			case SDLK_BACKSPACE:
+				if (state->curr_menu == MENU_SET_OUTPUT_DIR && state->output_dir) {
+					if (event.key.keysym.mod & KMOD_CTRL) {
+						state->output_dir[0] = 0;
+					} else if (state->output_dir[0]) {
+						state->output_dir[strlen(state->output_dir) - 1] = 0;
+					}
+					state->menu_needs_rerendering = true;
 				}
 				break;
 			case SDLK_ESCAPE:
@@ -832,6 +932,11 @@ void main() {\n\
 					}
 				}
 			}
+			if (event.type == SDL_TEXTINPUT) {
+				state->output_dir = realloc(state->output_dir, strlen(state->output_dir) + 2 + strlen(event.text.text));
+				strcat(state->output_dir, event.text.text);
+				state->menu_needs_rerendering = true;
+			}
 			if (state->quit) goto quit;
 		}
 		static int prev_window_width, prev_window_height;
@@ -857,7 +962,6 @@ void main() {\n\
 			menu_height = 36;
 		}
 		menu_width = (menu_width + 7) / 8 * 8; // play nice with pixel store alignment
-		state->menu_needs_rerendering &= state->curr_menu != 0;
 		int font_size = menu_height / 20;
 		TTF_SetFontSize(font, font_size);
 		static int prev_hover_option = -1;
@@ -873,6 +977,11 @@ void main() {\n\
 		}
 		state->menu_needs_rerendering |= hover_option != prev_hover_option;
 		prev_hover_option = hover_option;
+		bool show_cursor = fmod(get_time_double(), 1.5) < 1.0;
+		static int prev_show_cursor = -1;
+		state->menu_needs_rerendering |= state->curr_menu == MENU_SET_OUTPUT_DIR && show_cursor != prev_show_cursor;
+		prev_show_cursor = show_cursor;
+		state->menu_needs_rerendering &= state->curr_menu != 0;
 		if (state->menu_needs_rerendering) {
 			// render menu
 			arr_clear(state->menu_option_rects);
@@ -911,6 +1020,9 @@ void main() {\n\
 					case MENU_OPT_IMGFMT:
 						option = a_sprintf("Image format: %s", image_format_names[state->image_format]);
 						break;
+					case MENU_OPT_SET_OUTPUT_DIR:
+						option = a_sprintf("Output directory: %s", state->output_dir);
+						break;
 					default:
 						assert(false);
 						option = strdup("???");
@@ -938,6 +1050,7 @@ void main() {\n\
 					}
 					break;
 				case MENU_HELP:
+				case MENU_SET_OUTPUT_DIR:
 					option = a_sprintf("Back");
 					break;
 				case MENU_NONE:
@@ -970,6 +1083,19 @@ void main() {\n\
 				for (size_t line = 0; line < SDL_arraysize(text); line++) {
 					render_text_to_surface(font, menu, 5, 5 + (5 + font_size) * (line + 1),
 						text_color, text[line]);
+				}
+			} else if (state->curr_menu == MENU_SET_OUTPUT_DIR) {
+				if (!state->output_dir)
+					state->output_dir = strdup(DEFAULT_OUTPUT_DIR);
+				SDL_Rect r = render_text_to_surface(font, menu, 5, 10 + font_size, text_color, state->output_dir);
+				if (show_cursor) {
+					SDL_Rect cursor = {
+						.x = r.x + r.w + 2,
+						.y = r.y,
+						.w = 1,
+						.h = r.h
+					};
+					SDL_FillRect(menu, &cursor, sdl_color_to_u32(text_color));
 				}
 			}
 			arr_free(pixfmts);
@@ -1100,6 +1226,7 @@ void main() {\n\
 		camera_free(*pcamera);
 	}
 	arr_free(state->cameras);
+	free(state->output_dir);
 	SDL_Quit();
 	return 0;
 }
