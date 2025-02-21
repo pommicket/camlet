@@ -3,7 +3,6 @@ TODO
 -timer
 -video
 -adjustable camera framerate
--open picture directory
 -save/restore settings
 */
 #define _GNU_SOURCE
@@ -509,6 +508,24 @@ static void get_cameras_from_udev_device(State *state, struct udev_device *dev) 
 	str_builder_free(&serial);
 }
 
+static char home_dir[PATH_MAX];
+static bool get_expanded_output_dir(State *state, char path[PATH_MAX]) {
+	while (state->output_dir && state->output_dir[0] &&
+		state->output_dir[strlen(state->output_dir) - 1] == '/') {
+		state->output_dir[strlen(state->output_dir) - 1] = 0;
+	}
+	if (!state->output_dir || !state->output_dir[0]) {
+		free(state->output_dir);
+		state->output_dir = strdup(DEFAULT_OUTPUT_DIR);
+	}
+	if (state->output_dir[0] == '~' && state->output_dir[1] == '/') {
+		snprintf(path, PATH_MAX, "%s/%s", home_dir, &state->output_dir[2]);
+	} else {
+		snprintf(path, PATH_MAX, "%s", state->output_dir);
+	}
+	return mkdir_with_parents(path);
+}
+
 int main(void) {
 	static State state_data;
 	State *state = &state_data;
@@ -527,7 +544,6 @@ int main(void) {
 	if (TTF_Init() < 0) {
 		fatal_error("couldn't initialize SDL2_ttf: %s\n", TTF_GetError());
 	}
-	static char home_dir[PATH_MAX];
 	{
 		const char *home = getenv("HOME");
 		if (home) {
@@ -810,7 +826,7 @@ void main() {\n\
 		// set udev monitor to nonblocking
 		int fd = udev_monitor_get_fd(udev_monitor);
 		int flags = fcntl(fd, F_GETFL);
-		flags |= O_NONBLOCK;
+		flags |= O_NONBLOCK | O_CLOEXEC;
 		if (fcntl(fd, F_SETFL, flags) != 0) {
 			perror("fcntl");
 		}
@@ -881,6 +897,7 @@ void main() {\n\
 		while (SDL_PollEvent(&event)) {
 			if (event.type == SDL_QUIT) goto quit;
 			if (event.type == SDL_KEYDOWN) switch (event.key.keysym.sym) {
+			static char path[PATH_MAX];
 			case SDLK_v:
 				if (state->curr_menu == MENU_SET_OUTPUT_DIR && (event.key.keysym.mod & KMOD_CTRL) && state->output_dir) {
 					char *text = SDL_GetClipboardText();
@@ -890,26 +907,21 @@ void main() {\n\
 					SDL_free(text);
 				}
 				break;
+			case SDLK_f:
+				if (event.key.keysym.mod & KMOD_CTRL) {
+					if (!get_expanded_output_dir(state, path))
+						break;
+					if (fork() == 0) {
+						execlp("xdg-open", "xdg-open", path, NULL);
+						abort();
+					}
+				}
+				break;
 			case SDLK_SPACE:
 				if (state->camera) {
-					time_t t = time(NULL);
-					struct tm *tm = localtime(&t);
-					static char path[PATH_MAX];
-					while (state->output_dir && state->output_dir[0] &&
-						state->output_dir[strlen(state->output_dir) - 1] == '/') {
-						state->output_dir[strlen(state->output_dir) - 1] = 0;
-					}
-					if (!state->output_dir || !state->output_dir[0]) {
-						free(state->output_dir);
-						state->output_dir = strdup(DEFAULT_OUTPUT_DIR);
-					}
-					if (state->output_dir[0] == '~' && state->output_dir[1] == '/') {
-						snprintf(path, sizeof path, "%s/%s", home_dir, &state->output_dir[2]);
-					} else {
-						snprintf(path, sizeof path, "%s", state->output_dir);
-					}
-					if (!mkdir_with_parents(path))
+					if (!get_expanded_output_dir(state, path))
 						break;
+					struct tm *tm = localtime((time_t[1]){time(NULL)});
 					strftime(path + strlen(path), sizeof path - strlen(path), "/%Y-%m-%d-%H-%M-%S", tm);
 					snprintf(path + strlen(path), sizeof path - strlen(path), ".%s", image_format_extensions[state->image_format]);
 					bool success = false;
@@ -1156,9 +1168,10 @@ void main() {\n\
 			if (state->curr_menu == MENU_HELP) {
 				const char *text[] = {
 					"F1 - open this help screen",
+					"F2 - show debug info",
 					"Space - take a picture",
 					"Escape - open/close settings",
-					"F2 - show debug info",
+					"Ctrl+f - open picture directory",
 				};
 				for (size_t line = 0; line < SDL_arraysize(text); line++) {
 					render_text_to_surface(font, menu, 5, 5 + (5 + font_size) * (line + 1),

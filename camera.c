@@ -785,7 +785,7 @@ bool camera_open(Camera *camera) {
 	assert(!camera->read_frame);
 	assert(!camera->mmap_frames[0]);
 	assert(!camera->userp_frames[0]);
-	camera->fd = v4l2_open(camera->devnode, O_RDWR);
+	camera->fd = v4l2_open(camera->devnode, O_RDWR | O_CLOEXEC);
 	if (camera->fd < 0) {
 		perror("v4l2_open");
 		return false;
