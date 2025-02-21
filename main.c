@@ -1,6 +1,5 @@
 /*
 TODO
--timer
 -video
 -adjustable camera framerate
 -save/restore settings
@@ -47,12 +46,14 @@ enum {
 	MENU_OPT_PIXFMT,
 	MENU_OPT_IMGFMT,
 	MENU_OPT_SET_OUTPUT_DIR,
+	MENU_OPT_TIMER,
 };
 // use char for MenuOption type so that we can use strlen
 typedef char MenuOption;
 static const MenuOption main_menu[] = {
 	MENU_OPT_VIDEO_INPUT,
 	MENU_OPT_RESOLUTION,
+	MENU_OPT_TIMER,
 	MENU_OPT_IMGFMT,
 	MENU_OPT_PIXFMT,
 	MENU_OPT_SET_OUTPUT_DIR,
@@ -75,6 +76,9 @@ typedef struct {
 	bool show_debug;
 	bool menu_needs_rerendering;
 	bool quit;
+	int timer;
+	double timer_activate_time;
+	double flash_time;
 	char *output_dir;
 	Camera *camera;
 	Camera **cameras;
@@ -82,6 +86,8 @@ typedef struct {
 	SDL_Rect *menu_option_rects;
 	Hash *camera_precedence;
 } State;
+
+static const int timer_options[] = {0, 2, 5, 10, 15, 30};
 
 #if crypto_generichash_BYTES_MIN > HASH_SIZE
 #error "crypto_generichash what happened"
@@ -245,6 +251,18 @@ static void move_to_highest_precedence(State *state, Camera *camera) {
 	arr_insert(state->camera_precedence, 0, hash);
 }
 
+static void change_timer(State *state, int direction) {
+	int k;
+	int n_options = (int)SDL_arraysize(timer_options);
+	for (k = 0; k < n_options; k++) {
+		if (timer_options[k] == state->timer) {
+			break;
+		}
+	}
+	state->timer = timer_options[((k + direction) % n_options + n_options) % n_options];
+	state->menu_needs_rerendering = true;
+}
+
 static void menu_select(State *state) {
 	if (state->curr_menu == MENU_MAIN) {
 		switch (main_menu[state->menu_sel[MENU_MAIN]]) {
@@ -295,6 +313,9 @@ static void menu_select(State *state) {
 		case MENU_OPT_SET_OUTPUT_DIR:
 			state->curr_menu = MENU_SET_OUTPUT_DIR;
 			state->menu_needs_rerendering = true;
+			break;
+		case MENU_OPT_TIMER:
+			change_timer(state, 1);
 			break;
 		}
 	} else if (state->curr_menu == MENU_RESOLUTION) {
@@ -410,7 +431,7 @@ static void select_camera(State *state) {
 	free(cameras_working);
 }
 
-int menu_get_option_at_pos(State *state, int x, int y) {
+static int menu_get_option_at_pos(State *state, int x, int y) {
 	// technically this may be wrong for a single frame when the menu options change, but who cares.
 	arr_foreach_ptr(state->menu_option_rects, SDL_Rect, r) {
 		if (SDL_PointInRect((const SDL_Point[1]){{x, y}}, r)) {
@@ -422,7 +443,7 @@ int menu_get_option_at_pos(State *state, int x, int y) {
 	return -1;
 }
 
-bool mkdir_with_parents(const char *path) {
+static bool mkdir_with_parents(const char *path) {
 	if (mkdir(path, 0755) == 0
 		|| errno == EEXIST)
 		return true;
@@ -524,6 +545,32 @@ static bool get_expanded_output_dir(State *state, char path[PATH_MAX]) {
 		snprintf(path, PATH_MAX, "%s", state->output_dir);
 	}
 	return mkdir_with_parents(path);
+}
+
+
+static bool take_picture(State *state) {
+	static char path[PATH_MAX];
+	if (!get_expanded_output_dir(state, path))
+		return false;
+	struct tm *tm = localtime((time_t[1]){time(NULL)});
+	strftime(path + strlen(path), sizeof path - strlen(path), "/%Y-%m-%d-%H-%M-%S", tm);
+	snprintf(path + strlen(path), sizeof path - strlen(path), ".%s", image_format_extensions[state->image_format]);
+	bool success = false;
+	switch (state->image_format) {
+	case IMG_FMT_JPEG:
+		success = camera_save_jpg(state->camera, path, 90);
+		break;
+	case IMG_FMT_PNG:
+		success = camera_save_png(state->camera, path);
+		break;
+	case IMG_FMT_COUNT:
+		assert(false);
+		break;
+	}
+	if (success) {
+		state->flash_time = get_time_double();
+	}
+	return success;
 }
 
 int main(void) {
@@ -632,7 +679,6 @@ int main(void) {
 		gl.Enable(GL_DEBUG_OUTPUT);
 		gl.Enable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
 		if (flags & GL_CONTEXT_FLAG_DEBUG_BIT) {
-		printf("yay\n");
 			// set up debug message callback
 			gl.DebugMessageCallback(gl_message_callback, NULL);
 			gl.DebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, NULL, GL_TRUE);
@@ -641,7 +687,7 @@ int main(void) {
 	#endif
 	gl.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 	double last_time = get_time_double();
-	GLuint textures[7] = {0};
+	GLuint textures[8] = {0};
 	gl.GenTextures(SDL_arraysize(textures), textures);
 	for (size_t i = 0; i < SDL_arraysize(textures); i++) {
 		gl.BindTexture(GL_TEXTURE_2D, textures[i]);
@@ -652,8 +698,9 @@ int main(void) {
 	}
 	GLuint menu_texture = textures[0];
 	GLuint no_camera_texture = textures[1];
-	GLuint fps_texture = textures[2];
+	GLuint debug_info_texture = textures[2];
 	GLuint black_texture = textures[6];
+	GLuint timer_texture = textures[7];
 	{
 		static uint8_t black[16];
 		gl.BindTexture(GL_TEXTURE_2D, black_texture);
@@ -763,6 +810,11 @@ void main() {\n\
 		vec2 cbcr = texture2D(u_sampler2, tex_coord).yx;\n\
 		color = ycbcr_ITU_R_601_to_rgb(vec3(y,cbcr));\n\
 		} break;\n\
+	case 0x34324241: { // RGBA32 (used for timer currently)\n\
+		vec4 v = texture2D(u_sampler, tex_coord);\n\
+		color = v.xyz;\n\
+		opacity *= v.w;\n\
+		} break;\n\
 	default:\n\
 		color = texture2D(u_sampler, tex_coord).xyz;\n\
 		break;\n\
@@ -859,10 +911,10 @@ void main() {\n\
 	}
 	state->output_dir = strdup(DEFAULT_OUTPUT_DIR);
 	state->camera = NULL;
+	state->flash_time = -INFINITY;
 	if (arr_len(state->cameras) != 0) {
 		select_camera(state);
 	}
-	double flash_time = -INFINITY;
 	uint32_t last_frame_pixfmt = 0;
 	const int menu_options_per_column = 10;
 	while (!state->quit) {
@@ -918,26 +970,11 @@ void main() {\n\
 				}
 				break;
 			case SDLK_SPACE:
-				if (state->camera) {
-					if (!get_expanded_output_dir(state, path))
-						break;
-					struct tm *tm = localtime((time_t[1]){time(NULL)});
-					strftime(path + strlen(path), sizeof path - strlen(path), "/%Y-%m-%d-%H-%M-%S", tm);
-					snprintf(path + strlen(path), sizeof path - strlen(path), ".%s", image_format_extensions[state->image_format]);
-					bool success = false;
-					switch (state->image_format) {
-					case IMG_FMT_JPEG:
-						success = camera_save_jpg(state->camera, path, 90);
-						break;
-					case IMG_FMT_PNG:
-						success = camera_save_png(state->camera, path);
-						break;
-					case IMG_FMT_COUNT:
-						assert(false);
-						break;
-					}
-					if (success) {
-						flash_time = get_time_double();
+				if (state->camera && state->curr_menu == 0) {
+					if (state->timer == 0) {
+						take_picture(state);
+					} else {
+						state->timer_activate_time = get_time_double();
 					}
 				}
 				break;
@@ -983,9 +1020,11 @@ void main() {\n\
 				state->show_debug = !state->show_debug;
 				break;
 			case SDLK_LEFT:
-				if (state->curr_menu == MENU_MAIN && state->menu_sel[MENU_MAIN] == MENU_OPT_IMGFMT) {
+				if (state->curr_menu == MENU_MAIN && main_menu[state->menu_sel[MENU_MAIN]] == MENU_OPT_IMGFMT) {
 					state->image_format = state->image_format == 0 ? IMG_FMT_COUNT - 1 : state->image_format - 1;
 					state->menu_needs_rerendering = true;
+				} else if (state->curr_menu == MENU_MAIN && main_menu[state->menu_sel[MENU_MAIN]] == MENU_OPT_TIMER) {
+					change_timer(state, -1);
 				} else if (menu_option_count(state) > menu_options_per_column) {
 					int sel = state->menu_sel[state->curr_menu] - menu_options_per_column;
 					if (sel < 0) {
@@ -1009,6 +1048,9 @@ void main() {\n\
 				}
 				if (state->curr_menu == MENU_MAIN)
 					menu_select(state);
+				if (state->curr_menu == MENU_MAIN && main_menu[state->menu_sel[MENU_MAIN]] == MENU_OPT_TIMER) {
+					change_timer(state, 1);
+				}
 				break;
 			case SDLK_RETURN:
 				menu_select(state);
@@ -1024,7 +1066,7 @@ void main() {\n\
 					}
 				}
 			}
-			if (event.type == SDL_TEXTINPUT) {
+			if (event.type == SDL_TEXTINPUT && state->curr_menu == MENU_SET_OUTPUT_DIR) {
 				state->output_dir = realloc(state->output_dir, strlen(state->output_dir) + 2 + strlen(event.text.text));
 				strcat(state->output_dir, event.text.text);
 				state->menu_needs_rerendering = true;
@@ -1114,6 +1156,9 @@ void main() {\n\
 						break;
 					case MENU_OPT_SET_OUTPUT_DIR:
 						option = a_sprintf("Output directory: %s", state->output_dir);
+						break;
+					case MENU_OPT_TIMER:
+						option = a_sprintf("Timer: %ds", state->timer);
 						break;
 					default:
 						assert(false);
@@ -1271,12 +1316,47 @@ void main() {\n\
 			gl.BindTexture(GL_TEXTURE_2D, no_camera_texture);
 			gl.Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
 		}
+		double timer_time_left = state->timer - (curr_time - state->timer_activate_time);
+		if (state->timer_activate_time != 0 && timer_time_left <= 0) {
+			take_picture(state);
+			state->timer_activate_time = 0;
+		}
 		gl.Disable(GL_BLEND);
 		gl.BindBuffer(GL_ARRAY_BUFFER, vbo);
 		gl.BindVertexArray(vao);
-		gl.Uniform1f(u_flash, expf(-(curr_time - flash_time) * 3));
+		gl.Uniform1f(u_flash, expf(-(curr_time - state->flash_time) * 3));
 		gl.DrawArrays(GL_TRIANGLES, 0, 6);
 		gl.Uniform1f(u_flash, 0);
+		if (state->timer_activate_time != 0) {
+			int time_displayed = (int)ceil(timer_time_left);
+			static int prev_time_displayed = -1;
+			static float gl_width, gl_height;
+			gl.Enable(GL_BLEND);
+			gl.ActiveTexture(GL_TEXTURE0);
+			gl.BindTexture(GL_TEXTURE_2D, timer_texture);
+			if (time_displayed != prev_time_displayed) {
+				static char text[16];
+				TTF_SetFontSize(font, window_height / 4);
+				snprintf(text, sizeof text, "%d", time_displayed);
+				SDL_Surface *surf = TTF_RenderUTF8_Blended(font, text, (SDL_Color){255,255,255,255});
+				SDL_LockSurface(surf);
+				gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
+				assert(surf->format->format == SDL_PIXELFORMAT_ARGB8888);
+				assert(surf->pitch % 4 == 0);
+				gl.PixelStorei(GL_UNPACK_ROW_LENGTH, surf->pitch / 4);
+				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, surf->w, surf->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, surf->pixels);
+				gl.PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+				SDL_UnlockSurface(surf);
+				gl_width = (float)surf->w / window_width;
+				gl_height = (float)surf->h / window_height;
+				SDL_FreeSurface(surf);
+			}
+			gl.Uniform2f(u_scale, gl_width, gl_height);
+			gl.Uniform1i(u_sampler, 0);
+			gl.Uniform1f(u_opacity, 0.9f);
+			gl.Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGBA32);
+			gl.DrawArrays(GL_TRIANGLES, 0, 6);
+		}
 		if (state->curr_menu) {
 			gl.Enable(GL_BLEND);
 			gl.ActiveTexture(GL_TEXTURE0);
@@ -1297,7 +1377,7 @@ void main() {\n\
 			static double last_fps_update = -INFINITY;
 			gl.Enable(GL_BLEND);
 			gl.ActiveTexture(GL_TEXTURE0);
-			gl.BindTexture(GL_TEXTURE_2D, fps_texture);
+			gl.BindTexture(GL_TEXTURE_2D, debug_info_texture);
 			static float gl_width, gl_height;
 			if (curr_time - last_fps_update > 0.5) {
 				last_fps_update = curr_time;
