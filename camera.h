@@ -113,6 +113,7 @@ bool camera_save_png(Camera *camera, const char *path);
 bool camera_next_frame(Camera *camera);
 void camera_update_gl_textures(Camera *camera, const GLuint textures[3]);
 const char *camera_name(Camera *camera);
+const char *camera_devnode(Camera *camera);
 uint32_t camera_pixel_format(Camera *camera);
 CameraAccessMethod camera_access_method(Camera *camera);
 void camera_close(Camera *camera);

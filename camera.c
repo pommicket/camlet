@@ -13,7 +13,8 @@
 
 #define CAMERA_MAX_BUFFERS 4
 struct Camera {
-	char *dev_path;
+	// e.g. "/dev/video0"
+	char *devnode;
 	char *name;
 	uint32_t input_idx;
 	struct v4l2_format curr_format;
@@ -290,7 +291,7 @@ static bool camera_stop_io(Camera *camera) {
 	// Re-opening doesn't seem to be necessary for read-based access for me,
 	// but idk if that's true on all cameras.
 	v4l2_close(camera->fd);
-	camera->fd = v4l2_open(camera->dev_path, O_RDWR);
+	camera->fd = v4l2_open(camera->devnode, O_RDWR);
 	if (camera->fd < 0) {
 		perror("v4l2_open");
 		return false;
@@ -702,6 +703,7 @@ void camera_close(Camera *camera) {
 
 void camera_free(Camera *camera) {
 	camera_close(camera);
+	free(camera->devnode);
 	free(camera);
 }
 
@@ -768,7 +770,7 @@ bool camera_open(Camera *camera) {
 	assert(!camera->read_frame);
 	assert(!camera->mmap_frames[0]);
 	assert(!camera->userp_frames[0]);
-	camera->fd = v4l2_open(camera->dev_path, O_RDWR);
+	camera->fd = v4l2_open(camera->devnode, O_RDWR);
 	if (camera->fd < 0) {
 		perror("v4l2_open");
 		return false;
@@ -850,7 +852,7 @@ static void cameras_from_device_with_fd(const char *dev_path, const char *serial
 			arr_set_len(camera->formats, o);
 		}
 		camera->input_idx = input_idx;
-		camera->dev_path = strdup(dev_path);
+		camera->devnode = strdup(dev_path);
 		// select best format
 		PictureFormat best_format = {0};
 		uint32_t desired_format = V4L2_PIX_FMT_RGB24;
@@ -903,4 +905,8 @@ void camera_hash_str(Camera *camera, char str[HASH_SIZE * 2 + 1]) {
 	for (int i = 0; i < HASH_SIZE; i++) {
 		sprintf(&str[2*i], "%02x", camera->hash.hash[i]);
 	}
+}
+
+const char *camera_devnode(Camera *camera) {
+	return camera->devnode;
 }

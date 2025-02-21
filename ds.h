@@ -315,7 +315,7 @@ static void *arr_copy_(const void *arr, size_t member_size) {
 #define arr_remove_item(a, item) do { for (u32 _i = 0; _i < arr_len((a)); ++_i) if ((a)[_i] == item) { arr_remove((a), _i); break; } } while (0);
 #define arr_index_of(a, item) (sizeof((a)[0] == (item)), arr_index_of_((a), sizeof *(a), &(item)))
 #define arr_remove_multiple(a, i, n) (void)((a) = arr_remove_multiple_((a), sizeof *(a), (i), (n)))
-#define arr_insert(a, i, x) do { u32 _index = (i); (a) = arr_cast_typeof(a) arr_grow1_((a), sizeof *(a)); \
+#define arr_insert(a, i, x) do { uint32_t _index = (i); (a) = arr_cast_typeof(a) arr_grow1_((a), sizeof *(a)); \
 	if (a) { memmove((a) + _index + 1, (a) + _index, (arr_len(a) - _index) * sizeof *(a));\
 	(a)[_index] = x; \
 	++arr_hdr_(a)->len; } } while (0)

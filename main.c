@@ -1,6 +1,5 @@
 /*
 TODO
--handle dis/connecting devices
 -timer
 -video
 -adjustable camera framerate
@@ -364,23 +363,55 @@ static void menu_select(State *state) {
 }
 
 static void select_camera(State *state) {
-	arr_foreach_ptr(state->camera_precedence, const Hash, h) {
-		arr_foreach_ptr(state->cameras, Camera *const, pcamera) {
-			Camera *c = *pcamera;
-			if (hash_eq(camera_hash(c), *h)) {
-				if (state->camera == c)
-					return;
-				state->camera = c;
+	bool *cameras_working = calloc(1, arr_len(state->cameras));
+	memset(cameras_working, 1, arr_len(state->cameras));
+	while (true) {
+		int camera_idx = -1;
+		// find highest-precedence possibly-working camera
+		arr_foreach_ptr(state->camera_precedence, const Hash, h) {
+			arr_foreach_ptr(state->cameras, Camera *const, pcamera) {
+				Camera *c = *pcamera;
+				if (hash_eq(camera_hash(c), *h)) {
+					if (state->camera == c) {
+						// already have best camera selected
+						free(cameras_working);
+						return;
+					}
+					camera_idx = (int)(pcamera - state->cameras);
+					if (cameras_working[camera_idx]) {
+						state->camera = c;
+						break;
+					}
+				}
+			}
+			if (state->camera) break;
+		}
+		if (!state->camera) {
+			// nothing in precedence list works- find first possibly-working camera
+			for (camera_idx = 0; camera_idx < (int)arr_len(state->cameras); camera_idx++)
+				if (cameras_working[camera_idx])
+					break;
+			if (camera_idx >= (int)arr_len(state->cameras)) {
+				// no cameras work
 				break;
 			}
+			state->camera = state->cameras[camera_idx];
 		}
-		if (state->camera) break;
+		if (camera_open(state->camera)) {
+			// move to highest precedence
+			arr_foreach_ptr(state->camera_precedence, Hash, h) {
+				if (hash_eq(*h, camera_hash(state->camera))) {
+					arr_remove(state->camera_precedence, h - state->camera_precedence);
+				}
+			}
+			arr_insert(state->camera_precedence, 0, camera_hash(state->camera));
+			break;
+		} else {
+			cameras_working[camera_idx] = false;
+			state->camera = NULL;
+		}
 	}
-	if (!state->camera) {
-		state->camera = state->cameras[0];
-		arr_add(state->camera_precedence, camera_hash(state->camera));
-	}
-	camera_open(state->camera);
+	free(cameras_working);
 }
 
 int menu_get_option_at_pos(State *state, int x, int y) {
@@ -421,6 +452,64 @@ bool mkdir_with_parents(const char *path) {
 			return false;
 		}
 	}
+}
+
+static void debug_print_device_attrs(struct udev_device *dev) {
+	printf("----%s----\n",udev_device_get_devnode(dev));
+	struct udev_list_entry *attr = NULL, *attrs = udev_device_get_sysattr_list_entry(dev);
+	udev_list_entry_foreach(attr, attrs) {
+		const char *val = udev_device_get_sysattr_value(dev, udev_list_entry_get_name(attr));
+		printf("%s = %s\n", udev_list_entry_get_name(attr),
+			val ? val : "NULL");
+	}
+}
+
+static void get_cameras_from_udev_device(State *state, struct udev_device *dev) {
+	const char *devnode = udev_device_get_devnode(dev);
+	if (!devnode) return;
+	const char *subsystem = udev_device_get_sysattr_value(dev, "subsystem");
+	if (!subsystem || strcmp(subsystem, "video4linux") != 0) {
+		// not a v4l device
+		return;
+	}
+	int status = access(devnode, R_OK);
+	if (status != 0 && errno == EACCES) {
+		// can't read from this device
+		return;
+	}
+	if (status != 0) {
+		perror("access");
+		return;
+	}
+	/*
+	build up a serial number for the camera by taking its "serial" value,
+	together with the serial of its ancestors
+	(my personal camera doesn't have a serial on the video4linux device,
+	 but does have one on its grandparent- this makes sense since a single
+	 physical device can have multiple cameras, as well as microphones, etc.)
+	*/
+	// NOTE: we don't need to unref the return value of udev_device_get_parent
+	struct udev_device *parent = udev_device_get_parent(dev);
+	const char *serial_str = udev_device_get_sysattr_value(dev, "serial");
+	StrBuilder serial = str_builder_new();
+	if (serial_str && *serial_str)
+		str_builder_appendf(&serial, "%s;", serial_str);
+	for (int k = 0; k < 100 /* prevent infinite loop due to some fucked up device state */; k++) {
+		const char *parent_serial = udev_device_get_sysattr_value(parent, "serial");
+		if (parent_serial && strlen(parent_serial) >= 12 &&
+			parent_serial[4] == ':' && parent_serial[7] == ':' && parent_serial[10] == '.') {
+			// this is actually a USB interface! e.g. 0000:06:00.3
+			// so it is not tied to the camera
+			break;
+		}
+		if (parent_serial && *parent_serial)
+			str_builder_appendf(&serial, "%s;", parent_serial);
+		struct udev_device *grandparent = udev_device_get_parent(parent);
+		if (!grandparent) break;
+		parent = grandparent;
+	}
+	cameras_from_device(devnode, serial.str, &state->cameras);
+	str_builder_free(&serial);
 }
 
 int main(void) {
@@ -700,7 +789,8 @@ void main() {\n\
 	}
 	struct udev *udev = udev_new();
 	struct udev_monitor *udev_monitor = udev_monitor_new_from_netlink(udev, "udev");
-	udev_monitor_filter_add_match_subsystem_devtype(udev_monitor, "video4linux", NULL);
+	// subsystems don't seem to be set for "remove" events, so we shouldn't do this:
+	//    udev_monitor_filter_add_match_subsystem_devtype(udev_monitor, "video4linux", NULL);
 	if (!udev_monitor) {
 		perror("udev_monitor_new_from_netlink");
 	}
@@ -723,46 +813,7 @@ void main() {\n\
 		udev_list_entry_foreach(device, devices) {
 			struct udev_device *dev = udev_device_new_from_syspath(udev, udev_list_entry_get_name(device));
 			if (!dev) continue;
-			const char *devnode = udev_device_get_devnode(dev);
-			if (!devnode) continue;
-			const char *subsystem = udev_device_get_sysattr_value(dev, "subsystem");
-			if (!subsystem || strcmp(subsystem, "video4linux") != 0) goto cont1;
-			int status = access(devnode, R_OK);
-			if (status != 0 && errno == EACCES) {
-				// can't read from this device
-				goto cont1;
-			}
-			if (status != 0) goto cont1;
-			/*
-			build up a serial number for the camera by taking its "serial" value,
-			together with the serial of its ancestors
-			(my personal camera doesn't have a serial on the video4linux device,
-			 but does have one on its grandparent- this makes sense since a single
-			 physical device can have multiple cameras, as well as microphones, etc.)
-			*/
-			// NOTE: we don't need to unref the return value of udev_device_get_parent
-			struct udev_device *parent = udev_device_get_parent(dev);
-			const char *serial_str = udev_device_get_sysattr_value(dev, "serial");
-			StrBuilder serial = str_builder_new();
-			if (serial_str && *serial_str)
-				str_builder_appendf(&serial, "%s;", serial_str);
-			for (int k = 0; k < 100 /* prevent infinite loop due to some fucked up device state */; k++) {
-				const char *parent_serial = udev_device_get_sysattr_value(parent, "serial");
-				if (parent_serial && strlen(parent_serial) >= 12 &&
-					parent_serial[4] == ':' && parent_serial[7] == ':' && parent_serial[10] == '.') {
-					// this is actually a USB interface! e.g. 0000:06:00.3
-					// so it is not tied to the camera
-					break;
-				}
-				if (parent_serial && *parent_serial)
-					str_builder_appendf(&serial, "%s;", parent_serial);
-				struct udev_device *grandparent = udev_device_get_parent(parent);
-				if (!grandparent) break;
-				parent = grandparent;
-			}
-			cameras_from_device(devnode, serial.str, &state->cameras);
-			str_builder_free(&serial);
-			cont1:
+			get_cameras_from_udev_device(state, dev);
 			udev_device_unref(dev);
 		}
 		udev_enumerate_unref(enumerate);
@@ -787,16 +838,31 @@ void main() {\n\
 	while (!state->quit) {
 		state->menu_needs_rerendering = false;
 		struct udev_device *dev = NULL;
+		bool any_new_cameras = false;
 		while (udev_monitor && (dev = udev_monitor_receive_device(udev_monitor))) {
-			printf("%s %s\n",udev_device_get_sysname(dev),udev_device_get_action(dev));
-			struct udev_list_entry *attr = NULL, *attrs = udev_device_get_sysattr_list_entry(dev);
-			
-			udev_list_entry_foreach(attr, attrs) {
-				printf("%s = %s\n", udev_list_entry_get_name(attr),
-					udev_device_get_sysattr_value(dev, udev_list_entry_get_name(attr)));
+			const char *devnode = udev_device_get_devnode(dev);
+			const char *action = udev_device_get_action(dev);
+			const char *subsystem = udev_device_get_sysattr_value(dev, "subsystem");
+			if (strcmp(action, "remove") == 0) {
+				if (state->camera && strcmp(devnode, camera_devnode(state->camera)) == 0) {
+					// our special camera got disconnected ):
+					state->camera = NULL;
+				}
+				for (size_t i = 0; i < arr_len(state->cameras); ) {
+					if (strcmp(camera_devnode(state->cameras[i]), devnode) == 0) {
+						arr_remove(state->cameras, i);
+					} else {
+						i++;
+					}
+				}
+			} else if (strcmp(action, "add") == 0 && subsystem && strcmp(subsystem, "video4linux") == 0) {
+				get_cameras_from_udev_device(state, dev);
+				any_new_cameras = true;
 			}
 			udev_device_unref(dev);
 		}
+		if (!state->camera || any_new_cameras)
+			select_camera(state);
 		SDL_Event event = {0};
 		while (SDL_PollEvent(&event)) {
 			if (event.type == SDL_QUIT) goto quit;
