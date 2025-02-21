@@ -11,7 +11,6 @@ TODO
 #include <linux/videodev2.h>
 #include <inttypes.h>
 #include <errno.h>
-#include <string.h>
 #include <SDL.h>
 #include <SDL_ttf.h>
 #include <time.h>
@@ -20,6 +19,7 @@ TODO
 #include <fontconfig/fontconfig.h>
 #include <fcntl.h>
 #include <unistd.h>
+#include <dirent.h>
 #include "ds.h"
 #include "camera.h"
 
@@ -39,14 +39,14 @@ typedef enum {
 enum {
 	MENU_OPT_QUIT = 1,
 	MENU_OPT_RESOLUTION,
-	MENU_OPT_INPUT,
+	MENU_OPT_VIDEO_INPUT,
 	MENU_OPT_PIXFMT,
 	MENU_OPT_IMGFMT,
 };
 // use char for MenuOption type so that we can use strlen
 typedef char MenuOption;
 static const MenuOption main_menu[] = {
-	MENU_OPT_INPUT,
+	MENU_OPT_VIDEO_INPUT,
 	MENU_OPT_RESOLUTION,
 	MENU_OPT_IMGFMT,
 	MENU_OPT_PIXFMT,
@@ -73,6 +73,7 @@ typedef struct {
 	Camera **cameras;
 	ImageFormat image_format;
 	SDL_Rect *menu_option_rects;
+	Hash *camera_precedence;
 } State;
 
 #if crypto_generichash_BYTES_MIN > HASH_SIZE
@@ -260,7 +261,7 @@ static void menu_select(State *state) {
 			}
 			arr_free(resolutions);
 			} break;
-		case MENU_OPT_INPUT:
+		case MENU_OPT_VIDEO_INPUT:
 			if (state->cameras) {
 				state->curr_menu = MENU_INPUT;
 				state->menu_needs_rerendering = true;
@@ -335,6 +336,26 @@ static void menu_select(State *state) {
 	} else if (state->curr_menu == MENU_HELP) {
 		state->curr_menu = 0;
 	}
+}
+
+static void select_camera(State *state) {
+	arr_foreach_ptr(state->camera_precedence, const Hash, h) {
+		arr_foreach_ptr(state->cameras, Camera *const, pcamera) {
+			Camera *c = *pcamera;
+			if (hash_eq(camera_hash(c), *h)) {
+				if (state->camera == c)
+					return;
+				state->camera = c;
+				break;
+			}
+		}
+		if (state->camera) break;
+	}
+	if (!state->camera) {
+		state->camera = state->cameras[0];
+		arr_add(state->camera_precedence, camera_hash(state->camera));
+	}
+	camera_open(state->camera);
 }
 
 int menu_get_option_at_pos(State *state, int x, int y) {
@@ -630,16 +651,6 @@ void main() {\n\
 	{
 		struct udev_enumerate *enumerate = udev_enumerate_new(udev);
 		udev_enumerate_add_match_subsystem(enumerate, "video4linux");
-		/*
-		udev_enumerate_add_match_subsystem(enumerate, "usb");
-		udev_list_entry_foreach(device, devices) {
-			const char *serial = udev_device_get_sysattr_value(dev, "serial");
-			if (!serial || !*serial) continue;
-			TODO: walk through device directory here to see if it has any video4linux children.
-			NOTE: bus_info seems to be not a good way of identifying devices (it's a bit mysterious)
-			      and we'd have to support nested USB hubs which is a pain anyways.
-		}
-		*/
 		udev_enumerate_scan_devices(enumerate);
 		struct udev_list_entry *device = NULL, *devices = udev_enumerate_get_list_entry(enumerate);
 		udev_list_entry_foreach(device, devices) {
@@ -648,17 +659,43 @@ void main() {\n\
 			const char *devnode = udev_device_get_devnode(dev);
 			if (!devnode) continue;
 			const char *subsystem = udev_device_get_sysattr_value(dev, "subsystem");
-			const char *serial = udev_device_get_sysattr_value(dev, "serial");
-			if (strcmp(subsystem, "video4linux") == 0) {
-				int status = access(devnode, R_OK);
-				if (status != 0 && errno == EACCES) {
-					// can't read from this device
-					goto cont;
-				}
-				if (status) break;
-				cameras_from_device(devnode, serial, &state->cameras);
+			if (!subsystem || strcmp(subsystem, "video4linux") != 0) goto cont1;
+			int status = access(devnode, R_OK);
+			if (status != 0 && errno == EACCES) {
+				// can't read from this device
+				goto cont1;
 			}
-			cont:
+			if (status != 0) goto cont1;
+			/*
+			build up a serial number for the camera by taking its "serial" value,
+			together with the serial of its ancestors
+			(my personal camera doesn't have a serial on the video4linux device,
+			 but does have one on its grandparent- this makes sense since a single
+			 physical device can have multiple cameras, as well as microphones, etc.)
+			*/
+			// NOTE: we don't need to unref the return value of udev_device_get_parent
+			struct udev_device *parent = udev_device_get_parent(dev);
+			const char *serial_str = udev_device_get_sysattr_value(dev, "serial");
+			StrBuilder serial = str_builder_new();
+			if (serial_str && *serial_str)
+				str_builder_appendf(&serial, "%s;", serial_str);
+			for (int k = 0; k < 100 /* prevent infinite loop due to some fucked up device state */; k++) {
+				const char *parent_serial = udev_device_get_sysattr_value(parent, "serial");
+				if (parent_serial && strlen(parent_serial) >= 12 &&
+					parent_serial[4] == ':' && parent_serial[7] == ':' && parent_serial[10] == '.') {
+					// this is actually a USB interface! e.g. 0000:06:00.3
+					// so it is not tied to the camera
+					break;
+				}
+				if (parent_serial && *parent_serial)
+					str_builder_appendf(&serial, "%s;", parent_serial);
+				struct udev_device *grandparent = udev_device_get_parent(parent);
+				if (!grandparent) break;
+				parent = grandparent;
+			}
+			cameras_from_device(devnode, serial.str, &state->cameras);
+			str_builder_free(&serial);
+			cont1:
 			udev_device_unref(dev);
 		}
 		udev_enumerate_unref(enumerate);
@@ -672,12 +709,9 @@ void main() {\n\
 			printf("\n");
 		}
 	}
-	if (arr_len(state->cameras) == 0) {
-		state->camera = NULL;
-	} else {
-		state->camera = state->cameras[0];
-		if (!camera_open(state->camera))
-			return EXIT_FAILURE;
+	state->camera = NULL;
+	if (arr_len(state->cameras) != 0) {
+		select_camera(state);
 	}
 	double flash_time = -INFINITY;
 	uint32_t last_frame_pixfmt = 0;
@@ -864,8 +898,8 @@ void main() {\n\
 							option = a_sprintf("Resolution: None");
 						}
 						break;
-					case MENU_OPT_INPUT:
-						option = a_sprintf("Input: %s", state->camera ? camera_name(state->camera) : "None");
+					case MENU_OPT_VIDEO_INPUT:
+						option = a_sprintf("Video Input: %s", state->camera ? camera_name(state->camera) : "None");
 						break;
 					case MENU_OPT_PIXFMT:
 						option = a_sprintf("Picture format: %s",

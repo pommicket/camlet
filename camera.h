@@ -4,6 +4,7 @@
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
+#include <string.h>
 #include <GL/glcorearb.h>
 
 typedef uint32_t PixelFormat;
@@ -91,6 +92,10 @@ typedef struct {
 	gl_for_each_proc(declare_proc)
 #undef declare_proc
 } GlProcs;
+
+static bool hash_eq(Hash h1, Hash h2) {
+	return memcmp(h1.hash, h2.hash, sizeof h1.hash) == 0;
+}
 
 void camera_init(const GlProcs *procs);
 bool pix_fmt_supported(uint32_t pixfmt);

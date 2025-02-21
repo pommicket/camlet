@@ -1,7 +1,6 @@
 #include "camera.h"
 #include <linux/videodev2.h>
 #include <sodium.h>
-#include <string.h>
 #include <libv4l2.h>
 #include <sys/mman.h>
 #include <poll.h>
