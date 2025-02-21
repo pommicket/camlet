@@ -86,11 +86,13 @@ typedef enum {
 	do(UNIFORMMATRIX4FV, UniformMatrix4fv)\
 	do(DEBUGMESSAGECALLBACK, DebugMessageCallback)\
 	do(DEBUGMESSAGECONTROL, DebugMessageControl)\
-	do(PIXELSTOREI, PixelStorei)
+	do(PIXELSTOREI, PixelStorei)\
+	do(BINDFRAGDATALOCATION, BindFragDataLocation)
 typedef struct {
 #define declare_proc(upper, lower) PFNGL##upper##PROC lower;
 	gl_for_each_proc(declare_proc)
 #undef declare_proc
+	int version_major, version_minor;
 } GlProcs;
 
 static bool hash_eq(Hash h1, Hash h2) {
@@ -111,7 +113,10 @@ PictureFormat camera_picture_format(Camera *camera);
 bool camera_save_jpg(Camera *camera, const char *path, int quality);
 bool camera_save_png(Camera *camera, const char *path);
 bool camera_next_frame(Camera *camera);
-void camera_update_gl_textures(Camera *camera, const GLuint textures[3]);
+/// Updates the texture data for the given textures to the current picture.
+///
+/// Returns the number of textures which are actually needed.
+int camera_update_gl_textures(Camera *camera, const GLuint textures[3]);
 const char *camera_name(Camera *camera);
 const char *camera_devnode(Camera *camera);
 uint32_t camera_pixel_format(Camera *camera);

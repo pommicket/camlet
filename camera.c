@@ -552,6 +552,7 @@ bool camera_next_frame(Camera *camera) {
 	const int32_t frame_height = camera_frame_height(camera);
 	if (camera_pixel_format(camera) == V4L2_PIX_FMT_MJPEG) {
 		// decompress the jpeg
+		//  ("motion jpeg" is actually just a series of jpegs)
 		// NOTE: libjpeg is ~2x as fast as stb_image
 		JpegErrorMessenger messenger = {.base = {.error_exit = jpeg_error_handler}};
 		struct jpeg_decompress_struct cinfo = {0};
@@ -592,7 +593,7 @@ bool camera_next_frame(Camera *camera) {
 	return true;
 }
 
-void camera_update_gl_textures(Camera *camera, const GLuint textures[3]) {
+int camera_update_gl_textures(Camera *camera, const GLuint textures[3]) {
 	int prev_align = 1;
 	gl.BindTexture(GL_TEXTURE_2D, textures[0]);
 	gl.GetIntegerv(GL_UNPACK_ALIGNMENT, &prev_align);
@@ -604,23 +605,32 @@ void camera_update_gl_textures(Camera *camera, const GLuint textures[3]) {
 		}
 	}
 	uint8_t *curr_frame = camera_curr_frame(camera);
+	int n_textures = 0;
 	if (curr_frame) {
 		switch (camera->curr_format.fmt.pix.pixelformat) {
 		case V4L2_PIX_FMT_RGB24:
-			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 3)
+			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 3) {
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame_width, frame_height, 0, GL_RGB, GL_UNSIGNED_BYTE, curr_frame);
+				n_textures = 1;
+			}
 			break;
 		case V4L2_PIX_FMT_BGR24:
-			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 3)
+			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 3) {
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame_width, frame_height, 0, GL_BGR, GL_UNSIGNED_BYTE, curr_frame);
+				n_textures = 1;
+			}
 			break;
 		case V4L2_PIX_FMT_GREY:
-			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height)
+			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height) {
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width, frame_height, 0, GL_RED, GL_UNSIGNED_BYTE, curr_frame);
+				n_textures = 1;
+			}
 			break;
 		case V4L2_PIX_FMT_YUYV:
-			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 2)
+			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 2) {
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, frame_width / 2, frame_height, 0, GL_RGBA, GL_UNSIGNED_BYTE, curr_frame);
+				n_textures = 1;
+			}
 			break;
 		case V4L2_PIX_FMT_YUV420:
 			if (camera->frame_bytes_set >= (size_t)frame_width * (size_t)frame_height * 3 / 2) {
@@ -634,6 +644,7 @@ void camera_update_gl_textures(Camera *camera, const GLuint textures[3]) {
 				gl.BindTexture(GL_TEXTURE_2D, textures[2]);
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width / 2, frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE,
 					curr_frame + (size_t)frame_width * (size_t)frame_height * 5 / 4);
+				n_textures = 3;
 			}
 			break;
 		case V4L2_PIX_FMT_YVU420:
@@ -649,6 +660,7 @@ void camera_update_gl_textures(Camera *camera, const GLuint textures[3]) {
 				gl.BindTexture(GL_TEXTURE_2D, textures[1]);
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, frame_width / 2, frame_height / 2, 0, GL_RED, GL_UNSIGNED_BYTE,
 					curr_frame + (size_t)frame_width * (size_t)frame_height * 5 / 4);
+				n_textures = 3;
 			}
 			break;
 		case V4L2_PIX_FMT_NV12:
@@ -660,16 +672,18 @@ void camera_update_gl_textures(Camera *camera, const GLuint textures[3]) {
 				gl.BindTexture(GL_TEXTURE_2D, textures[1]);
 				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RG, frame_width / 2, frame_height / 2, 0, GL_RG, GL_UNSIGNED_BYTE,
 					curr_frame + (size_t)frame_width * (size_t)frame_height);
+				n_textures = 2;
 			}
 			break;
 		case V4L2_PIX_FMT_MJPEG: {
-			// "motion jpeg" is actually just a series of jpegs
 			gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGB, frame_width, frame_height, 0, GL_RGB, GL_UNSIGNED_BYTE,
 				camera->decompression_buf);
+			n_textures = 1;
 			} break;
 		}
 	}
 	gl.PixelStorei(GL_UNPACK_ALIGNMENT, prev_align);
+	return n_textures;
 }
 
 const char *camera_name(Camera *camera) {
@@ -704,6 +718,7 @@ void camera_close(Camera *camera) {
 void camera_free(Camera *camera) {
 	camera_close(camera);
 	free(camera->devnode);
+	free(camera->name);
 	free(camera);
 }
 

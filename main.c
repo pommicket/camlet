@@ -73,7 +73,7 @@ static const char *const image_format_extensions[IMG_FMT_COUNT] = {"jpg", "png"}
 typedef struct {
 	Menu curr_menu;
 	int menu_sel[MENU_COUNT];
-	bool show_fps;
+	bool show_debug;
 	bool menu_needs_rerendering;
 	bool quit;
 	char *output_dir;
@@ -89,6 +89,18 @@ typedef struct {
 #endif
 
 static GlProcs gl;
+static void select_camera(State *state);
+
+static void fatal_error(PRINTF_FORMAT_STRING const char *fmt, ...) ATTRIBUTE_PRINTF(1, 2);
+static void fatal_error(const char *fmt, ...) {
+	va_list args;
+	va_start(args, fmt);
+	static char message[256];
+	vsnprintf(message, sizeof message, fmt, args);
+	va_end(args);
+	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "camlet error", message, NULL);
+	exit(EXIT_FAILURE);
+}
 
 #if DEBUG
 static void APIENTRY gl_message_callback(GLenum source, GLenum type, unsigned int id, GLenum severity, 
@@ -98,42 +110,6 @@ static void APIENTRY gl_message_callback(GLenum source, GLenum type, unsigned in
 	printf("Message from OpenGL: %s.\n", message);
 }
 #endif
-
-static void debug_save_24bpp_bmp(const char *filename, const uint8_t *pixels, uint16_t width, uint16_t height) {
-	FILE *fp = fopen(filename, "wb");
-	if (!fp) {
-		perror("fopen");
-		return;
-	}
-	typedef struct {
-		char BM[2];
-		char size[4];
-		char resv[4];
-		char offset[4];
-		char hdrsize[4];
-		uint16_t width;
-		uint16_t height;
-		uint16_t planes;
-		uint16_t bit_count;
-	} BMPHeader;
-	BMPHeader hdr = {
-		.BM = "BM",
-		.width = width,
-		.height = height,
-		.planes = 1,
-		.bit_count = 24,
-	};
-	uint32_t offset = sizeof(BMPHeader);
-	uint32_t file_size = sizeof(BMPHeader) + (uint32_t)width * height * 3;
-	memcpy(&hdr.size, &file_size, 4);
-	memcpy(&hdr.offset, &offset, 4);
-	memcpy(&hdr.hdrsize, (uint32_t[1]) { 12 }, 4);
-	fwrite(&hdr, sizeof(BMPHeader), 1, fp);
-	for (uint32_t i = 0; i < height; i++) {
-		fwrite(pixels + (height-1-i) * width * 3, 3, (size_t)width, fp);
-	}
-	fclose(fp);
-}
 
 // compile a GLSL shader
 GLuint gl_compile_shader(char error_buf[256], const char *code, GLenum shader_type) {
@@ -198,7 +174,7 @@ GLuint gl_compile_and_link_shaders(char error_buf[256], const char *vshader_code
 	GLuint program = gl_link_program(error_buf, shaders, 2);
 	if (shaders[0]) gl.DeleteShader(shaders[0]);
 	if (shaders[1]) gl.DeleteShader(shaders[1]);
-	if (program) {
+	if (program && DEBUG) {
 		printf("Successfully linked program %u.\n", program);
 	}
 	return program;
@@ -257,6 +233,17 @@ static double get_time_double(void) {
 	struct timespec ts = {0};
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
+}
+
+static void move_to_highest_precedence(State *state, Camera *camera) {
+	Hash hash = camera_hash(camera);
+	for (size_t i = 0; i < arr_len(state->camera_precedence); i++) {
+		if (hash_eq(state->camera_precedence[i], hash)) {
+			arr_remove(state->camera_precedence, i);
+			break;
+		}
+	}
+	arr_insert(state->camera_precedence, 0, hash);
 }
 
 static void menu_select(State *state) {
@@ -333,11 +320,18 @@ static void menu_select(State *state) {
 		}
 		Camera *new_camera = state->cameras[sel-1];
 		if (state->camera == new_camera) {
-			// already using this camera
+			// already using this camera- just change its precedence
+			move_to_highest_precedence(state, state->camera);
 		} else {
 			camera_close(state->camera);
 			state->camera = new_camera;
-			camera_open(state->camera);
+			if (camera_open(state->camera)) {
+				// put at highest precedence
+				move_to_highest_precedence(state, state->camera);
+			} else {
+				state->camera = NULL;
+				select_camera(state);
+			}
 		}
 	} else if (state->curr_menu == MENU_PIXFMT) {
 		uint32_t *pixfmts = camera_get_pixfmts(state->camera);
@@ -398,13 +392,16 @@ static void select_camera(State *state) {
 			state->camera = state->cameras[camera_idx];
 		}
 		if (camera_open(state->camera)) {
-			// move to highest precedence
+			bool already_there = false;
 			arr_foreach_ptr(state->camera_precedence, Hash, h) {
 				if (hash_eq(*h, camera_hash(state->camera))) {
-					arr_remove(state->camera_precedence, h - state->camera_precedence);
+					already_there = true;
 				}
 			}
-			arr_insert(state->camera_precedence, 0, camera_hash(state->camera));
+			// if hasn't already been added, put it at the lowest precedence
+			if (!already_there) {
+				arr_add(state->camera_precedence, camera_hash(state->camera));
+			}
 			break;
 		} else {
 			cameras_working[camera_idx] = false;
@@ -521,17 +518,14 @@ int main(void) {
 		return EXIT_FAILURE;
 	}
 	if (sodium_init() < 0) {
-		fprintf(stderr, "couldn't initialize libsodium\n");
-		return EXIT_FAILURE;
+		fatal_error("couldn't initialize libsodium");
 	}
 	if (!FcInit()) {
-		fprintf(stderr, "couldn't initialize fontconfig\n");
-		return EXIT_FAILURE;
+		fatal_error("couldn't initialize fontconfig");
 	}
 	#define FcFini "don't call FcFini: it's broken on certain versions of fontconfig - https://github.com/brndnmtthws/conky/pull/1755"
 	if (TTF_Init() < 0) {
-		fprintf(stderr, "couldn't initialize SDL2_ttf: %s\n", TTF_GetError());
-		return EXIT_FAILURE;
+		fatal_error("couldn't initialize SDL2_ttf: %s\n", TTF_GetError());
 	}
 	static char home_dir[PATH_MAX];
 	{
@@ -540,11 +534,12 @@ int main(void) {
 			snprintf(home_dir, sizeof home_dir, "%s", home);
 		} else {
 			struct passwd *pwd = getpwuid(getuid());
-			if (!pwd) {
+			if (pwd) {
+				snprintf(home_dir, sizeof home_dir, "%s", pwd->pw_dir);
+			} else {
 				perror("getpwuid");
-				return EXIT_FAILURE;
+				strcpy(home_dir, "."); // why not
 			}
-			snprintf(home_dir, sizeof home_dir, "%s", pwd->pw_dir);
 		}
 	}
 	char *font_path = NULL;
@@ -568,8 +563,7 @@ int main(void) {
 				font_path = strdup((const char *)file);
 			}
 		} else {
-			fprintf(stderr, "couldn't find any regular English TTF fonts. try installing one?\n");
-			return EXIT_FAILURE;
+			fatal_error("couldn't find any regular English TTF fonts. try installing one?");
 		}
 		FcPatternDestroy(pattern);
 		FcPatternDestroy(font);
@@ -577,25 +571,32 @@ int main(void) {
 	}
 	TTF_Font *font = TTF_OpenFont(font_path, 72);
 	if (!font) {
-		fprintf(stderr, "couldn't open font %s: %s\n", font_path, TTF_GetError());
-		return EXIT_FAILURE;
+		fatal_error("couldn't open font %s: %s", font_path, TTF_GetError());
 	}
 	SDL_Window *window = SDL_CreateWindow("camlet", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 1280, 720, SDL_WINDOW_OPENGL|SDL_WINDOW_SHOWN|SDL_WINDOW_RESIZABLE);
 	if (!window) {
-		fprintf(stderr, "couldn't create window: %s\n", SDL_GetError());
-		return EXIT_FAILURE;
+		fatal_error("couldn't create window: %s", SDL_GetError());
 	}
-	int gl_version_major = 3, gl_version_minor = 0;
-	#if DEBUG
-		gl_version_major = 4;
-		gl_version_minor = 3;
-	#endif
-	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, gl_version_major);
-	SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, gl_version_minor);
-	SDL_GLContext glctx = SDL_GL_CreateContext(window);
+	static const struct {
+		int maj, min;
+	} gl_versions_to_try[] = {
+		{4, 3},
+		{3, 0}
+	};
+	SDL_GLContext glctx = NULL;
+	for (size_t i = 0; !glctx && i < SDL_arraysize(gl_versions_to_try); i++) {
+		gl.version_major = gl_versions_to_try[i].maj;
+		gl.version_minor = gl_versions_to_try[i].min;
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, gl.version_major);
+		SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, gl.version_minor);
+		#if DEBUG
+		if (gl.version_major * 100 + gl.version_minor >= 403)
+			SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, SDL_GL_CONTEXT_DEBUG_FLAG);
+		#endif
+		glctx = SDL_GL_CreateContext(window);
+	}
 	if (!glctx) {
-		fprintf(stderr, "couldn't create GL context: %s\n", SDL_GetError());
-		return EXIT_FAILURE;
+		fatal_error("couldn't create GL context: %s", SDL_GetError());
 	}
 	SDL_GL_SetSwapInterval(1); // vsync
 	#if __GNUC__
@@ -615,6 +616,7 @@ int main(void) {
 		gl.Enable(GL_DEBUG_OUTPUT);
 		gl.Enable(GL_DEBUG_OUTPUT_SYNCHRONOUS);
 		if (flags & GL_CONTEXT_FLAG_DEBUG_BIT) {
+		printf("yay\n");
 			// set up debug message callback
 			gl.DebugMessageCallback(gl_message_callback, NULL);
 			gl.DebugMessageControl(GL_DONT_CARE, GL_DONT_CARE, GL_DONT_CARE, 0, NULL, GL_TRUE);
@@ -623,7 +625,7 @@ int main(void) {
 	#endif
 	gl.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 	double last_time = get_time_double();
-	GLuint textures[6] = {0};
+	GLuint textures[7] = {0};
 	gl.GenTextures(SDL_arraysize(textures), textures);
 	for (size_t i = 0; i < SDL_arraysize(textures); i++) {
 		gl.BindTexture(GL_TEXTURE_2D, textures[i]);
@@ -635,6 +637,12 @@ int main(void) {
 	GLuint menu_texture = textures[0];
 	GLuint no_camera_texture = textures[1];
 	GLuint fps_texture = textures[2];
+	GLuint black_texture = textures[6];
+	{
+		static uint8_t black[16];
+		gl.BindTexture(GL_TEXTURE_2D, black_texture);
+		gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RED, 4, 4, 0, GL_RED, GL_UNSIGNED_BYTE, black);
+	}
 	// texture for camera output
 	GLuint camera_textures[3] = {textures[3], textures[4], textures[5]};
 	static const int32_t no_camera_width = 1280, no_camera_height = 720;
@@ -671,6 +679,7 @@ void main() {\n\
 ";
 	const char *fshader_code = "in vec4 color;\n\
 in vec2 tex_coord;\n\
+out vec4 o_color;\n\
 uniform sampler2D u_sampler;\n\
 uniform sampler2D u_sampler2;\n\
 uniform sampler2D u_sampler3;\n\
@@ -742,15 +751,18 @@ void main() {\n\
 		color = texture2D(u_sampler, tex_coord).xyz;\n\
 		break;\n\
 	}\n\
-	gl_FragColor = vec4(mix(color, vec3(1.0), u_flash), opacity);\n\
+	o_color = vec4(mix(color, vec3(1.0), u_flash), opacity);\n\
 }\n\
 ";
 	char err[256] = {0};
 	GLuint program = gl_compile_and_link_shaders(err, vshader_code, fshader_code);
 	if (*err) {
-		fprintf(stderr, "%s\n",err);
+		fatal_error("Couldn't compile shader: %s", err);
 	}
-	if (program == 0) return EXIT_FAILURE;
+	if (program == 0) {
+		fatal_error("Couldn't compile shader (no error log available)");
+	}
+	gl.BindFragDataLocation(program, 0, "o_color");
 	GLuint vbo = 0, vao = 0;
 	gl.GenBuffers(1, &vbo);
 	gl.GenVertexArrays(1, &vao);
@@ -817,14 +829,16 @@ void main() {\n\
 			udev_device_unref(dev);
 		}
 		udev_enumerate_unref(enumerate);
-		printf("---CAMERAS---\n");
-		for (size_t i = 0; i < arr_len(state->cameras); i++) {
-			Camera *camera = state->cameras[i];
-			printf("[%zu] %s ", i, camera_name(camera));
-			char buf[HASH_SIZE * 2 + 1] = {0};
-			camera_hash_str(camera, buf);
-			printf("%s", buf);
-			printf("\n");
+		if (DEBUG) {
+			printf("---CAMERAS---\n");
+			for (size_t i = 0; i < arr_len(state->cameras); i++) {
+				Camera *camera = state->cameras[i];
+				printf("[%zu] %s ", i, camera_name(camera));
+				char buf[HASH_SIZE * 2 + 1] = {0};
+				camera_hash_str(camera, buf);
+				printf("%s", buf);
+				printf("\n");
+			}
 		}
 	}
 	state->output_dir = strdup(DEFAULT_OUTPUT_DIR);
@@ -954,7 +968,7 @@ void main() {\n\
 				state->menu_needs_rerendering = true;
 				break;
 			case SDLK_F2:
-				state->show_fps = !state->show_fps;
+				state->show_debug = !state->show_debug;
 				break;
 			case SDLK_LEFT:
 				if (state->curr_menu == MENU_MAIN && state->menu_sel[MENU_MAIN] == MENU_OPT_IMGFMT) {
@@ -1144,7 +1158,7 @@ void main() {\n\
 					"F1 - open this help screen",
 					"Space - take a picture",
 					"Escape - open/close settings",
-					"F2 - show frame rate",
+					"F2 - show debug info",
 				};
 				for (size_t line = 0; line < SDL_arraysize(text); line++) {
 					render_text_to_surface(font, menu, 5, 5 + (5 + font_size) * (line + 1),
@@ -1208,6 +1222,7 @@ void main() {\n\
 		if (last_camera_time == 0) last_camera_time = curr_time;
 		static double smoothed_camera_time;
 		if (state->camera) {
+			static int n_active_textures;
 			if (camera_next_frame(state->camera)) {
 				last_frame_pixfmt = camera_pixel_format(state->camera);
 				if (smoothed_camera_time == 0)
@@ -1215,15 +1230,29 @@ void main() {\n\
 				// bias towards recent frame times
 				smoothed_camera_time = smoothed_camera_time * 0.9 + (curr_time - last_camera_time) * 0.1;
 				last_camera_time = curr_time;
-				camera_update_gl_textures(state->camera, camera_textures);
+				n_active_textures = camera_update_gl_textures(state->camera, camera_textures);
 			}
 			gl.Uniform1i(u_pixel_format, last_frame_pixfmt);
 			gl.ActiveTexture(GL_TEXTURE0);
-			gl.BindTexture(GL_TEXTURE_2D, camera_textures[0]);
+			// we always want to bind something to every texture slot,
+			// otherwise opengl will scream at us in the debug messages.
+			if (n_active_textures >= 1) {
+				gl.BindTexture(GL_TEXTURE_2D, camera_textures[0]);
+			} else {
+				gl.BindTexture(GL_TEXTURE_2D, black_texture);
+			}
 			gl.ActiveTexture(GL_TEXTURE1);
-			gl.BindTexture(GL_TEXTURE_2D, camera_textures[1]);
+			if (n_active_textures >= 2) {
+				gl.BindTexture(GL_TEXTURE_2D, camera_textures[1]);
+			} else {
+				gl.BindTexture(GL_TEXTURE_2D, black_texture);
+			}
 			gl.ActiveTexture(GL_TEXTURE2);
-			gl.BindTexture(GL_TEXTURE_2D, camera_textures[2]);
+			if (n_active_textures >= 3) {
+				gl.BindTexture(GL_TEXTURE_2D, camera_textures[2]);
+			} else {
+				gl.BindTexture(GL_TEXTURE_2D, black_texture);
+			}
 		} else {
 			gl.ActiveTexture(GL_TEXTURE0);
 			gl.BindTexture(GL_TEXTURE_2D, no_camera_texture);
@@ -1246,7 +1275,7 @@ void main() {\n\
 			gl.Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
 			gl.DrawArrays(GL_TRIANGLES, 0, 6);
 		}
-		if (state->show_fps) {
+		if (state->show_debug) {
 			static double smoothed_frame_time;
 			if (smoothed_frame_time == 0)
 				smoothed_frame_time = frame_time;
@@ -1259,21 +1288,28 @@ void main() {\n\
 			static float gl_width, gl_height;
 			if (curr_time - last_fps_update > 0.5) {
 				last_fps_update = curr_time;
-				static char text[32];
-				snprintf(text, sizeof text, "Camera FPS: %" PRId32 "  Render FPS: %" PRId32,
+				static char text[256];
+				char hash[HASH_SIZE * 2 + 1] = {0};
+				if (state->camera) {
+					camera_hash_str(state->camera, hash);
+					strcpy(&hash[8], "...");
+				}
+				snprintf(text, sizeof text, "Camera FPS: %" PRId32 "  Render FPS: %" PRId32 " Camera ID: %s",
 					smoothed_camera_time > 1e-9 && smoothed_camera_time < 1 ? (int32_t)(1/smoothed_camera_time) : 0,
-					smoothed_frame_time > 1e-9 && smoothed_frame_time < 1 ? (int32_t)(1/smoothed_frame_time) : 0);
-				SDL_Surface *fps = TTF_RenderUTF8_Blended(font, text, (SDL_Color){255,255,255,255});
-				SDL_LockSurface(fps);
+					smoothed_frame_time > 1e-9 && smoothed_frame_time < 1 ? (int32_t)(1/smoothed_frame_time) : 0,
+					state->camera ? hash : "(None)");
+				SDL_Surface *surf = TTF_RenderUTF8_Blended(font, text, (SDL_Color){255,255,255,255});
+				SDL_LockSurface(surf);
 				gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
-				assert(fps->pitch % 4 == 0);
-				gl.PixelStorei(GL_UNPACK_ROW_LENGTH, fps->pitch / 4);
-				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, fps->w, fps->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, fps->pixels);
+				assert(surf->format->format == SDL_PIXELFORMAT_ARGB8888);
+				assert(surf->pitch % 4 == 0);
+				gl.PixelStorei(GL_UNPACK_ROW_LENGTH, surf->pitch / 4);
+				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, surf->w, surf->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, surf->pixels);
 				gl.PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-				SDL_UnlockSurface(fps);
-				gl_width = (float)fps->w / window_width;
-				gl_height = (float)fps->h / window_height;
-				SDL_FreeSurface(fps);
+				SDL_UnlockSurface(surf);
+				gl_width = (float)surf->w / window_width;
+				gl_height = (float)surf->h / window_height;
+				SDL_FreeSurface(surf);
 			}
 			gl.Uniform2f(u_scale, gl_width, gl_height);
 			gl.Uniform1i(u_sampler, 0);
@@ -1287,7 +1323,6 @@ void main() {\n\
 	quit:
 	udev_monitor_unref(udev_monitor);
 	udev_unref(udev);
-	//debug_save_24bpp_bmp("out.bmp", buf, camera->best_format.fmt.pix.width, camera->best_format.fmt.pix.height);
 	arr_foreach_ptr(state->cameras, Camera *, pcamera) {
 		camera_free(*pcamera);
 	}
