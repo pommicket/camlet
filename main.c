@@ -1,8 +1,10 @@
 /*
 TODO
--view previous pictures (thumbnails)
+-timer
 -video
 -adjustable camera framerate
+-configurable picture directory (default ~/Pictures/Webcam)
+-open picture directory
 -save/restore settings
 */
 #define _GNU_SOURCE

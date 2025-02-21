@@ -799,23 +799,21 @@ static void cameras_from_device_with_fd(const char *dev_path, const char *serial
 		camera->fd = -1;
 		crypto_generichash_state hash_state = {0};
 		crypto_generichash_init(&hash_state, NULL, 0, HASH_SIZE);
-		static char fname[32];
-		static int fid;
-		sprintf(fname, "%d.hash", fid++);
-		FILE *fp = fopen(fname, "w");
-		fprintf(fp,"%s %s %s\n",cap.card,input.name,serial);
 		crypto_generichash_update(&hash_state, cap.card, strlen((const char *)cap.card) + 1);
 		crypto_generichash_update(&hash_state, input.name, strlen((const char *)input.name) + 1);
 		if (serial && *serial)
 			crypto_generichash_update(&hash_state, (const uint8_t *)serial, strlen(serial) + 1);
 		struct v4l2_fmtdesc fmtdesc = {0};
-		printf("-----\n");
+		if (DEBUG)
+			printf("%s -----\n", cap.card);
 		for (uint32_t fmt_idx = 0; ; fmt_idx++) {
 			fmtdesc.index = fmt_idx;
 			fmtdesc.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 			if (v4l2_ioctl(fd, VIDIOC_ENUM_FMT, &fmtdesc) == -1) break;
-			uint32_t fourcc[2] = {fmtdesc.pixelformat, 0};
-			printf("  - %s (%s)\n",fmtdesc.description, (const char *)fourcc);
+			if (DEBUG) {
+				const uint32_t fourcc[2] = {fmtdesc.pixelformat, 0};
+				printf("  - %s (%s)\n",fmtdesc.description, (const char *)fourcc);
+			}
 			struct v4l2_frmsizeenum frmsize = {0};
 			for (uint32_t frmsz_idx = 0; ; frmsz_idx++) {
 				frmsize.index = frmsz_idx;
@@ -856,7 +854,6 @@ static void cameras_from_device_with_fd(const char *dev_path, const char *serial
 		// select best format
 		PictureFormat best_format = {0};
 		uint32_t desired_format = V4L2_PIX_FMT_RGB24;
-		fprintf(fp, "%u\n", arr_len(camera->formats));
 		crypto_generichash_update(&hash_state, (const uint8_t *)(const uint32_t [1]){arr_len(camera->formats)}, 4);
 		arr_foreach_ptr(camera->formats, PictureFormat, fmt) {
 			// Now you might think do we really need this?
@@ -867,7 +864,6 @@ static void cameras_from_device_with_fd(const char *dev_path, const char *serial
 			// Oddly Windows doesn't show the infrared camera as an input device.
 			// I wonder if there is some way of detecting which one is the "normal" camera.
 			// Or perhaps Windows has its own special proprietary driver and we have no way of knowing.
-			fprintf(fp, "%u %u %u\n",fmt->pixfmt, fmt->width, fmt->height);
 			crypto_generichash_update(&hash_state, (const uint8_t *)&fmt->pixfmt, sizeof fmt->pixfmt);
 			crypto_generichash_update(&hash_state, (const uint8_t *)&fmt->width, sizeof fmt->width);
 			crypto_generichash_update(&hash_state, (const uint8_t *)&fmt->height, sizeof fmt->height);
@@ -879,7 +875,6 @@ static void cameras_from_device_with_fd(const char *dev_path, const char *serial
 				best_format = *fmt;
 			}
 		}
-		fclose(fp);
 		camera->best_format = best_format;
 		camera->name = a_sprintf(
 			"%s %s (up to %" PRIu32 "x%" PRIu32 ")", (const char *)cap.card, (const char *)input.name,

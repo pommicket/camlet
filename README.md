@@ -1,3 +1,14 @@
+# camlet
+
+Camlet is a picture-taking application for Linux.
+It features
+
+- Reasonably good performance
+- Proper handling of disconnecting/reconnecting devices, including the ability to prioritize some cameras over others
+- JPEG and PNG output
+- Full selection of resolutions available from camera
+- Remembers settings across program launches
+
 # Building from source
 
 camlet requires meson-build, a C compiler, and the development libraries
