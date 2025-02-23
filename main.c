@@ -558,7 +558,7 @@ static bool take_picture(State *state) {
 		return false;
 	struct tm *tm = localtime((time_t[1]){time(NULL)});
 	strftime(path + strlen(path), sizeof path - strlen(path), "/%Y-%m-%d-%H-%M-%S", tm);
-	const char *extension = state->mode == MODE_VIDEO ? "mkv" : image_format_extensions[state->image_format];
+	const char *extension = state->mode == MODE_VIDEO ? "mp4" : image_format_extensions[state->image_format];
 	snprintf(path + strlen(path), sizeof path - strlen(path), ".%s", extension);
 	bool success = false;
 	switch (state->mode) {
@@ -611,7 +611,6 @@ int main(void) {
 	if (TTF_Init() < 0) {
 		fatal_error("couldn't initialize SDL2_ttf: %s\n", TTF_GetError());
 	}
-	state->video = video_init();
 	{
 		const char *home = getenv("HOME");
 		if (home) {
@@ -661,12 +660,15 @@ int main(void) {
 	if (!window) {
 		fatal_error("couldn't create window: %s", SDL_GetError());
 	}
+	state->video = video_init();
+
 	static const struct {
 		int maj, min;
 	} gl_versions_to_try[] = {
 		{4, 3},
 		{3, 0}
 	};
+	
 	SDL_GLContext glctx = NULL;
 	for (size_t i = 0; !glctx && i < SDL_arraysize(gl_versions_to_try); i++) {
 		gl.version_major = gl_versions_to_try[i].maj;
