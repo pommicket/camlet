@@ -6,6 +6,7 @@
 #include <stddef.h>
 #include <string.h>
 #include <GL/glcorearb.h>
+struct AVFrame;
 
 typedef uint32_t PixelFormat;
 typedef struct Camera Camera;
@@ -127,6 +128,10 @@ bool camera_open(Camera *camera);
 Hash camera_hash(Camera *camera);
 void camera_hash_str(Camera *camera, char str[HASH_SIZE * 2 + 1]);
 bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod access, bool force);
+/// Copy current frame from camera to AVFrame.
+///
+/// Returns `true` on success. Currently only works if both the camera and the AVFrame are in the YUV420 format.
+bool camera_copy_to_av_frame(Camera *camera, struct AVFrame *frame);
 void camera_free(Camera *camera);
 
 #endif

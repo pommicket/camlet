@@ -88,6 +88,7 @@ typedef struct {
 	bool quit;
 	CameraMode mode;
 	bool recording_video;
+	double video_start_time;
 	AVFormatContext *avf_context;
 	AVCodecContext *video_encoder;
 	AVFrame *video_frame;
@@ -591,7 +592,6 @@ static bool write_frame(State *state, AVCodecContext *encoder, AVStream *stream,
 	return true;
 }
 
-
 static void stop_video(State *state) {
 	if (state->recording_video) {
 		state->recording_video = false;
@@ -651,11 +651,13 @@ static bool start_video(State *state, const char *filename) {
 		return false;
 	}
 	state->video_encoder->codec_id = fmt->video_codec;
-	// TODO: adjustable video framerate
-	state->video_encoder->bit_rate = (int64_t)5 * camera_frame_width(state->camera) * camera_frame_height(state->camera);
+	// TODO: adjustable video quality
+	const int64_t quality = 5;
+	state->video_encoder->bit_rate = quality * camera_frame_width(state->camera) * camera_frame_height(state->camera);
 	state->video_encoder->width = camera_frame_width(state->camera);
 	state->video_encoder->height = camera_frame_height(state->camera);
-	state->video_encoder->time_base = state->video_stream->time_base = (AVRational){1,30};// TODO: restrict application to 30FPS when recording video
+	// TODO: adjustable video framerate
+	state->video_encoder->time_base = state->video_stream->time_base = (AVRational){1,30};
 	state->video_encoder->gop_size = 12;
 	state->video_encoder->pix_fmt = AV_PIX_FMT_YUV420P;
 	if (state->avf_context->oformat->flags & AVFMT_GLOBALHEADER)
@@ -695,23 +697,7 @@ static bool start_video(State *state, const char *filename) {
 		return false;
 	}
 	state->recording_video = true;
-	// ----
-	for (int frame = 0; frame < 300; frame++) {
-	err = av_frame_make_writable(state->video_frame);
-	if (err < 0) {
-		fprintf(stderr, "error: av_frame_make_writable: %s\n", av_err2str(err));
-		return false;
-	}
-	for (int y = 0; y < state->video_frame->height; y++) {
-		for (int x = 0; x < state->video_frame->width; x++) {
-			state->video_frame->data[0][y * state->video_frame->linesize[0] + x] = (uint8_t)(x + y+frame);
-			state->video_frame->data[1][(y/2) * state->video_frame->linesize[1] + x/2] = (uint8_t)(x * y);
-			state->video_frame->data[2][(y/2) * state->video_frame->linesize[2] + x/2] = (uint8_t)(x - y);
-		}
-	}
-	state->video_frame->pts = state->video_pts++;
-	write_frame(state, state->video_encoder, state->video_stream, state->video_frame);
-	}
+	state->video_start_time = get_time_double();
 	return true;
 }
 
@@ -1001,10 +987,10 @@ void main() {\n\
 	o_color = vec4(mix(color, vec3(1.0), u_flash), opacity);\n\
 }\n\
 ";
-	char err[256] = {0};
-	GLuint program = gl_compile_and_link_shaders(err, vshader_code, fshader_code);
-	if (*err) {
-		fatal_error("Couldn't compile shader: %s", err);
+	static char shader_err[256] = {0};
+	GLuint program = gl_compile_and_link_shaders(shader_err, vshader_code, fshader_code);
+	if (*shader_err) {
+		fatal_error("Couldn't compile shader: %s", shader_err);
 	}
 	if (program == 0) {
 		fatal_error("Couldn't compile shader (no error log available)");
@@ -1150,6 +1136,7 @@ void main() {\n\
 				}
 				break;
 			case SDLK_TAB:
+				if (state->recording_video) break;
 				state->mode = (state->mode + 1) % MODE_COUNT;
 				switch (state->mode) {
 				case MODE_PICTURE:
@@ -1416,7 +1403,9 @@ void main() {\n\
 				const char *text[] = {
 					"F1 - open this help screen",
 					"F2 - show debug info",
-					"Space - take a picture",
+					state->mode == MODE_VIDEO
+						? "Space - start/stop recording"
+						: "Space - take a picture",
 					"Escape - open/close settings",
 					"Ctrl+f - open picture directory",
 					"Tab - switch between picture and video",
@@ -1492,6 +1481,23 @@ void main() {\n\
 				smoothed_camera_time = smoothed_camera_time * 0.9 + (curr_time - last_camera_time) * 0.1;
 				last_camera_time = curr_time;
 				n_active_textures = camera_update_gl_textures(state->camera, camera_textures);
+			}
+			if (state->recording_video) {
+				int64_t next_pts = state->video_pts;
+				int64_t curr_pts = (int64_t)((curr_time - state->video_start_time)
+					* state->video_encoder->time_base.den
+					/ state->video_encoder->time_base.num);
+				if (curr_pts >= next_pts) {
+					int err = av_frame_make_writable(state->video_frame);
+					if (err < 0) {
+						fprintf(stderr, "error: av_frame_make_writable: %s\n", av_err2str(err));
+						return EXIT_FAILURE;
+					}
+					state->video_frame->pts = curr_pts;
+					camera_copy_to_av_frame(state->camera, state->video_frame);
+					write_frame(state, state->video_encoder, state->video_stream, state->video_frame);
+					state->video_pts = curr_pts + 1;
+				}
 			}
 			gl.Uniform1i(u_pixel_format, last_frame_pixfmt);
 			gl.ActiveTexture(GL_TEXTURE0);
@@ -1586,7 +1592,7 @@ void main() {\n\
 				SDL_FreeSurface(surf);
 			}
 			gl.Uniform2f(u_scale, gl_width, gl_height);
-			gl.Uniform2f(u_offset, 1 - gl_width, 1 - gl_height);
+			gl.Uniform2f(u_offset, 0.99f - gl_width, 1 - gl_height);
 			gl.Uniform1i(u_sampler, 0);
 			gl.Uniform1f(u_opacity, 1);
 			gl.Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGBA32);
@@ -1650,6 +1656,7 @@ void main() {\n\
 		SDL_GL_SwapWindow(window);
 	}
 	quit:
+	stop_video(state);
 	udev_monitor_unref(udev_monitor);
 	udev_unref(udev);
 	arr_foreach_ptr(state->cameras, Camera *, pcamera) {

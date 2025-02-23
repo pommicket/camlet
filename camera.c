@@ -10,6 +10,7 @@
 #include "ds.h"
 #include "3rd_party/stb_image_write.h"
 #include <jpeglib.h>
+#include <libavcodec/avcodec.h>
 
 #define CAMERA_MAX_BUFFERS 4
 struct Camera {
@@ -924,4 +925,37 @@ void camera_hash_str(Camera *camera, char str[HASH_SIZE * 2 + 1]) {
 
 const char *camera_devnode(Camera *camera) {
 	return camera->devnode;
+}
+
+bool camera_copy_to_av_frame(Camera *camera, struct AVFrame *frame_out) {
+	uint8_t *frame_in = camera_curr_frame(camera);
+	int32_t frame_width = camera_frame_width(camera);
+	int32_t frame_height = camera_frame_height(camera);
+	if (!frame_in
+		|| frame_width != frame_out->width
+		|| frame_height != frame_out->height
+		|| camera_pixel_format(camera) != V4L2_PIX_FMT_YUV420
+		|| frame_out->format != AV_PIX_FMT_YUV420P) {
+		return false;
+	}
+	// copy Y plane
+	for (int64_t y = 0; y < frame_height; y++) {
+		memcpy(&frame_out->data[0][y * frame_out->linesize[0]],
+			&frame_in[y * frame_width], frame_width);
+	}
+	// copy Cb plane
+	int64_t cb_offset = (int64_t)frame_width * frame_height;
+	for (int64_t y = 0; y < frame_height / 2; y++) {
+		memcpy(&frame_out->data[1][y * frame_out->linesize[1]],
+			&frame_in[cb_offset + y * (frame_width / 2)],
+			frame_width / 2);
+	}
+	// copy Cr plane
+	int64_t cr_offset = cb_offset + (int64_t)frame_width / 2 * frame_height / 2;
+	for (int64_t y = 0; y < frame_height / 2; y++) {
+		memcpy(&frame_out->data[2][y * frame_out->linesize[2]],
+			&frame_in[cr_offset + y * (frame_width / 2)],
+			frame_width / 2);
+	}
+	return true;
 }
