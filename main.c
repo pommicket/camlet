@@ -21,10 +21,9 @@ TODO
 #include <unistd.h>
 #include <dirent.h>
 #include <pwd.h>
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
-#include "ds.h"
+#include "util.h"
 #include "camera.h"
+#include "video.h"
 
 // pixel format used for convenience
 #define PIX_FMT_XXXGRAY 0x47585858
@@ -87,14 +86,7 @@ typedef struct {
 	bool menu_needs_rerendering;
 	bool quit;
 	CameraMode mode;
-	bool recording_video;
-	double video_start_time;
-	AVFormatContext *avf_context;
-	AVCodecContext *video_encoder;
-	AVFrame *video_frame;
-	AVPacket *av_packet;
-	AVStream *video_stream;
-	int64_t video_pts;
+	VideoContext *video;
 	int timer;
 	double timer_activate_time;
 	double flash_time;
@@ -251,12 +243,6 @@ static SDL_Rect render_text_to_surface_anchored(TTF_Font *font, SDL_Surface *des
 
 static SDL_Rect render_text_to_surface(TTF_Font *font, SDL_Surface *dest, int x, int y, SDL_Color color, const char *str) {
 	return render_text_to_surface_anchored(font, dest, x, y, color, str, -1, -1);
-}
-
-static double get_time_double(void) {
-	struct timespec ts = {0};
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
 
 static void move_to_highest_precedence(State *state, Camera *camera) {
@@ -566,141 +552,6 @@ static bool get_expanded_output_dir(State *state, char path[PATH_MAX]) {
 	return mkdir_with_parents(path);
 }
 
-static bool write_frame(State *state, AVCodecContext *encoder, AVStream *stream, AVFrame *frame) {
-	int err = avcodec_send_frame(encoder, frame);
-	if (err < 0) {
-		fprintf(stderr, "error: avcodec_send_frame: %s\n", av_err2str(err));
-		return false;
-	}
-	while (true) {
-		err = avcodec_receive_packet(encoder, state->av_packet);
-		if (err == AVERROR(EAGAIN) || err == AVERROR_EOF) {
-			break;
-		}
-		if (err < 0) {
-			fprintf(stderr, "error: avcodec_receive_packet: %s\n", av_err2str(err));
-			return false;
-		}
-		state->av_packet->stream_index = stream->index;
-		av_packet_rescale_ts(state->av_packet, encoder->time_base, stream->time_base);
-		err = av_interleaved_write_frame(state->avf_context, state->av_packet);
-		if (err < 0) {
-			fprintf(stderr, "error: av_interleaved_write_frame: %s\n", av_err2str(err));
-			return false;
-		}
-	}
-	return true;
-}
-
-static void stop_video(State *state) {
-	if (state->recording_video) {
-		state->recording_video = false;
-		// flush video encoder
-		write_frame(state, state->video_encoder, state->video_stream, NULL);
-		int err = av_write_trailer(state->avf_context);
-		if (err < 0) {
-			fprintf(stderr, "error: av_write_trailer: %s\n", av_err2str(err));
-		}
-		avio_closep(&state->avf_context->pb);
-	}
-	if (state->video_encoder) {
-		avcodec_free_context(&state->video_encoder);
-	}
-	if (state->video_frame) {
-		av_frame_free(&state->video_frame);
-	}
-	if (state->avf_context) {
-		if (state->avf_context->pb) {
-			avio_closep(&state->avf_context->pb);
-		}
-		avformat_free_context(state->avf_context);
-		state->avf_context = NULL;
-	}
-	if (state->av_packet) {
-		av_packet_free(&state->av_packet);
-	}
-}
-
-static bool start_video(State *state, const char *filename) {
-	if (!state->camera) return false;
-	if (state->recording_video) {
-		return true;
-	}
-	stop_video(state);
-	int err = avformat_alloc_output_context2(&state->avf_context, NULL, NULL, filename);
-	if (!state->avf_context) {
-		fprintf(stderr, "error: avformat_alloc_output_context2: %s\n", av_err2str(err));
-		return false;
-	}
-	const AVOutputFormat *fmt = state->avf_context->oformat;
-	const AVCodec *video_codec = avcodec_find_encoder(fmt->video_codec);
-	if (!video_codec) {
-		fprintf(stderr, "couldn't find encoder for codec %s\n", avcodec_get_name(fmt->video_codec));
-		return false;
-	}
-	state->video_stream = avformat_new_stream(state->avf_context, NULL);
-	state->video_stream->id = 0;
-	state->video_encoder = avcodec_alloc_context3(video_codec);
-	if (!state->video_encoder) {
-		fprintf(stderr, "couldn't create video encoding context\n");
-		return false;
-	}
-	state->av_packet = av_packet_alloc();
-	if (!state->av_packet) {
-		fprintf(stderr, "couldn't allocate video packet\n");
-		return false;
-	}
-	state->video_encoder->codec_id = fmt->video_codec;
-	// TODO: adjustable video quality
-	const int64_t quality = 5;
-	state->video_encoder->bit_rate = quality * camera_frame_width(state->camera) * camera_frame_height(state->camera);
-	state->video_encoder->width = camera_frame_width(state->camera);
-	state->video_encoder->height = camera_frame_height(state->camera);
-	// TODO: adjustable video framerate
-	state->video_encoder->time_base = state->video_stream->time_base = (AVRational){1,30};
-	state->video_encoder->gop_size = 12;
-	state->video_encoder->pix_fmt = AV_PIX_FMT_YUV420P;
-	if (state->avf_context->oformat->flags & AVFMT_GLOBALHEADER)
-		state->video_encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-	err = avcodec_open2(state->video_encoder, video_codec, NULL);
-	if (err < 0) {
-		fprintf(stderr, "error: avcodec_open2: %s\n", av_err2str(err));
-		return false;
-	}
-	err = avcodec_parameters_from_context(state->video_stream->codecpar, state->video_encoder);
-	if (err < 0) {
-		fprintf(stderr, "error: avcodec_parameters_from_context: %s\n", av_err2str(err));
-		return false;
-	}
-	state->video_frame = av_frame_alloc();
-	if (!state->video_frame) {
-		fprintf(stderr, "couldn't allocate video frame\n");
-		return false;
-	}
-	state->video_frame->format = AV_PIX_FMT_YUV420P;
-	state->video_frame->width = state->video_encoder->width;
-	state->video_frame->height = state->video_encoder->height;
-	err = av_frame_get_buffer(state->video_frame, 0);
-	if (err < 0) {
-		fprintf(stderr, "error: av_frame_get_buffer: %s\n", av_err2str(err));
-		return false;
-	}
-	// av_dump_format(state->avf_context, 0, filename, 1);
-	err = avio_open(&state->avf_context->pb, filename, AVIO_FLAG_WRITE);
-	if (err < 0) {
-		fprintf(stderr, "error: avio_open: %s\n", av_err2str(err));
-		return false;
-	}
-	err = avformat_write_header(state->avf_context, NULL);
-	if (err < 0) {
-		fprintf(stderr, "error: avformat_write_header: %s\n", av_err2str(err));
-		return false;
-	}
-	state->recording_video = true;
-	state->video_start_time = get_time_double();
-	return true;
-}
-
 static bool take_picture(State *state) {
 	static char path[PATH_MAX];
 	if (!get_expanded_output_dir(state, path))
@@ -728,7 +579,12 @@ static bool take_picture(State *state) {
 		}
 		break;
 	case MODE_VIDEO:
-		success = start_video(state, path);
+		if (state->camera) {
+			// TODO: adjustable video quality and framerate
+			success = video_start(state->video, path,
+				camera_frame_width(state->camera), camera_frame_height(state->camera),
+				30, 5);
+		}
 		break;
 	case MODE_COUNT:
 		assert(false);
@@ -755,6 +611,7 @@ int main(void) {
 	if (TTF_Init() < 0) {
 		fatal_error("couldn't initialize SDL2_ttf: %s\n", TTF_GetError());
 	}
+	state->video = video_init();
 	{
 		const char *home = getenv("HOME");
 		if (home) {
@@ -1093,7 +950,7 @@ void main() {\n\
 			if (strcmp(action, "remove") == 0) {
 				if (state->camera && strcmp(devnode, camera_devnode(state->camera)) == 0) {
 					// our special camera got disconnected ):
-					stop_video(state);
+					video_stop(state->video);
 					state->camera = NULL;
 				}
 				for (size_t i = 0; i < arr_len(state->cameras); ) {
@@ -1109,7 +966,7 @@ void main() {\n\
 			}
 			udev_device_unref(dev);
 		}
-		if (!state->camera || (any_new_cameras && !state->recording_video))
+		if (!state->camera || (any_new_cameras && !video_is_recording(state->video)))
 			select_camera(state);
 		SDL_Event event = {0};
 		while (SDL_PollEvent(&event)) {
@@ -1136,7 +993,7 @@ void main() {\n\
 				}
 				break;
 			case SDLK_TAB:
-				if (state->recording_video) break;
+				if (video_is_recording(state->video)) break;
 				state->mode = (state->mode + 1) % MODE_COUNT;
 				switch (state->mode) {
 				case MODE_PICTURE:
@@ -1157,8 +1014,8 @@ void main() {\n\
 				break;
 			case SDLK_SPACE:
 				if (!state->camera || state->curr_menu != 0) break;
-				if (state->recording_video) {
-					stop_video(state);
+				if (video_is_recording(state->video)) {
+					video_stop(state->video);
 				} else {
 					if (state->timer == 0) {
 						take_picture(state);
@@ -1180,7 +1037,7 @@ void main() {\n\
 			case SDLK_ESCAPE:
 				if (state->curr_menu == MENU_MAIN || state->curr_menu == MENU_HELP) {
 					state->curr_menu = MENU_NONE;
-				} else if (state->recording_video) {
+				} else if (video_is_recording(state->video)) {
 					// don't allow opening menu while recording video
 				} else {
 					state->curr_menu = MENU_MAIN;
@@ -1481,22 +1338,8 @@ void main() {\n\
 				smoothed_camera_time = smoothed_camera_time * 0.9 + (curr_time - last_camera_time) * 0.1;
 				last_camera_time = curr_time;
 				n_active_textures = camera_update_gl_textures(state->camera, camera_textures);
-			}
-			if (state->recording_video) {
-				int64_t next_pts = state->video_pts;
-				int64_t curr_pts = (int64_t)((curr_time - state->video_start_time)
-					* state->video_encoder->time_base.den
-					/ state->video_encoder->time_base.num);
-				if (curr_pts >= next_pts) {
-					int err = av_frame_make_writable(state->video_frame);
-					if (err < 0) {
-						fprintf(stderr, "error: av_frame_make_writable: %s\n", av_err2str(err));
-						return EXIT_FAILURE;
-					}
-					state->video_frame->pts = curr_pts;
-					camera_copy_to_av_frame(state->camera, state->video_frame);
-					write_frame(state, state->video_encoder, state->video_stream, state->video_frame);
-					state->video_pts = curr_pts + 1;
+				if (video_is_recording(state->video)) {
+					video_submit_frame(state->video, state->camera);
 				}
 			}
 			gl.Uniform1i(u_pixel_format, last_frame_pixfmt);
@@ -1570,7 +1413,7 @@ void main() {\n\
 		static char mode_text[32];
 		if (window_size_changed) *mode_text = 0;
 		if (state->mode == MODE_VIDEO) {
-			const char *new_text = state->recording_video ? "REC" : "VIDEO";
+			const char *new_text = video_is_recording(state->video) ? "REC" : "VIDEO";
 			static float gl_width, gl_height;
 			gl.Enable(GL_BLEND);
 			gl.ActiveTexture(GL_TEXTURE0);
@@ -1656,7 +1499,7 @@ void main() {\n\
 		SDL_GL_SwapWindow(window);
 	}
 	quit:
-	stop_video(state);
+	video_quit(state->video);
 	udev_monitor_unref(udev_monitor);
 	udev_unref(udev);
 	arr_foreach_ptr(state->cameras, Camera *, pcamera) {

@@ -1,4 +1,5 @@
 #include "camera.h"
+#include <stdatomic.h>
 #include <linux/videodev2.h>
 #include <sodium.h>
 #include <libv4l2.h>
@@ -7,10 +8,10 @@
 #include <fcntl.h>
 #include <time.h>
 #include <tgmath.h>
-#include "ds.h"
 #include "3rd_party/stb_image_write.h"
 #include <jpeglib.h>
 #include <libavcodec/avcodec.h>
+#include "util.h"
 
 #define CAMERA_MAX_BUFFERS 4
 struct Camera {
@@ -936,6 +937,10 @@ bool camera_copy_to_av_frame(Camera *camera, struct AVFrame *frame_out) {
 		|| frame_height != frame_out->height
 		|| camera_pixel_format(camera) != V4L2_PIX_FMT_YUV420
 		|| frame_out->format != AV_PIX_FMT_YUV420P) {
+		static atomic_flag warned = ATOMIC_FLAG_INIT;
+		if (!atomic_flag_test_and_set_explicit(&warned, memory_order_relaxed)) {
+			fprintf(stderr, "%s: Bad picture format.", __func__);
+		}
 		return false;
 	}
 	// copy Y plane
