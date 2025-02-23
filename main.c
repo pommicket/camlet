@@ -20,6 +20,8 @@ TODO
 #include <unistd.h>
 #include <dirent.h>
 #include <pwd.h>
+#include <libavcodec/avcodec.h>
+#include <libavformat/avformat.h>
 #include "ds.h"
 #include "camera.h"
 
@@ -76,6 +78,13 @@ typedef struct {
 	bool show_debug;
 	bool menu_needs_rerendering;
 	bool quit;
+	bool recording_video;
+	AVFormatContext *avf_context;
+	AVCodecContext *video_encoder;
+	AVFrame *video_frame;
+	AVPacket *av_packet;
+	AVStream *video_stream;
+	int64_t video_pts;
 	int timer;
 	double timer_activate_time;
 	double flash_time;
@@ -573,9 +582,160 @@ static bool take_picture(State *state) {
 	return success;
 }
 
+static bool write_frame(State *state, AVCodecContext *encoder, AVStream *stream, AVFrame *frame) {
+	int err = avcodec_send_frame(encoder, frame);
+	if (err < 0) {
+		fprintf(stderr, "error: avcodec_send_frame: %s\n", av_err2str(err));
+		return false;
+	}
+	while (true) {
+		err = avcodec_receive_packet(encoder, state->av_packet);
+		if (err == AVERROR(EAGAIN) || err == AVERROR_EOF) {
+			break;
+		}
+		if (err < 0) {
+			fprintf(stderr, "error: avcodec_receive_packet: %s\n", av_err2str(err));
+			return false;
+		}
+		state->av_packet->stream_index = stream->index;
+		av_packet_rescale_ts(state->av_packet, encoder->time_base, stream->time_base);
+		err = av_interleaved_write_frame(state->avf_context, state->av_packet);
+		if (err < 0) {
+			fprintf(stderr, "error: av_interleaved_write_frame: %s\n", av_err2str(err));
+			return false;
+		}
+	}
+	return true;
+}
+
+static void stop_video(State *state) {
+	if (state->recording_video) {
+		// flush video encoder
+		write_frame(state, state->video_encoder, state->video_stream, NULL);
+		int err = av_write_trailer(state->avf_context);
+		if (err < 0) {
+			fprintf(stderr, "error: av_write_trailer: %s\n", av_err2str(err));
+			return;
+		}
+		avio_closep(&state->avf_context->pb);
+	}
+	if (state->video_encoder) {
+		avcodec_free_context(&state->video_encoder);
+	}
+	if (state->video_frame) {
+		av_frame_free(&state->video_frame);
+	}
+	if (state->avf_context) {
+		if (state->avf_context->pb) {
+			avio_closep(&state->avf_context->pb);
+		}
+		avformat_free_context(state->avf_context);
+		state->avf_context = NULL;
+	}
+	if (state->av_packet) {
+		av_packet_free(&state->av_packet);
+	}
+}
+
+static bool start_video(State *state, const char *filename) {
+	//if (!state->camera) return false;
+	if (state->recording_video) {
+		return true;
+	}
+	stop_video(state);
+	int err = avformat_alloc_output_context2(&state->avf_context, NULL, NULL, filename);
+	if (!state->avf_context) {
+		fprintf(stderr, "error: avformat_alloc_output_context2: %s\n", av_err2str(err));
+		return false;
+	}
+	const AVOutputFormat *fmt = state->avf_context->oformat;
+	const AVCodec *video_codec = avcodec_find_encoder(fmt->video_codec);
+	if (!video_codec) {
+		fprintf(stderr, "couldn't find encoder for codec %s\n", avcodec_get_name(fmt->video_codec));
+		return false;
+	}
+	state->video_stream = avformat_new_stream(state->avf_context, NULL);
+	state->video_stream->id = 0;
+	state->video_encoder = avcodec_alloc_context3(video_codec);
+	if (!state->video_encoder) {
+		fprintf(stderr, "couldn't create video encoding context\n");
+		return false;
+	}
+	state->av_packet = av_packet_alloc();
+	if (!state->av_packet) {
+		fprintf(stderr, "couldn't allocate video packet\n");
+		return false;
+	}
+	state->video_encoder->codec_id = fmt->video_codec;
+	state->video_encoder->bit_rate = 400000;
+	state->video_encoder->width = 360;//camera_frame_width(state->camera);
+	state->video_encoder->height = 240;//camera_frame_height(state->camera);
+	state->video_encoder->time_base = state->video_stream->time_base = (AVRational){1,30};// TODO: restrict application to 30FPS when recording video
+	state->video_encoder->gop_size = 12;
+	state->video_encoder->pix_fmt = AV_PIX_FMT_YUV420P;
+	if (state->avf_context->oformat->flags & AVFMT_GLOBALHEADER)
+		state->video_encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+	err = avcodec_open2(state->video_encoder, video_codec, NULL);
+	if (err < 0) {
+		fprintf(stderr, "error: avcodec_open2: %s\n", av_err2str(err));
+		return false;
+	}
+	err = avcodec_parameters_from_context(state->video_stream->codecpar, state->video_encoder);
+	if (err < 0) {
+		fprintf(stderr, "error: avcodec_parameters_from_context: %s\n", av_err2str(err));
+		return false;
+	}
+	state->video_frame = av_frame_alloc();
+	if (!state->video_frame) {
+		fprintf(stderr, "couldn't allocate video frame\n");
+		return false;
+	}
+	state->video_frame->format = AV_PIX_FMT_YUV420P;
+	state->video_frame->width = state->video_encoder->width;
+	state->video_frame->height = state->video_encoder->height;
+	err = av_frame_get_buffer(state->video_frame, 0);
+	if (err < 0) {
+		fprintf(stderr, "error: av_frame_get_buffer: %s\n", av_err2str(err));
+		return false;
+	}
+	// av_dump_format(state->avf_context, 0, filename, 1);
+	err = avio_open(&state->avf_context->pb, filename, AVIO_FLAG_WRITE);
+	if (err < 0) {
+		fprintf(stderr, "error: avio_open: %s\n", av_err2str(err));
+		return false;
+	}
+	err = avformat_write_header(state->avf_context, NULL);
+	if (err < 0) {
+		fprintf(stderr, "error: avformat_write_header: %s\n", av_err2str(err));
+		return false;
+	}
+	state->recording_video = true;
+	// ----
+	for (int frame = 0; frame < 300; frame++) {
+	err = av_frame_make_writable(state->video_frame);
+	if (err < 0) {
+		fprintf(stderr, "error: av_frame_make_writable: %s\n", av_err2str(err));
+		return false;
+	}
+	for (int y = 0; y < state->video_frame->height; y++) {
+		for (int x = 0; x < state->video_frame->width; x++) {
+			state->video_frame->data[0][y * state->video_frame->linesize[0] + x] = (uint8_t)(x + y+frame);
+			state->video_frame->data[1][(y/2) * state->video_frame->linesize[1] + x/2] = (uint8_t)(x * y);
+			state->video_frame->data[2][(y/2) * state->video_frame->linesize[2] + x/2] = (uint8_t)(x - y);
+		}
+	}
+	state->video_frame->pts = state->video_pts++;
+	write_frame(state, state->video_encoder, state->video_stream, state->video_frame);
+	}
+	return true;
+}
+
 int main(void) {
 	static State state_data;
 	State *state = &state_data;
+	start_video(state, "out.mkv");
+	stop_video(state);
+	return 0;
 	SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1"); // if this program is sent a SIGTERM/SIGINT, don't turn it into a quit event
 	if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
 		fprintf(stderr, "couldn't initialize SDL\n");
