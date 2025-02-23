@@ -11,20 +11,68 @@
 #include "camera.h"
 
 struct VideoContext {
-	bool recording;
 	double start_time;
-	double last_frame_time;
 	AVFormatContext *avf_context;
 	AVCodecContext *video_encoder;
 	AVFrame *video_frame;
 	AVPacket *av_packet;
 	AVStream *video_stream;
 	int64_t next_video_pts;
-	pa_simple *pulseaudio;
+	SDL_Thread *audio_thread;
+	bool recording;
+	char _unused0[128]; // reduce false sharing
+	SDL_mutex *audio_mutex;
+	SDL_AudioStream *audio_stream;
+	bool audio_quit;
+	char _unused1[128]; // reduce false sharing
 };
+
+static int audio_thread(void *data) {
+	VideoContext *ctx = data;
+	if (!ctx->audio_mutex) return -1;
+	pa_sample_spec audio_format = {
+		.format = PA_SAMPLE_S16LE,
+		.rate = 44100,
+		.channels = 2,
+	};
+	int err = 0;
+	pa_simple *pulseaudio = pa_simple_new(NULL, "camlet", PA_STREAM_RECORD, NULL,
+		"microphone", &audio_format, NULL, NULL, &err);
+	if (!pulseaudio) {
+		fprintf(stderr, "%s", pa_strerror(err));
+	}
+	bool warned = false;
+	bool quit = false;
+	while (!quit) {
+		char buf[2048];
+		if (pa_simple_read(pulseaudio, buf, sizeof buf, &err) < 0) {
+			if (!warned) {
+				fprintf(stderr, "pa_simple_read: %s", pa_strerror(err));
+				warned = true;
+			}
+			SDL_LockMutex(ctx->audio_mutex);
+			quit = ctx->audio_quit;
+			SDL_UnlockMutex(ctx->audio_mutex);
+		} else {
+			SDL_LockMutex(ctx->audio_mutex);
+			quit = ctx->audio_quit;
+			if (!quit && ctx->audio_stream)
+				SDL_AudioStreamPut(ctx->audio_stream, buf, sizeof buf);
+			SDL_UnlockMutex(ctx->audio_mutex);
+		}
+	}
+	pa_simple_free(pulseaudio);
+	return 0;
+}
+
 
 VideoContext *video_init(void) {
 	VideoContext *ctx = calloc(1, sizeof(VideoContext));
+	if (!ctx) return NULL;
+	ctx->audio_mutex = SDL_CreateMutex();
+	if (ctx->audio_mutex) {
+		ctx->audio_thread = SDL_CreateThread(audio_thread, "camlet audio thread", ctx);
+	}
 	return ctx;
 }
 
@@ -100,23 +148,15 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 		fprintf(stderr, "error: avformat_write_header: %s\n", av_err2str(err));
 		return false;
 	}
-	pa_sample_spec audio_format = {
-		.format = PA_SAMPLE_S16NE,
-		.channels = 2,
-		.rate = 44100
-	};
-	// NOTE: SDL2 audio capture is currently broken
-	//  https://github.com/libsdl-org/SDL/issues/9706
-	// once SDL3 becomes commonplace enough, we can switch to that for capturing audio.
-	ctx->pulseaudio = pa_simple_new(NULL, "camlet", PA_STREAM_RECORD, NULL,
-		"microphone", &audio_format, NULL, NULL, &err);
-	if (!ctx->pulseaudio) {
-		fprintf(stderr, "%s", pa_strerror(err));
+	if (ctx->audio_mutex) {
+		SDL_LockMutex(ctx->audio_mutex);
+		// we're just using this audio stream as a queue really.
+		ctx->audio_stream = SDL_NewAudioStream(AUDIO_S16, 2, 44100, AUDIO_S16, 2, 44100);
+		SDL_UnlockMutex(ctx->audio_mutex);
 	}
-	pa_simple_read(ctx->pulseaudio, (char[1]){0}, 1, &err);
 	ctx->recording = true;
 	ctx->next_video_pts = 0;
-	ctx->start_time = ctx->last_frame_time = get_time_double();
+	ctx->start_time = get_time_double();
 	return true;
 }
 
@@ -151,29 +191,20 @@ bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 	if (!ctx || !camera || !ctx->recording) return false;
 	double curr_time = get_time_double();
 	double time_since_start = curr_time - ctx->start_time;
-	double time_since_last_frame = curr_time - ctx->last_frame_time;
-	ctx->last_frame_time = curr_time;
 	int64_t video_pts = (int64_t)(time_since_start
 		* ctx->video_encoder->time_base.den
 		/ ctx->video_encoder->time_base.num);
-	size_t audio_size = ctx->pulseaudio
-		? (size_t)(time_since_last_frame * 44100 * 2 * sizeof(int16_t))
-		: 0;
-	int err;
-	while (audio_size > 0 && audio_size < SIZE_MAX / 2 /* just in case time goes backwards somehow */) {
-		uint8_t buf[4096];
-		size_t n = audio_size > sizeof buf ? sizeof buf : audio_size;
-		if (pa_simple_read(ctx->pulseaudio, buf, n, &err) < 0) {
-			static atomic_flag warned = ATOMIC_FLAG_INIT;
-			if (!atomic_flag_test_and_set_explicit(&warned, memory_order_relaxed)) {
-				fprintf(stderr, "error: pa_simple_read: %s\n", pa_strerror(err));
-			}
-			break;
+	if (ctx->audio_mutex) {
+		SDL_LockMutex(ctx->audio_mutex);
+		char buf[4096];
+		int n;
+		while ((n = SDL_AudioStreamGet(ctx->audio_stream, buf, sizeof buf))) {
+			printf("%d\n",n);
 		}
-		audio_size -= n;
+		SDL_UnlockMutex(ctx->audio_mutex);
 	}
 	if (video_pts >= ctx->next_video_pts) {
-		err = av_frame_make_writable(ctx->video_frame);
+		int err = av_frame_make_writable(ctx->video_frame);
 		if (err < 0) {
 			fprintf(stderr, "error: av_frame_make_writable: %s\n", av_err2str(err));
 			return false;
@@ -194,9 +225,11 @@ bool video_is_recording(VideoContext *ctx) {
 void video_stop(VideoContext *ctx) {
 	if (!ctx) return;
 	if (ctx->recording) {
-		if (ctx->pulseaudio) {
-			pa_simple_free(ctx->pulseaudio);
-			ctx->pulseaudio = NULL;
+		if (ctx->audio_mutex) {
+			SDL_LockMutex(ctx->audio_mutex);
+			SDL_FreeAudioStream(ctx->audio_stream);
+			ctx->audio_stream = NULL;
+			SDL_UnlockMutex(ctx->audio_mutex);
 		}
 		ctx->recording = false;
 		// flush video encoder
@@ -228,5 +261,15 @@ void video_stop(VideoContext *ctx) {
 void video_quit(VideoContext *ctx) {
 	if (!ctx) return;
 	video_stop(ctx);
+	if (ctx->audio_thread) {
+		SDL_LockMutex(ctx->audio_mutex);
+		ctx->audio_quit = true;
+		SDL_UnlockMutex(ctx->audio_mutex);
+		SDL_WaitThread(ctx->audio_thread, NULL);
+	}
+	if (ctx->audio_stream)
+		SDL_FreeAudioStream(ctx->audio_stream);
+	if (ctx->audio_mutex)
+		SDL_DestroyMutex(ctx->audio_mutex);
 	free(ctx);
 }
