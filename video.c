@@ -14,15 +14,19 @@ struct VideoContext {
 	double start_time;
 	AVFormatContext *avf_context;
 	AVCodecContext *video_encoder;
+	AVCodecContext *audio_encoder;
 	AVFrame *video_frame;
+	AVFrame *audio_frame;
+	int audio_frame_samples;
 	AVPacket *av_packet;
 	AVStream *video_stream;
+	AVStream *audio_stream;
 	int64_t next_video_pts;
 	SDL_Thread *audio_thread;
 	bool recording;
 	char _unused0[128]; // reduce false sharing
 	SDL_mutex *audio_mutex;
-	SDL_AudioStream *audio_stream;
+	SDL_AudioStream *audio_queue;
 	bool audio_quit;
 	char _unused1[128]; // reduce false sharing
 };
@@ -31,7 +35,7 @@ static int audio_thread(void *data) {
 	VideoContext *ctx = data;
 	if (!ctx->audio_mutex) return -1;
 	pa_sample_spec audio_format = {
-		.format = PA_SAMPLE_S16LE,
+		.format = PA_SAMPLE_FLOAT32NE,
 		.rate = 44100,
 		.channels = 2,
 	};
@@ -39,25 +43,26 @@ static int audio_thread(void *data) {
 	pa_simple *pulseaudio = pa_simple_new(NULL, "camlet", PA_STREAM_RECORD, NULL,
 		"microphone", &audio_format, NULL, NULL, &err);
 	if (!pulseaudio) {
-		fprintf(stderr, "%s", pa_strerror(err));
+		fprintf(stderr, "couldn't connect to pulseaudio: %s", pa_strerror(err));
+		return -1;
 	}
 	bool warned = false;
 	bool quit = false;
 	while (!quit) {
-		char buf[2048];
-		if (pa_simple_read(pulseaudio, buf, sizeof buf, &err) < 0) {
+		char buf[4096];
+		if (pa_simple_read(pulseaudio, buf, sizeof buf, &err) >= 0) {
+			SDL_LockMutex(ctx->audio_mutex);
+			quit = ctx->audio_quit;
+			if (!quit && ctx->audio_queue)
+				SDL_AudioStreamPut(ctx->audio_queue, buf, sizeof buf);
+			SDL_UnlockMutex(ctx->audio_mutex);
+		} else {
 			if (!warned) {
 				fprintf(stderr, "pa_simple_read: %s", pa_strerror(err));
 				warned = true;
 			}
 			SDL_LockMutex(ctx->audio_mutex);
 			quit = ctx->audio_quit;
-			SDL_UnlockMutex(ctx->audio_mutex);
-		} else {
-			SDL_LockMutex(ctx->audio_mutex);
-			quit = ctx->audio_quit;
-			if (!quit && ctx->audio_stream)
-				SDL_AudioStreamPut(ctx->audio_stream, buf, sizeof buf);
 			SDL_UnlockMutex(ctx->audio_mutex);
 		}
 	}
@@ -82,6 +87,7 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 		return true;
 	}
 	video_stop(ctx);
+	// TODO: nail down codecs as H264 and AAC
 	int err = avformat_alloc_output_context2(&ctx->avf_context, NULL, NULL, filename);
 	if (!ctx->avf_context) {
 		fprintf(stderr, "error: avformat_alloc_output_context2: %s\n", av_err2str(err));
@@ -143,6 +149,61 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 		fprintf(stderr, "error: avio_open: %s\n", av_err2str(err));
 		return false;
 	}
+	const AVCodec *audio_codec = avcodec_find_encoder(fmt->audio_codec);
+	if (!audio_codec) {
+		fprintf(stderr, "error: avcodec_find_encoder: %s\n", av_err2str(err));
+		goto no_audio;
+	}
+	ctx->audio_encoder = avcodec_alloc_context3(audio_codec);
+	if (!ctx->audio_encoder) {
+		fprintf(stderr, "error: avcodec_alloc_context3: %s\n", av_err2str(err));
+		goto no_audio;
+	}
+	// only FLTP is supported by AAC encoder
+	ctx->audio_encoder->sample_fmt = AV_SAMPLE_FMT_FLTP;
+	ctx->audio_encoder->bit_rate = (int64_t)192 * 1024;
+	ctx->audio_encoder->sample_rate = 44100;
+	static const AVChannelLayout channel_layout = AV_CHANNEL_LAYOUT_STEREO;
+	av_channel_layout_copy(&ctx->audio_encoder->ch_layout, &channel_layout);
+	if (ctx->avf_context->oformat->flags & AVFMT_GLOBALHEADER)
+		ctx->audio_encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
+	err = avcodec_open2(ctx->audio_encoder, audio_codec, NULL);
+	if (err < 0) {
+		fprintf(stderr, "error: couldn't set audio encoder codec (avcodec_open2): %s\n", av_err2str(err));
+		goto no_audio;
+	}
+	ctx->audio_frame_samples = audio_codec->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE
+		? 4096
+		: ctx->audio_encoder->frame_size;
+	ctx->audio_frame = av_frame_alloc();
+	if (!ctx->audio_frame) {
+		fprintf(stderr, "error: couldn't allocate audio frame\n");
+		goto no_audio;
+	}
+	ctx->audio_frame->format = AV_SAMPLE_FMT_FLTP;
+	av_channel_layout_copy(&ctx->audio_frame->ch_layout, &channel_layout);
+	ctx->audio_frame->sample_rate = 44100;
+	ctx->audio_frame->nb_samples = ctx->audio_frame_samples;
+	err = av_frame_get_buffer(ctx->audio_frame, 0);
+	if (err < 0) {
+		fprintf(stderr, "error: av_frame_get_buffer (audio): %s\n", av_err2str(err));
+		goto no_audio;
+	}
+
+	// create stream last so that if stuff above fails we don't have a broken stream in the avformat context
+	ctx->audio_stream = avformat_new_stream(ctx->avf_context, audio_codec);
+	if (!ctx->audio_stream) {
+		fprintf(stderr, "error: avformat_new_stream (audio): %s\n", av_err2str(err));
+		goto no_audio;
+	}
+	ctx->audio_stream->id = 1;
+	ctx->audio_stream->time_base = (AVRational){1, 44100};
+	err = avcodec_parameters_from_context(ctx->audio_stream->codecpar, ctx->audio_encoder);
+	if (err < 0) {
+		fprintf(stderr, "error: avcodec_parameters_from_context (audio): %s\n", av_err2str(err));
+		goto no_audio;
+	}
+no_audio:
 	err = avformat_write_header(ctx->avf_context, NULL);
 	if (err < 0) {
 		fprintf(stderr, "error: avformat_write_header: %s\n", av_err2str(err));
@@ -150,8 +211,8 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 	}
 	if (ctx->audio_mutex) {
 		SDL_LockMutex(ctx->audio_mutex);
-		// we're just using this audio stream as a queue really.
-		ctx->audio_stream = SDL_NewAudioStream(AUDIO_S16, 2, 44100, AUDIO_S16, 2, 44100);
+		// TODO: use a ring buffer instead of an SDL audio stream
+		ctx->audio_queue = SDL_NewAudioStream(AUDIO_F32, 2, 44100, AUDIO_F32, 2, 44100);
 		SDL_UnlockMutex(ctx->audio_mutex);
 	}
 	ctx->recording = true;
@@ -198,7 +259,7 @@ bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 		SDL_LockMutex(ctx->audio_mutex);
 		char buf[4096];
 		int n;
-		while ((n = SDL_AudioStreamGet(ctx->audio_stream, buf, sizeof buf))) {
+		while ((n = SDL_AudioStreamGet(ctx->audio_queue, buf, sizeof buf))) {
 			printf("%d\n",n);
 		}
 		SDL_UnlockMutex(ctx->audio_mutex);
@@ -227,8 +288,8 @@ void video_stop(VideoContext *ctx) {
 	if (ctx->recording) {
 		if (ctx->audio_mutex) {
 			SDL_LockMutex(ctx->audio_mutex);
-			SDL_FreeAudioStream(ctx->audio_stream);
-			ctx->audio_stream = NULL;
+			SDL_FreeAudioStream(ctx->audio_queue);
+			ctx->audio_queue = NULL;
 			SDL_UnlockMutex(ctx->audio_mutex);
 		}
 		ctx->recording = false;
@@ -240,12 +301,14 @@ void video_stop(VideoContext *ctx) {
 		}
 		avio_closep(&ctx->avf_context->pb);
 	}
-	if (ctx->video_encoder) {
+	if (ctx->video_encoder)
 		avcodec_free_context(&ctx->video_encoder);
-	}
-	if (ctx->video_frame) {
+	if (ctx->audio_encoder)
+		avcodec_free_context(&ctx->audio_encoder);
+	if (ctx->video_frame)
 		av_frame_free(&ctx->video_frame);
-	}
+	if (ctx->audio_frame)
+		av_frame_free(&ctx->audio_frame);
 	if (ctx->avf_context) {
 		if (ctx->avf_context->pb) {
 			avio_closep(&ctx->avf_context->pb);
@@ -253,9 +316,8 @@ void video_stop(VideoContext *ctx) {
 		avformat_free_context(ctx->avf_context);
 		ctx->avf_context = NULL;
 	}
-	if (ctx->av_packet) {
+	if (ctx->av_packet)
 		av_packet_free(&ctx->av_packet);
-	}
 }
 
 void video_quit(VideoContext *ctx) {
@@ -267,8 +329,8 @@ void video_quit(VideoContext *ctx) {
 		SDL_UnlockMutex(ctx->audio_mutex);
 		SDL_WaitThread(ctx->audio_thread, NULL);
 	}
-	if (ctx->audio_stream)
-		SDL_FreeAudioStream(ctx->audio_stream);
+	if (ctx->audio_queue)
+		SDL_FreeAudioStream(ctx->audio_queue);
 	if (ctx->audio_mutex)
 		SDL_DestroyMutex(ctx->audio_mutex);
 	free(ctx);
