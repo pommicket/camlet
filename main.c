@@ -3,6 +3,7 @@ TODO
 -video
 -adjustable camera framerate
 -save/restore settings
+-make sure file doesn't exist before writing to it
 */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -72,12 +73,20 @@ typedef enum {
 static const char *const image_format_names[IMG_FMT_COUNT] = {"JPEG", "PNG"};
 static const char *const image_format_extensions[IMG_FMT_COUNT] = {"jpg", "png"};
 
+typedef enum {
+	MODE_PICTURE,
+	MODE_VIDEO,
+
+	MODE_COUNT,
+} CameraMode;
+
 typedef struct {
 	Menu curr_menu;
 	int menu_sel[MENU_COUNT];
 	bool show_debug;
 	bool menu_needs_rerendering;
 	bool quit;
+	CameraMode mode;
 	bool recording_video;
 	AVFormatContext *avf_context;
 	AVCodecContext *video_encoder;
@@ -556,32 +565,6 @@ static bool get_expanded_output_dir(State *state, char path[PATH_MAX]) {
 	return mkdir_with_parents(path);
 }
 
-
-static bool take_picture(State *state) {
-	static char path[PATH_MAX];
-	if (!get_expanded_output_dir(state, path))
-		return false;
-	struct tm *tm = localtime((time_t[1]){time(NULL)});
-	strftime(path + strlen(path), sizeof path - strlen(path), "/%Y-%m-%d-%H-%M-%S", tm);
-	snprintf(path + strlen(path), sizeof path - strlen(path), ".%s", image_format_extensions[state->image_format]);
-	bool success = false;
-	switch (state->image_format) {
-	case IMG_FMT_JPEG:
-		success = camera_save_jpg(state->camera, path, 90);
-		break;
-	case IMG_FMT_PNG:
-		success = camera_save_png(state->camera, path);
-		break;
-	case IMG_FMT_COUNT:
-		assert(false);
-		break;
-	}
-	if (success) {
-		state->flash_time = get_time_double();
-	}
-	return success;
-}
-
 static bool write_frame(State *state, AVCodecContext *encoder, AVStream *stream, AVFrame *frame) {
 	int err = avcodec_send_frame(encoder, frame);
 	if (err < 0) {
@@ -608,14 +591,15 @@ static bool write_frame(State *state, AVCodecContext *encoder, AVStream *stream,
 	return true;
 }
 
+
 static void stop_video(State *state) {
 	if (state->recording_video) {
+		state->recording_video = false;
 		// flush video encoder
 		write_frame(state, state->video_encoder, state->video_stream, NULL);
 		int err = av_write_trailer(state->avf_context);
 		if (err < 0) {
 			fprintf(stderr, "error: av_write_trailer: %s\n", av_err2str(err));
-			return;
 		}
 		avio_closep(&state->avf_context->pb);
 	}
@@ -638,7 +622,7 @@ static void stop_video(State *state) {
 }
 
 static bool start_video(State *state, const char *filename) {
-	//if (!state->camera) return false;
+	if (!state->camera) return false;
 	if (state->recording_video) {
 		return true;
 	}
@@ -667,9 +651,10 @@ static bool start_video(State *state, const char *filename) {
 		return false;
 	}
 	state->video_encoder->codec_id = fmt->video_codec;
-	state->video_encoder->bit_rate = 400000;
-	state->video_encoder->width = 360;//camera_frame_width(state->camera);
-	state->video_encoder->height = 240;//camera_frame_height(state->camera);
+	// TODO: adjustable video framerate
+	state->video_encoder->bit_rate = (int64_t)5 * camera_frame_width(state->camera) * camera_frame_height(state->camera);
+	state->video_encoder->width = camera_frame_width(state->camera);
+	state->video_encoder->height = camera_frame_height(state->camera);
 	state->video_encoder->time_base = state->video_stream->time_base = (AVRational){1,30};// TODO: restrict application to 30FPS when recording video
 	state->video_encoder->gop_size = 12;
 	state->video_encoder->pix_fmt = AV_PIX_FMT_YUV420P;
@@ -730,12 +715,45 @@ static bool start_video(State *state, const char *filename) {
 	return true;
 }
 
+static bool take_picture(State *state) {
+	static char path[PATH_MAX];
+	if (!get_expanded_output_dir(state, path))
+		return false;
+	struct tm *tm = localtime((time_t[1]){time(NULL)});
+	strftime(path + strlen(path), sizeof path - strlen(path), "/%Y-%m-%d-%H-%M-%S", tm);
+	const char *extension = state->mode == MODE_VIDEO ? "mkv" : image_format_extensions[state->image_format];
+	snprintf(path + strlen(path), sizeof path - strlen(path), ".%s", extension);
+	bool success = false;
+	switch (state->mode) {
+	case MODE_PICTURE:
+		switch (state->image_format) {
+		case IMG_FMT_JPEG:
+			success = camera_save_jpg(state->camera, path, 90);
+			break;
+		case IMG_FMT_PNG:
+			success = camera_save_png(state->camera, path);
+			break;
+		case IMG_FMT_COUNT:
+			assert(false);
+			break;
+		}
+		if (success) {
+			state->flash_time = get_time_double();
+		}
+		break;
+	case MODE_VIDEO:
+		success = start_video(state, path);
+		break;
+	case MODE_COUNT:
+		assert(false);
+		break;
+	}
+	return success;
+}
+
 int main(void) {
 	static State state_data;
 	State *state = &state_data;
-	start_video(state, "out.mkv");
-	stop_video(state);
-	return 0;
 	SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1"); // if this program is sent a SIGTERM/SIGINT, don't turn it into a quit event
 	if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
 		fprintf(stderr, "couldn't initialize SDL\n");
@@ -847,7 +865,7 @@ int main(void) {
 	#endif
 	gl.BlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
 	double last_time = get_time_double();
-	GLuint textures[8] = {0};
+	GLuint textures[9] = {0};
 	gl.GenTextures(SDL_arraysize(textures), textures);
 	for (size_t i = 0; i < SDL_arraysize(textures); i++) {
 		gl.BindTexture(GL_TEXTURE_2D, textures[i]);
@@ -856,11 +874,12 @@ int main(void) {
 		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
 		gl.TexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
 	}
-	GLuint menu_texture = textures[0];
-	GLuint no_camera_texture = textures[1];
-	GLuint debug_info_texture = textures[2];
-	GLuint black_texture = textures[6];
-	GLuint timer_texture = textures[7];
+	const GLuint menu_texture = textures[0];
+	const GLuint no_camera_texture = textures[1];
+	const GLuint debug_info_texture = textures[2];
+	const GLuint black_texture = textures[6];
+	const GLuint timer_texture = textures[7];
+	const GLuint mode_texture = textures[8];
 	{
 		static uint8_t black[16];
 		gl.BindTexture(GL_TEXTURE_2D, black_texture);
@@ -1088,6 +1107,7 @@ void main() {\n\
 			if (strcmp(action, "remove") == 0) {
 				if (state->camera && strcmp(devnode, camera_devnode(state->camera)) == 0) {
 					// our special camera got disconnected ):
+					stop_video(state);
 					state->camera = NULL;
 				}
 				for (size_t i = 0; i < arr_len(state->cameras); ) {
@@ -1103,7 +1123,7 @@ void main() {\n\
 			}
 			udev_device_unref(dev);
 		}
-		if (!state->camera || any_new_cameras)
+		if (!state->camera || (any_new_cameras && !state->recording_video))
 			select_camera(state);
 		SDL_Event event = {0};
 		while (SDL_PollEvent(&event)) {
@@ -1129,8 +1149,30 @@ void main() {\n\
 					}
 				}
 				break;
+			case SDLK_TAB:
+				state->mode = (state->mode + 1) % MODE_COUNT;
+				switch (state->mode) {
+				case MODE_PICTURE:
+					// TODO: go back to normal settings
+					break;
+				case MODE_VIDEO:
+					// TODO: configurable width/height
+					camera_set_format(state->camera, (PictureFormat) {
+						.width = 1280,
+						.height = 720,
+						.pixfmt = V4L2_PIX_FMT_YUV420
+					}, CAMERA_ACCESS_MMAP, false);
+					break;
+				case MODE_COUNT:
+					assert(false);
+					break;
+				}
+				break;
 			case SDLK_SPACE:
-				if (state->camera && state->curr_menu == 0) {
+				if (!state->camera || state->curr_menu != 0) break;
+				if (state->recording_video) {
+					stop_video(state);
+				} else {
 					if (state->timer == 0) {
 						take_picture(state);
 					} else {
@@ -1149,10 +1191,10 @@ void main() {\n\
 				}
 				break;
 			case SDLK_ESCAPE:
-				if (state->curr_menu == MENU_NONE) {
-					state->curr_menu = MENU_MAIN;
-				} else if (state->curr_menu == MENU_MAIN || state->curr_menu == MENU_HELP) {
+				if (state->curr_menu == MENU_MAIN || state->curr_menu == MENU_HELP) {
 					state->curr_menu = MENU_NONE;
+				} else if (state->recording_video) {
+					// don't allow opening menu while recording video
 				} else {
 					state->curr_menu = MENU_MAIN;
 				}
@@ -1235,10 +1277,10 @@ void main() {\n\
 		}
 		static int prev_window_width, prev_window_height;
 		int window_width = 0, window_height = 0;
+		// NOTE: not all window size changes seem to generate WINDOWEVENT_RESIZED.
 		SDL_GetWindowSize(window, &window_width, &window_height);
-		// not all window size changes seem to generate WINDOWEVENT_RESIZED.
-		state->menu_needs_rerendering |= window_width != prev_window_width;
-		state->menu_needs_rerendering |= window_height != prev_window_height;
+		const bool window_size_changed = window_width != prev_window_width || window_height != prev_window_height;
+		state->menu_needs_rerendering |= window_size_changed;
 		prev_window_width = window_width;
 		prev_window_height = window_height;
 		int menu_width = window_width / 2, menu_height = window_height / 2;
@@ -1377,6 +1419,7 @@ void main() {\n\
 					"Space - take a picture",
 					"Escape - open/close settings",
 					"Ctrl+f - open picture directory",
+					"Tab - switch between picture and video",
 				};
 				for (size_t line = 0; line < SDL_arraysize(text); line++) {
 					render_text_to_surface(font, menu, 5, 5 + (5 + font_size) * (line + 1),
@@ -1494,7 +1537,7 @@ void main() {\n\
 			gl.Enable(GL_BLEND);
 			gl.ActiveTexture(GL_TEXTURE0);
 			gl.BindTexture(GL_TEXTURE_2D, timer_texture);
-			if (time_displayed != prev_time_displayed) {
+			if (time_displayed != prev_time_displayed || window_size_changed) {
 				static char text[16];
 				TTF_SetFontSize(font, window_height / 4);
 				snprintf(text, sizeof text, "%d", time_displayed);
@@ -1514,9 +1557,42 @@ void main() {\n\
 			gl.Uniform2f(u_scale, gl_width, gl_height);
 			gl.Uniform1i(u_sampler, 0);
 			gl.Uniform1f(u_opacity, 0.9f);
+			gl.Uniform2f(u_offset, 0, 0);
 			gl.Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGBA32);
 			gl.DrawArrays(GL_TRIANGLES, 0, 6);
 		}
+		static char mode_text[32];
+		if (window_size_changed) *mode_text = 0;
+		if (state->mode == MODE_VIDEO) {
+			const char *new_text = state->recording_video ? "REC" : "VIDEO";
+			static float gl_width, gl_height;
+			gl.Enable(GL_BLEND);
+			gl.ActiveTexture(GL_TEXTURE0);
+			gl.BindTexture(GL_TEXTURE_2D, mode_texture);
+			if (strcmp(mode_text, new_text) != 0) {
+				strcpy(mode_text, new_text);
+				TTF_SetFontSize(font, window_height / 10);
+				SDL_Surface *surf = TTF_RenderUTF8_Blended(font, mode_text, (SDL_Color){0, 0, 255, 255});
+				SDL_LockSurface(surf);
+				gl.PixelStorei(GL_UNPACK_ALIGNMENT, 4);
+				assert(surf->format->format == SDL_PIXELFORMAT_ARGB8888);
+				assert(surf->pitch % 4 == 0);
+				gl.PixelStorei(GL_UNPACK_ROW_LENGTH, surf->pitch / 4);
+				gl.TexImage2D(GL_TEXTURE_2D, 0, GL_RGBA, surf->w, surf->h, 0, GL_RGBA, GL_UNSIGNED_BYTE, surf->pixels);
+				gl.PixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+				SDL_UnlockSurface(surf);
+				gl_width = (float)surf->w / window_width;
+				gl_height = (float)surf->h / window_height;
+				SDL_FreeSurface(surf);
+			}
+			gl.Uniform2f(u_scale, gl_width, gl_height);
+			gl.Uniform2f(u_offset, 1 - gl_width, 1 - gl_height);
+			gl.Uniform1i(u_sampler, 0);
+			gl.Uniform1f(u_opacity, 1);
+			gl.Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGBA32);
+			gl.DrawArrays(GL_TRIANGLES, 0, 6);
+		}
+		
 		if (state->curr_menu) {
 			gl.Enable(GL_BLEND);
 			gl.ActiveTexture(GL_TEXTURE0);
@@ -1539,7 +1615,7 @@ void main() {\n\
 			gl.ActiveTexture(GL_TEXTURE0);
 			gl.BindTexture(GL_TEXTURE_2D, debug_info_texture);
 			static float gl_width, gl_height;
-			if (curr_time - last_fps_update > 0.5) {
+			if (curr_time - last_fps_update > 0.5 || window_size_changed) {
 				last_fps_update = curr_time;
 				static char text[256];
 				char hash[HASH_SIZE * 2 + 1] = {0};
