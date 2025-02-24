@@ -22,6 +22,7 @@ struct VideoContext {
 	AVStream *video_stream;
 	AVStream *audio_stream;
 	int64_t next_video_pts;
+	int64_t next_audio_pts;
 	SDL_Thread *audio_thread;
 	bool recording;
 	char _unused0[128]; // reduce false sharing
@@ -39,9 +40,15 @@ static int audio_thread(void *data) {
 		.rate = 44100,
 		.channels = 2,
 	};
+	// by default pulseaudio uses a crazy large buffer, like 500KB,
+	// and doesn't send any audio until it's full.
+	const pa_buffer_attr buffer_attr = {
+		.maxlength = 8192,
+		.fragsize = 4096,
+	};
 	int err = 0;
 	pa_simple *pulseaudio = pa_simple_new(NULL, "camlet", PA_STREAM_RECORD, NULL,
-		"microphone", &audio_format, NULL, NULL, &err);
+		"microphone", &audio_format, NULL, &buffer_attr, &err);
 	if (!pulseaudio) {
 		fprintf(stderr, "couldn't connect to pulseaudio: %s", pa_strerror(err));
 		return -1;
@@ -53,8 +60,9 @@ static int audio_thread(void *data) {
 		if (pa_simple_read(pulseaudio, buf, sizeof buf, &err) >= 0) {
 			SDL_LockMutex(ctx->audio_mutex);
 			quit = ctx->audio_quit;
-			if (!quit && ctx->audio_queue)
+			if (!quit && ctx->audio_queue) {
 				SDL_AudioStreamPut(ctx->audio_queue, buf, sizeof buf);
+			}
 			SDL_UnlockMutex(ctx->audio_mutex);
 		} else {
 			if (!warned) {
@@ -256,13 +264,27 @@ bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 		* ctx->video_encoder->time_base.den
 		/ ctx->video_encoder->time_base.num);
 	if (ctx->audio_mutex) {
+		int audio_frame_size = ctx->audio_frame_samples * 2 * sizeof(float);
+		float *buf = malloc(audio_frame_size);
 		SDL_LockMutex(ctx->audio_mutex);
-		char buf[4096];
-		int n;
-		while ((n = SDL_AudioStreamGet(ctx->audio_queue, buf, sizeof buf))) {
-			printf("%d\n",n);
+		while (SDL_AudioStreamAvailable(ctx->audio_queue) > audio_frame_size) {
+			SDL_AudioStreamGet(ctx->audio_queue, buf, audio_frame_size);
+			SDL_UnlockMutex(ctx->audio_mutex);
+			int err = av_frame_make_writable(ctx->audio_frame);
+			if (err < 0) {
+				fprintf(stderr, "error: av_frame_make_writable: %s\n", av_err2str(err));
+				break;
+			}
+			ctx->audio_frame->pts = ctx->next_audio_pts;
+			ctx->next_audio_pts += ctx->audio_frame_samples;
+			for (int s = 0; s < ctx->audio_frame_samples; s++) {
+				((float *)ctx->audio_frame->data[0])[s] = buf[2*s];
+				((float *)ctx->audio_frame->data[1])[s] = buf[2*s+1];
+			}
+			write_frame(ctx, ctx->audio_encoder, ctx->audio_stream, ctx->audio_frame);
 		}
 		SDL_UnlockMutex(ctx->audio_mutex);
+		free(buf);
 	}
 	if (video_pts >= ctx->next_video_pts) {
 		int err = av_frame_make_writable(ctx->video_frame);
@@ -295,6 +317,8 @@ void video_stop(VideoContext *ctx) {
 		ctx->recording = false;
 		// flush video encoder
 		write_frame(ctx, ctx->video_encoder, ctx->video_stream, NULL);
+		// flush audio encoder
+		write_frame(ctx, ctx->audio_encoder, ctx->audio_stream, NULL);
 		int err = av_write_trailer(ctx->avf_context);
 		if (err < 0) {
 			fprintf(stderr, "error: av_write_trailer: %s\n", av_err2str(err));
