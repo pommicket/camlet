@@ -72,7 +72,7 @@ static const char *const image_format_names[IMG_FMT_COUNT] = {"JPEG", "PNG"};
 static const char *const image_format_extensions[IMG_FMT_COUNT] = {"jpg", "png"};
 
 typedef enum {
-	MODE_PICTURE,
+	MODE_IMAGE,
 	MODE_VIDEO,
 
 	MODE_COUNT,
@@ -82,7 +82,8 @@ typedef struct {
 	Hash *camera_precedence;
 	uint32_t pixel_format;
 	int timer;
-	int32_t resolution[2];
+	int32_t image_resolution[2];
+	int32_t video_resolution[2];
 	ImageFormat image_format;
 	char *output_dir;
 } Settings;
@@ -132,12 +133,19 @@ static void APIENTRY gl_message_callback(GLenum source, GLenum type, unsigned in
 }
 #endif
 
-static PictureFormat settings_picture_format(Settings *settings) {
+static PictureFormat settings_desired_picture_format(State *state) {
+	Settings *settings = &state->settings;
 	return (PictureFormat) {
-		.width = settings->resolution[0],
-		.height = settings->resolution[1],
+		.width = state->mode == MODE_VIDEO ? settings->video_resolution[0] : settings->image_resolution[0],
+		.height = state->mode == MODE_VIDEO ? settings->video_resolution[1] : settings->image_resolution[1],
 		.pixfmt = settings->pixel_format
 	};
+}
+
+
+static PictureFormat settings_picture_format_for_camera(State *state, Camera *camera) {
+	PictureFormat picfmt = settings_desired_picture_format(state);
+	return camera_closest_picfmt(camera, picfmt);
 }
 
 // compile a GLSL shader
@@ -294,6 +302,7 @@ static void menu_select(State *state) {
 			state->menu_needs_rerendering = true;
 			// set menu_sel
 			PictureFormat *resolutions = camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera));
+			state->menu_sel[MENU_RESOLUTION] = 0;
 			arr_foreach_ptr(resolutions, PictureFormat, resolution) {
 				if (resolution->width == camera_frame_width(state->camera)
 					&& resolution->height == camera_frame_height(state->camera)) {
@@ -314,7 +323,7 @@ static void menu_select(State *state) {
 				}
 			}
 			break;
-		case MENU_OPT_PIXFMT: if (state->camera) {
+		case MENU_OPT_PIXFMT: if (state->camera && state->mode != MODE_VIDEO) {
 			state->curr_menu = MENU_PIXFMT;
 			state->menu_needs_rerendering = true;
 			// set menu_sel
@@ -346,8 +355,16 @@ static void menu_select(State *state) {
 			return;
 		}
 		PictureFormat *resolutions = camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera));
+		PictureFormat resolution = resolutions[sel-1];
+		if (state->mode == MODE_VIDEO) {
+			settings->video_resolution[0] = resolution.width;
+			settings->video_resolution[1] = resolution.height;
+		} else {
+			settings->image_resolution[0] = resolution.width;
+			settings->image_resolution[1] = resolution.height;
+		}
 		camera_set_format(state->camera,
-			resolutions[sel-1],
+			resolution,
 			camera_access_method(state->camera),
 			false);
 		arr_free(resolutions);
@@ -365,7 +382,8 @@ static void menu_select(State *state) {
 		} else {
 			camera_close(state->camera);
 			state->camera = new_camera;
-			if (camera_open(state->camera, settings_picture_format(settings))) {
+			PictureFormat picfmt = settings_picture_format_for_camera(state, state->camera);
+			if (camera_open(state->camera, picfmt)) {
 				// put at highest precedence
 				move_to_highest_precedence(&state->settings, state->camera);
 			} else {
@@ -381,8 +399,8 @@ static void menu_select(State *state) {
 			state->menu_needs_rerendering = true;
 			return;
 		}
-		uint32_t pixfmt = pixfmts[sel-1];
-		PictureFormat new_picfmt = camera_closest_resolution(state->camera, pixfmt, settings->resolution[0], settings->resolution[1]);
+		settings->pixel_format = pixfmts[sel-1];
+		PictureFormat new_picfmt = settings_picture_format_for_camera(state, state->camera);
 		arr_free(pixfmts);
 		camera_set_format(state->camera,
 			new_picfmt,
@@ -432,7 +450,7 @@ static void select_camera(State *state) {
 			}
 			state->camera = state->cameras[camera_idx];
 		}
-		if (camera_open(state->camera, settings_picture_format(settings))) {
+		if (camera_open(state->camera, settings_picture_format_for_camera(state, state->camera))) {
 			bool already_there = false;
 			arr_foreach_ptr(settings->camera_precedence, Hash, h) {
 				if (hash_eq(*h, camera_hash(state->camera))) {
@@ -580,7 +598,7 @@ static bool take_picture(State *state) {
 	snprintf(path + strlen(path), sizeof path - strlen(path), ".%s", extension);
 	bool success = false;
 	switch (state->mode) {
-	case MODE_PICTURE:
+	case MODE_IMAGE:
 		switch (settings->image_format) {
 		case IMG_FMT_JPEG:
 			success = camera_save_jpg(state->camera, path, 90);
@@ -1016,20 +1034,26 @@ void main() {\n\
 				}
 				break;
 			case SDLK_TAB:
+				if (state->curr_menu) break;
 				if (video_is_recording(state->video)) break;
 				state->mode = (state->mode + 1) % MODE_COUNT;
 				switch (state->mode) {
-				case MODE_PICTURE:
-					// TODO: go back to normal settings
+				case MODE_IMAGE:
+					camera_set_format(state->camera,
+						settings_picture_format_for_camera(state, state->camera),
+						camera_access_method(state->camera), false);
 					break;
-				case MODE_VIDEO:
-					// TODO: configurable width/height
-					camera_set_format(state->camera, (PictureFormat) {
-						.width = 1280,
-						.height = 720,
-						.pixfmt = V4L2_PIX_FMT_YUV420
-					}, CAMERA_ACCESS_MMAP, false);
-					break;
+				case MODE_VIDEO: {
+					PictureFormat desired = settings_desired_picture_format(state);
+					desired.pixfmt = V4L2_PIX_FMT_YUV420;
+					// default to 720p for video
+					if (!desired.width) desired.width = 1280;
+					if (!desired.height) desired.height = 720;
+					PictureFormat picfmt = camera_closest_picfmt(state->camera, desired);
+					// force V4L2 to do the conversion if we have to
+					picfmt.pixfmt = V4L2_PIX_FMT_YUV420;
+					camera_set_format(state->camera, picfmt, camera_access_method(state->camera), false);
+					} break;
 				case MODE_COUNT:
 					assert(false);
 					break;

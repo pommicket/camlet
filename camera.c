@@ -238,19 +238,28 @@ uint32_t *camera_get_pixfmts(Camera *camera) {
 	arr_qsort(available, uint32_cmp_qsort);
 	return available;
 }
-PictureFormat camera_closest_resolution(Camera *camera, uint32_t pixfmt, int32_t desired_width, int32_t desired_height) {
-	PictureFormat best_format = camera->best_format; // default if there's nothing with the desired pixfmt
+
+PictureFormat camera_closest_picfmt(Camera *camera, PictureFormat desired) {
+	PictureFormat best_format = {0};
 	int32_t best_score = INT32_MIN;
 	arr_foreach_ptr(camera->formats, const PictureFormat, fmt) {
-		if (fmt->pixfmt != pixfmt) {
-			continue;
+		int32_t score = 0;
+		if (fmt->pixfmt != desired.pixfmt) {
+			score -= INT32_MAX / 4;
 		}
-		int32_t score = -abs(fmt->width - desired_width) + abs(fmt->height - desired_height);
+		if (desired.width == 0 && desired.height == 0) {
+			// go for largest resolution if none is specified
+			score += fmt->width + fmt->height;
+		} else {
+			// closest difference in resolution
+			score -= abs(fmt->width - desired.width) + abs(fmt->height - desired.height);
+		}
 		if (score >= best_score) {
 			best_score = score;
 			best_format = *fmt;
 		}
 	}
+	assert(best_format.pixfmt);
 	return best_format;
 }
 
@@ -288,6 +297,10 @@ TODO: test me with a camera that supports userptr i/o
 	return true;*/
 }
 static bool camera_stop_io(Camera *camera) {
+	if (v4l2_ioctl(camera->fd, VIDIOC_STREAMOFF,
+		(enum v4l2_buf_type[1]) { V4L2_BUF_TYPE_VIDEO_CAPTURE }) != 0) {
+		perror("v4l2_ioctl VIDIOC_STREAMOFF");
+	}
 	// Just doing VIDIOC_STREAMOFF doesn't seem to be enough to prevent EBUSY.
 	//  (Even if we dequeue all buffers afterwards)
 	// Re-opening doesn't seem to be necessary for read-based access for me,
@@ -731,6 +744,9 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod 
 		// no changes needed
 		return true;
 	}
+	assert(picfmt.pixfmt);
+	assert(picfmt.width);
+	assert(picfmt.height);
 	camera->any_frames = false;
 	camera->access_method = access;
 	for (int i = 0; i < camera->buffer_count; i++) {
@@ -796,13 +812,6 @@ bool camera_open(Camera *camera, PictureFormat desired_format) {
 		perror("v4l2_ioctl");
 		return false;
 	}
-	int32_t desired_width = desired_format.width;
-	int32_t desired_height = desired_format.height;
-	uint32_t desired_pixfmt = desired_format.pixfmt;
-	if (!desired_width) desired_width = camera->best_format.width;
-	if (!desired_height) desired_height = camera->best_format.height;
-	if (!desired_pixfmt) desired_pixfmt = camera->best_format.pixfmt;
-	desired_format = camera_closest_resolution(camera, desired_pixfmt, desired_width, desired_height);
 	camera_set_format(camera, desired_format, camera->access_method, true);
 	return true;
 }
@@ -946,7 +955,7 @@ bool camera_copy_to_av_frame(Camera *camera, struct AVFrame *frame_out) {
 		|| frame_out->format != AV_PIX_FMT_YUV420P) {
 		static atomic_flag warned = ATOMIC_FLAG_INIT;
 		if (!atomic_flag_test_and_set_explicit(&warned, memory_order_relaxed)) {
-			fprintf(stderr, "%s: Bad picture format.", __func__);
+			fprintf(stderr, "%s: Bad picture format.\n", __func__);
 		}
 		return false;
 	}

@@ -107,7 +107,7 @@ int picture_format_cmp_qsort(const void *av, const void *bv);
 const char *pixfmt_to_string(uint32_t pixfmt);
 PictureFormat *camera_get_resolutions_with_pixfmt(Camera *camera, uint32_t pixfmt);
 uint32_t *camera_get_pixfmts(Camera *camera);
-PictureFormat camera_closest_resolution(Camera *camera, uint32_t pixfmt, int32_t desired_width, int32_t desired_height);
+PictureFormat camera_closest_picfmt(Camera *camera, PictureFormat picfmt);
 int32_t camera_frame_width(Camera *camera);
 int32_t camera_frame_height(Camera *camera);
 PictureFormat camera_picture_format(Camera *camera);
