@@ -239,7 +239,7 @@ uint32_t *camera_get_pixfmts(Camera *camera) {
 	return available;
 }
 PictureFormat camera_closest_resolution(Camera *camera, uint32_t pixfmt, int32_t desired_width, int32_t desired_height) {
-	PictureFormat best_format = {.pixfmt = pixfmt};
+	PictureFormat best_format = camera->best_format; // default if there's nothing with the desired pixfmt
 	int32_t best_score = INT32_MIN;
 	arr_foreach_ptr(camera->formats, const PictureFormat, fmt) {
 		if (fmt->pixfmt != pixfmt) {
@@ -780,7 +780,7 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod 
 	}
 }
 
-bool camera_open(Camera *camera) {
+bool camera_open(Camera *camera, PictureFormat desired_format) {
 	if (!camera->access_method)
 		camera->access_method = CAMERA_ACCESS_MMAP;
 	// camera should not already be open
@@ -796,7 +796,14 @@ bool camera_open(Camera *camera) {
 		perror("v4l2_ioctl");
 		return false;
 	}
-	camera_set_format(camera, camera->best_format, camera->access_method, true);
+	int32_t desired_width = desired_format.width;
+	int32_t desired_height = desired_format.height;
+	uint32_t desired_pixfmt = desired_format.pixfmt;
+	if (!desired_width) desired_width = camera->best_format.width;
+	if (!desired_height) desired_height = camera->best_format.height;
+	if (!desired_pixfmt) desired_pixfmt = camera->best_format.pixfmt;
+	desired_format = camera_closest_resolution(camera, desired_pixfmt, desired_width, desired_height);
+	camera_set_format(camera, desired_format, camera->access_method, true);
 	return true;
 }
 

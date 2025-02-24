@@ -124,7 +124,7 @@ uint32_t camera_pixel_format(Camera *camera);
 CameraAccessMethod camera_access_method(Camera *camera);
 void camera_close(Camera *camera);
 void cameras_from_device(const char *dev_path, const char *serial, Camera ***cameras);
-bool camera_open(Camera *camera);
+bool camera_open(Camera *camera, PictureFormat desired_format);
 Hash camera_hash(Camera *camera);
 void camera_hash_str(Camera *camera, char str[HASH_SIZE * 2 + 1]);
 bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod access, bool force);

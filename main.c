@@ -79,6 +79,15 @@ typedef enum {
 } CameraMode;
 
 typedef struct {
+	Hash *camera_precedence;
+	uint32_t pixel_format;
+	int timer;
+	int32_t resolution[2];
+	ImageFormat image_format;
+	char *output_dir;
+} Settings;
+
+typedef struct {
 	Menu curr_menu;
 	int menu_sel[MENU_COUNT];
 	bool show_debug;
@@ -86,15 +95,12 @@ typedef struct {
 	bool quit;
 	CameraMode mode;
 	VideoContext *video;
-	int timer;
 	double timer_activate_time;
 	double flash_time;
-	char *output_dir;
 	Camera *camera;
 	Camera **cameras;
-	ImageFormat image_format;
 	SDL_Rect *menu_option_rects;
-	Hash *camera_precedence;
+	Settings settings;
 } State;
 
 static const int timer_options[] = {0, 2, 5, 10, 15, 30};
@@ -125,6 +131,14 @@ static void APIENTRY gl_message_callback(GLenum source, GLenum type, unsigned in
 	printf("Message from OpenGL: %s.\n", message);
 }
 #endif
+
+static PictureFormat settings_picture_format(Settings *settings) {
+	return (PictureFormat) {
+		.width = settings->resolution[0],
+		.height = settings->resolution[1],
+		.pixfmt = settings->pixel_format
+	};
+}
 
 // compile a GLSL shader
 GLuint gl_compile_shader(char error_buf[256], const char *code, GLenum shader_type) {
@@ -244,30 +258,32 @@ static SDL_Rect render_text_to_surface(TTF_Font *font, SDL_Surface *dest, int x,
 	return render_text_to_surface_anchored(font, dest, x, y, color, str, -1, -1);
 }
 
-static void move_to_highest_precedence(State *state, Camera *camera) {
+static void move_to_highest_precedence(Settings *settings, Camera *camera) {
 	Hash hash = camera_hash(camera);
-	for (size_t i = 0; i < arr_len(state->camera_precedence); i++) {
-		if (hash_eq(state->camera_precedence[i], hash)) {
-			arr_remove(state->camera_precedence, i);
+	for (size_t i = 0; i < arr_len(settings->camera_precedence); i++) {
+		if (hash_eq(settings->camera_precedence[i], hash)) {
+			arr_remove(settings->camera_precedence, i);
 			break;
 		}
 	}
-	arr_insert(state->camera_precedence, 0, hash);
+	arr_insert(settings->camera_precedence, 0, hash);
 }
 
 static void change_timer(State *state, int direction) {
+	Settings *settings = &state->settings;
 	int k;
 	int n_options = (int)SDL_arraysize(timer_options);
 	for (k = 0; k < n_options; k++) {
-		if (timer_options[k] == state->timer) {
+		if (timer_options[k] == settings->timer) {
 			break;
 		}
 	}
-	state->timer = timer_options[((k + direction) % n_options + n_options) % n_options];
+	settings->timer = timer_options[((k + direction) % n_options + n_options) % n_options];
 	state->menu_needs_rerendering = true;
 }
 
 static void menu_select(State *state) {
+	Settings *settings = &state->settings;
 	if (state->curr_menu == MENU_MAIN) {
 		switch (main_menu[state->menu_sel[MENU_MAIN]]) {
 		case MENU_OPT_QUIT:
@@ -311,7 +327,7 @@ static void menu_select(State *state) {
 			arr_free(pixfmts);
 			} break;
 		case MENU_OPT_IMGFMT: {
-			state->image_format = (state->image_format + 1) % IMG_FMT_COUNT;
+			settings->image_format = (settings->image_format + 1) % IMG_FMT_COUNT;
 			state->menu_needs_rerendering = true;
 			} break;
 		case MENU_OPT_SET_OUTPUT_DIR:
@@ -345,13 +361,13 @@ static void menu_select(State *state) {
 		Camera *new_camera = state->cameras[sel-1];
 		if (state->camera == new_camera) {
 			// already using this camera- just change its precedence
-			move_to_highest_precedence(state, state->camera);
+			move_to_highest_precedence(&state->settings, state->camera);
 		} else {
 			camera_close(state->camera);
 			state->camera = new_camera;
-			if (camera_open(state->camera)) {
+			if (camera_open(state->camera, settings_picture_format(settings))) {
 				// put at highest precedence
-				move_to_highest_precedence(state, state->camera);
+				move_to_highest_precedence(&state->settings, state->camera);
 			} else {
 				state->camera = NULL;
 				select_camera(state);
@@ -366,7 +382,7 @@ static void menu_select(State *state) {
 			return;
 		}
 		uint32_t pixfmt = pixfmts[sel-1];
-		PictureFormat new_picfmt = camera_closest_resolution(state->camera, pixfmt, camera_frame_width(state->camera), camera_frame_height(state->camera));
+		PictureFormat new_picfmt = camera_closest_resolution(state->camera, pixfmt, settings->resolution[0], settings->resolution[1]);
 		arr_free(pixfmts);
 		camera_set_format(state->camera,
 			new_picfmt,
@@ -381,12 +397,13 @@ static void menu_select(State *state) {
 }
 
 static void select_camera(State *state) {
+	Settings *settings = &state->settings;
 	bool *cameras_working = calloc(1, arr_len(state->cameras));
 	memset(cameras_working, 1, arr_len(state->cameras));
 	while (true) {
 		int camera_idx = -1;
 		// find highest-precedence possibly-working camera
-		arr_foreach_ptr(state->camera_precedence, const Hash, h) {
+		arr_foreach_ptr(settings->camera_precedence, const Hash, h) {
 			arr_foreach_ptr(state->cameras, Camera *const, pcamera) {
 				Camera *c = *pcamera;
 				if (hash_eq(camera_hash(c), *h)) {
@@ -415,16 +432,16 @@ static void select_camera(State *state) {
 			}
 			state->camera = state->cameras[camera_idx];
 		}
-		if (camera_open(state->camera)) {
+		if (camera_open(state->camera, settings_picture_format(settings))) {
 			bool already_there = false;
-			arr_foreach_ptr(state->camera_precedence, Hash, h) {
+			arr_foreach_ptr(settings->camera_precedence, Hash, h) {
 				if (hash_eq(*h, camera_hash(state->camera))) {
 					already_there = true;
 				}
 			}
 			// if hasn't already been added, put it at the lowest precedence
 			if (!already_there) {
-				arr_add(state->camera_precedence, camera_hash(state->camera));
+				arr_add(settings->camera_precedence, camera_hash(state->camera));
 			}
 			break;
 		} else {
@@ -535,34 +552,36 @@ static void get_cameras_from_udev_device(State *state, struct udev_device *dev) 
 
 static char home_dir[PATH_MAX];
 static bool get_expanded_output_dir(State *state, char path[PATH_MAX]) {
-	while (state->output_dir && state->output_dir[0] &&
-		state->output_dir[strlen(state->output_dir) - 1] == '/') {
-		state->output_dir[strlen(state->output_dir) - 1] = 0;
+	Settings *settings = &state->settings;
+	while (settings->output_dir && settings->output_dir[0] &&
+		settings->output_dir[strlen(settings->output_dir) - 1] == '/') {
+		settings->output_dir[strlen(settings->output_dir) - 1] = 0;
 	}
-	if (!state->output_dir || !state->output_dir[0]) {
-		free(state->output_dir);
-		state->output_dir = strdup(DEFAULT_OUTPUT_DIR);
+	if (!settings->output_dir || !settings->output_dir[0]) {
+		free(settings->output_dir);
+		settings->output_dir = strdup(DEFAULT_OUTPUT_DIR);
 	}
-	if (state->output_dir[0] == '~' && state->output_dir[1] == '/') {
-		snprintf(path, PATH_MAX, "%s/%s", home_dir, &state->output_dir[2]);
+	if (settings->output_dir[0] == '~' && settings->output_dir[1] == '/') {
+		snprintf(path, PATH_MAX, "%s/%s", home_dir, &settings->output_dir[2]);
 	} else {
-		snprintf(path, PATH_MAX, "%s", state->output_dir);
+		snprintf(path, PATH_MAX, "%s", settings->output_dir);
 	}
 	return mkdir_with_parents(path);
 }
 
 static bool take_picture(State *state) {
 	static char path[PATH_MAX];
+	Settings *settings = &state->settings;
 	if (!get_expanded_output_dir(state, path))
 		return false;
 	struct tm *tm = localtime((time_t[1]){time(NULL)});
 	strftime(path + strlen(path), sizeof path - strlen(path), "/%Y-%m-%d-%H-%M-%S", tm);
-	const char *extension = state->mode == MODE_VIDEO ? "mp4" : image_format_extensions[state->image_format];
+	const char *extension = state->mode == MODE_VIDEO ? "mp4" : image_format_extensions[settings->image_format];
 	snprintf(path + strlen(path), sizeof path - strlen(path), ".%s", extension);
 	bool success = false;
 	switch (state->mode) {
 	case MODE_PICTURE:
-		switch (state->image_format) {
+		switch (settings->image_format) {
 		case IMG_FMT_JPEG:
 			success = camera_save_jpg(state->camera, path, 90);
 			break;
@@ -595,6 +614,7 @@ static bool take_picture(State *state) {
 int main(void) {
 	static State state_data;
 	State *state = &state_data;
+	Settings *settings = &state->settings;
 	SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1"); // if this program is sent a SIGTERM/SIGINT, don't turn it into a quit event
 	if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
 		fprintf(stderr, "couldn't initialize SDL\n");
@@ -932,7 +952,8 @@ void main() {\n\
 			}
 		}
 	}
-	state->output_dir = strdup(DEFAULT_OUTPUT_DIR);
+	if (!settings->output_dir)
+		settings->output_dir = strdup(DEFAULT_OUTPUT_DIR);
 	state->camera = NULL;
 	state->flash_time = -INFINITY;
 	if (arr_len(state->cameras) != 0) {
@@ -975,10 +996,11 @@ void main() {\n\
 			if (event.type == SDL_KEYDOWN) switch (event.key.keysym.sym) {
 			static char path[PATH_MAX];
 			case SDLK_v:
-				if (state->curr_menu == MENU_SET_OUTPUT_DIR && (event.key.keysym.mod & KMOD_CTRL) && state->output_dir) {
+				if (state->curr_menu == MENU_SET_OUTPUT_DIR && (event.key.keysym.mod & KMOD_CTRL) && settings->output_dir) {
 					char *text = SDL_GetClipboardText();
-					state->output_dir = realloc(state->output_dir, strlen(state->output_dir) + 2 + strlen(text));
-					strcat(state->output_dir, text);
+					settings->output_dir =
+						realloc(settings->output_dir, strlen(settings->output_dir) + 2 + strlen(text));
+					strcat(settings->output_dir, text);
 					state->menu_needs_rerendering = true;
 					SDL_free(text);
 				}
@@ -1018,7 +1040,7 @@ void main() {\n\
 				if (video_is_recording(state->video)) {
 					video_stop(state->video);
 				} else {
-					if (state->timer == 0) {
+					if (settings->timer == 0) {
 						take_picture(state);
 					} else {
 						state->timer_activate_time = get_time_double();
@@ -1026,11 +1048,11 @@ void main() {\n\
 				}
 				break;
 			case SDLK_BACKSPACE:
-				if (state->curr_menu == MENU_SET_OUTPUT_DIR && state->output_dir) {
+				if (state->curr_menu == MENU_SET_OUTPUT_DIR && settings->output_dir) {
 					if (event.key.keysym.mod & KMOD_CTRL) {
-						state->output_dir[0] = 0;
-					} else if (state->output_dir[0]) {
-						state->output_dir[strlen(state->output_dir) - 1] = 0;
+						settings->output_dir[0] = 0;
+					} else if (settings->output_dir[0]) {
+						settings->output_dir[strlen(settings->output_dir) - 1] = 0;
 					}
 					state->menu_needs_rerendering = true;
 				}
@@ -1068,7 +1090,7 @@ void main() {\n\
 				break;
 			case SDLK_LEFT:
 				if (state->curr_menu == MENU_MAIN && main_menu[state->menu_sel[MENU_MAIN]] == MENU_OPT_IMGFMT) {
-					state->image_format = state->image_format == 0 ? IMG_FMT_COUNT - 1 : state->image_format - 1;
+					settings->image_format = settings->image_format == 0 ? IMG_FMT_COUNT - 1 : settings->image_format - 1;
 					state->menu_needs_rerendering = true;
 				} else if (state->curr_menu == MENU_MAIN && main_menu[state->menu_sel[MENU_MAIN]] == MENU_OPT_TIMER) {
 					change_timer(state, -1);
@@ -1114,8 +1136,8 @@ void main() {\n\
 				}
 			}
 			if (event.type == SDL_TEXTINPUT && state->curr_menu == MENU_SET_OUTPUT_DIR) {
-				state->output_dir = realloc(state->output_dir, strlen(state->output_dir) + 2 + strlen(event.text.text));
-				strcat(state->output_dir, event.text.text);
+				settings->output_dir = realloc(settings->output_dir, strlen(settings->output_dir) + 2 + strlen(event.text.text));
+				strcat(settings->output_dir, event.text.text);
 				state->menu_needs_rerendering = true;
 			}
 			if (state->quit) goto quit;
@@ -1199,13 +1221,13 @@ void main() {\n\
 								: "None");
 						break;
 					case MENU_OPT_IMGFMT:
-						option = a_sprintf("Image format: %s", image_format_names[state->image_format]);
+						option = a_sprintf("Image format: %s", image_format_names[settings->image_format]);
 						break;
 					case MENU_OPT_SET_OUTPUT_DIR:
-						option = a_sprintf("Output directory: %s", state->output_dir);
+						option = a_sprintf("Output directory: %s", settings->output_dir);
 						break;
 					case MENU_OPT_TIMER:
-						option = a_sprintf("Timer: %ds", state->timer);
+						option = a_sprintf("Timer: %ds", settings->timer);
 						break;
 					default:
 						assert(false);
@@ -1273,9 +1295,9 @@ void main() {\n\
 						text_color, text[line]);
 				}
 			} else if (state->curr_menu == MENU_SET_OUTPUT_DIR) {
-				if (!state->output_dir)
-					state->output_dir = strdup(DEFAULT_OUTPUT_DIR);
-				SDL_Rect r = render_text_to_surface(font, menu, 5, 10 + font_size, text_color, state->output_dir);
+				if (!settings->output_dir)
+					settings->output_dir = strdup(DEFAULT_OUTPUT_DIR);
+				SDL_Rect r = render_text_to_surface(font, menu, 5, 10 + font_size, text_color, settings->output_dir);
 				if (show_cursor) {
 					SDL_Rect cursor = {
 						.x = r.x + r.w + 2,
@@ -1369,7 +1391,7 @@ void main() {\n\
 			gl.BindTexture(GL_TEXTURE_2D, no_camera_texture);
 			gl.Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
 		}
-		double timer_time_left = state->timer - (curr_time - state->timer_activate_time);
+		double timer_time_left = settings->timer - (curr_time - state->timer_activate_time);
 		if (state->timer_activate_time != 0 && timer_time_left <= 0) {
 			take_picture(state);
 			state->timer_activate_time = 0;
@@ -1507,7 +1529,8 @@ void main() {\n\
 		camera_free(*pcamera);
 	}
 	arr_free(state->cameras);
-	free(state->output_dir);
+	free(settings->output_dir);
+	arr_free(settings->camera_precedence);
 	SDL_Quit();
 	return 0;
 }
