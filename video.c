@@ -1,7 +1,7 @@
 #include "video.h"
 
 #include <stdatomic.h>
-#include <SDL_thread.h>
+#include <threads.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
 #include <pulse/pulseaudio.h>
@@ -13,6 +13,8 @@
 
 // no real harm in making this bigger, other than increased memory usage.
 #define AUDIO_QUEUE_SIZE 65536
+#define AUDIO_NOT_RECORDING (UINT32_MAX)
+#define AUDIO_QUIT (UINT32_MAX - 1)
 
 struct VideoContext {
 	double start_time;
@@ -27,20 +29,20 @@ struct VideoContext {
 	AVStream *audio_stream;
 	int64_t next_video_pts;
 	int64_t next_audio_pts;
-	SDL_Thread *audio_thread;
+	thrd_t audio_thread;
+	bool audio_thread_created;
 	bool recording;
 	// ring buffer of audio data.
 	float audio_queue[AUDIO_QUEUE_SIZE];
-	SDL_mutex *audio_mutex;
-	uint32_t audio_head;
-	uint32_t audio_tail;
-	bool audio_quit;
+	atomic_uint_fast32_t audio_head;
+	atomic_uint_fast32_t audio_tail;
 	char _unused[128]; // reduce false sharing
 };
 
+// NOTE: SDL2 pulseaudio capture is broken on some versions: https://github.com/libsdl-org/SDL/issues/9706
+//      When SDL3 is widespread enough (e.g. available on Debian stable), we can switch to that for capturing.
 static int audio_thread(void *data) {
 	VideoContext *ctx = data;
-	if (!ctx->audio_mutex) return -1;
 	pa_sample_spec audio_format = {
 		.format = PA_SAMPLE_FLOAT32NE,
 		.rate = 44100,
@@ -61,47 +63,44 @@ static int audio_thread(void *data) {
 	}
 	uint32_t warned[2] = {0};
 	bool quit = false;
+	// only this thread writes to ctx->tail, so we can have a local variable which mirrors it.
+	uint32_t tail = AUDIO_NOT_RECORDING;
 	while (!quit) {
 		float buf[1024];
-		if (pa_simple_read(pulseaudio, buf, sizeof buf, &err) >= 0) {
-			const uint32_t nfloats = sizeof buf / sizeof(float);
-			SDL_LockMutex(ctx->audio_mutex);
-			quit = ctx->audio_quit;
-			uint32_t head = ctx->audio_head;
-			uint32_t tail = ctx->audio_tail;
-			if (head == UINT32_MAX) {
-				// not recording
-				ctx->audio_tail = UINT32_MAX;
-				SDL_UnlockMutex(ctx->audio_mutex);
-				continue;
-			} else if (tail == UINT32_MAX) {
-				// reset tail now that we are recording
-				ctx->audio_tail = tail = 0;
+		int result = pa_simple_read(pulseaudio, buf, sizeof buf, &err);
+		uint32_t head = atomic_load(&ctx->audio_head);
+		if (head == AUDIO_NOT_RECORDING) {
+			// not recording
+			if (tail != AUDIO_NOT_RECORDING) {
+				tail = AUDIO_NOT_RECORDING;
+				atomic_store(&ctx->audio_tail, tail);
 			}
-			SDL_UnlockMutex(ctx->audio_mutex);
+			continue;
+		} else if (head == AUDIO_QUIT) {
+			break;
+		} else if (tail == AUDIO_NOT_RECORDING) {
+			// reset tail now that we are recording
+			tail = 0;
+		}
+		if (result >= 0) {
+			const uint32_t nfloats = sizeof buf / sizeof(float);
 			if (tail + nfloats <= AUDIO_QUEUE_SIZE) {
 				// easy case
 				memcpy(&ctx->audio_queue[tail], buf, sizeof buf);
-				SDL_LockMutex(ctx->audio_mutex);
-				ctx->audio_tail += nfloats;
-				SDL_UnlockMutex(ctx->audio_mutex);
+				tail += nfloats;
 			} else {
 				// "wrap around" case
 				memcpy(&ctx->audio_queue[tail], buf, (AUDIO_QUEUE_SIZE - tail) * sizeof(float));
 				memcpy(&ctx->audio_queue[0], &buf[AUDIO_QUEUE_SIZE - tail], (tail + nfloats - AUDIO_QUEUE_SIZE) * sizeof(float));
-				SDL_LockMutex(ctx->audio_mutex);
-				ctx->audio_tail = tail + nfloats - AUDIO_QUEUE_SIZE;
-				SDL_UnlockMutex(ctx->audio_mutex);
+				tail = tail + nfloats - AUDIO_QUEUE_SIZE;
 			}
 		} else {
 			if (!warned[1]) {
 				fprintf(stderr, "pa_simple_read: %s", pa_strerror(err));
 				warned[1]++;
 			}
-			SDL_LockMutex(ctx->audio_mutex);
-			quit = ctx->audio_quit;
-			SDL_UnlockMutex(ctx->audio_mutex);
 		}
+		atomic_store(&ctx->audio_tail, tail);
 	}
 	pa_simple_free(pulseaudio);
 	return 0;
@@ -111,10 +110,12 @@ static int audio_thread(void *data) {
 VideoContext *video_init(void) {
 	VideoContext *ctx = calloc(1, sizeof(VideoContext));
 	if (!ctx) return NULL;
-	ctx->audio_mutex = SDL_CreateMutex();
-	ctx->audio_head = UINT32_MAX;
-	if (ctx->audio_mutex) {
-		ctx->audio_thread = SDL_CreateThread(audio_thread, "camlet audio thread", ctx);
+	atomic_init(&ctx->audio_head, AUDIO_NOT_RECORDING);
+	atomic_init(&ctx->audio_tail, AUDIO_NOT_RECORDING);
+	if (thrd_create(&ctx->audio_thread, audio_thread, ctx) == thrd_success) {
+		ctx->audio_thread_created = true;
+	} else {
+		perror("couldn't create audio thread");
 	}
 	return ctx;
 }
@@ -126,11 +127,8 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 	}
 	video_stop(ctx);
 	// wait for capture thread to acknowledge that we have stopped recording
-	while (true) {
-		SDL_LockMutex(ctx->audio_mutex);
-		uint32_t tail = ctx->audio_tail;
-		SDL_UnlockMutex(ctx->audio_mutex);
-		if (tail == UINT32_MAX) break;
+	if (ctx->audio_thread_created) while (true) {
+		if (atomic_load(&ctx->audio_tail) == AUDIO_NOT_RECORDING) break;
 		usleep(1000);
 	}
 	int err = avformat_alloc_output_context2(&ctx->avf_context, NULL, NULL, filename);
@@ -188,7 +186,6 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 		fprintf(stderr, "error: av_frame_get_buffer: %s\n", av_err2str(err));
 		return false;
 	}
-	// av_dump_format(state->avf_context, 0, filename, 1);
 	err = avio_open(&ctx->avf_context->pb, filename, AVIO_FLAG_WRITE);
 	if (err < 0) {
 		fprintf(stderr, "error: avio_open: %s\n", av_err2str(err));
@@ -254,11 +251,7 @@ no_audio:
 		fprintf(stderr, "error: avformat_write_header: %s\n", av_err2str(err));
 		return false;
 	}
-	if (ctx->audio_mutex) {
-		SDL_LockMutex(ctx->audio_mutex);
-		ctx->audio_head = 0;
-		SDL_UnlockMutex(ctx->audio_mutex);
-	}
+	atomic_store(&ctx->audio_head, 0);
 	ctx->next_video_pts = 0;
 	ctx->next_audio_pts = 0;
 	ctx->recording = true;
@@ -297,60 +290,56 @@ bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 	if (!ctx || !camera || !ctx->recording) return false;
 	double curr_time = get_time_double();
 	double time_since_start = curr_time - ctx->start_time;
+	// process audio
+	if (ctx->audio_thread_created) while (true) {
+		int err = av_frame_make_writable(ctx->audio_frame);
+		if (err < 0) {
+			fprintf(stderr, "error: av_frame_make_writable: %s\n", av_err2str(err));
+			break;
+		}
+		ctx->audio_frame->pts = ctx->next_audio_pts;
+		uint32_t nfloats = (uint32_t)ctx->audio_frame_samples * 2;
+		// only this thread writes to head, so relaxed is fine.
+		uint32_t head = atomic_load_explicit(&ctx->audio_head, memory_order_relaxed);
+		uint32_t tail = atomic_load(&ctx->audio_tail);
+		bool frame_ready = false;
+		if (tail == AUDIO_NOT_RECORDING) {
+			// capture thread doesn't even know we're recording yet
+		} else if (head + nfloats < AUDIO_QUEUE_SIZE) {
+			// easy case
+			frame_ready = head + nfloats <= tail;
+			if (frame_ready) {
+				for (uint32_t s = 0; s < nfloats; s++) {
+					((float *)ctx->audio_frame->data[s % 2])[s / 2] = ctx->audio_queue[head + s];
+				}
+				head += nfloats;
+			}
+		} else {
+			// "wrap around" case
+			frame_ready = head + nfloats - AUDIO_QUEUE_SIZE <= tail && tail <= AUDIO_QUEUE_SIZE / 2;
+			if (frame_ready) {
+				for (uint32_t s = 0; s < AUDIO_QUEUE_SIZE - head; s++) {
+					((float *)ctx->audio_frame->data[s % 2])[s / 2] = ctx->audio_queue[head + s];
+				}
+				for (uint32_t s = 0; s < head + nfloats - AUDIO_QUEUE_SIZE; s++) {
+					uint32_t i = AUDIO_QUEUE_SIZE - head + s;
+					((float *)ctx->audio_frame->data[i % 2])[i / 2] = ctx->audio_queue[s];
+				}
+				head = head + nfloats - AUDIO_QUEUE_SIZE;
+			}
+		}
+		if (frame_ready) {
+			atomic_store(&ctx->audio_head, head);
+			ctx->next_audio_pts += ctx->audio_frame_samples;
+			write_frame(ctx, ctx->audio_encoder, ctx->audio_stream, ctx->audio_frame);
+		} else {
+			break;
+		}
+	}
+	// process video
 	int64_t video_pts = (int64_t)(time_since_start
 		* ctx->video_encoder->time_base.den
 		/ ctx->video_encoder->time_base.num);
-	if (ctx->audio_mutex) {
-		while (true) {
-			int err = av_frame_make_writable(ctx->audio_frame);
-			if (err < 0) {
-				fprintf(stderr, "error: av_frame_make_writable: %s\n", av_err2str(err));
-				break;
-			}
-			ctx->audio_frame->pts = ctx->next_audio_pts;
-			uint32_t nfloats = (uint32_t)ctx->audio_frame_samples * 2;
-			SDL_LockMutex(ctx->audio_mutex);
-			uint32_t head = ctx->audio_head;
-			uint32_t tail = ctx->audio_tail;
-			SDL_UnlockMutex(ctx->audio_mutex);
-			bool frame_ready = false;
-			if (tail == UINT32_MAX) {
-				// capture thread doesn't even know we're recording yet
-			} else if (head + nfloats < AUDIO_QUEUE_SIZE) {
-				// easy case
-				frame_ready = head + nfloats <= tail;
-				if (frame_ready) {
-					for (uint32_t s = 0; s < nfloats; s++) {
-						((float *)ctx->audio_frame->data[s % 2])[s / 2] = ctx->audio_queue[head + s];
-					}
-					SDL_LockMutex(ctx->audio_mutex);
-					ctx->audio_head = head + nfloats;
-					SDL_UnlockMutex(ctx->audio_mutex);
-				}
-			} else {
-				// "wrap around" case
-				frame_ready = head + nfloats - AUDIO_QUEUE_SIZE <= tail && tail <= AUDIO_QUEUE_SIZE / 2;
-				if (frame_ready) {
-					for (uint32_t s = 0; s < AUDIO_QUEUE_SIZE - head; s++) {
-						((float *)ctx->audio_frame->data[s % 2])[s / 2] = ctx->audio_queue[head + s];
-					}
-					for (uint32_t s = 0; s < head + nfloats - AUDIO_QUEUE_SIZE; s++) {
-						uint32_t i = AUDIO_QUEUE_SIZE - head + s;
-						((float *)ctx->audio_frame->data[i % 2])[i / 2] = ctx->audio_queue[s];
-					}
-					SDL_LockMutex(ctx->audio_mutex);
-					ctx->audio_head = head + nfloats - AUDIO_QUEUE_SIZE;
-					SDL_UnlockMutex(ctx->audio_mutex);
-				}
-			}
-			if (frame_ready) {
-				ctx->next_audio_pts += ctx->audio_frame_samples;
-				write_frame(ctx, ctx->audio_encoder, ctx->audio_stream, ctx->audio_frame);
-			} else {
-				break;
-			}
-		}
-	}
 	if (video_pts >= ctx->next_video_pts) {
 		int err = av_frame_make_writable(ctx->video_frame);
 		if (err < 0) {
@@ -373,11 +362,7 @@ bool video_is_recording(VideoContext *ctx) {
 void video_stop(VideoContext *ctx) {
 	if (!ctx) return;
 	if (ctx->recording) {
-		if (ctx->audio_mutex) {
-			SDL_LockMutex(ctx->audio_mutex);
-			ctx->audio_head = UINT32_MAX;
-			SDL_UnlockMutex(ctx->audio_mutex);
-		}
+		atomic_store(&ctx->audio_head, AUDIO_NOT_RECORDING);
 		ctx->recording = false;
 		// flush video encoder
 		write_frame(ctx, ctx->video_encoder, ctx->video_stream, NULL);
@@ -411,13 +396,9 @@ void video_stop(VideoContext *ctx) {
 void video_quit(VideoContext *ctx) {
 	if (!ctx) return;
 	video_stop(ctx);
-	if (ctx->audio_thread) {
-		SDL_LockMutex(ctx->audio_mutex);
-		ctx->audio_quit = true;
-		SDL_UnlockMutex(ctx->audio_mutex);
-		SDL_WaitThread(ctx->audio_thread, NULL);
+	if (ctx->audio_thread_created) {
+		atomic_store(&ctx->audio_head, AUDIO_QUIT);
+		thrd_join(ctx->audio_thread, NULL);
 	}
-	if (ctx->audio_mutex)
-		SDL_DestroyMutex(ctx->audio_mutex);
 	free(ctx);
 }
