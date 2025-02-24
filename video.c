@@ -95,7 +95,6 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 		return true;
 	}
 	video_stop(ctx);
-	// TODO: nail down codecs as H264 and AAC
 	int err = avformat_alloc_output_context2(&ctx->avf_context, NULL, NULL, filename);
 	if (!ctx->avf_context) {
 		fprintf(stderr, "error: avformat_alloc_output_context2: %s\n", av_err2str(err));

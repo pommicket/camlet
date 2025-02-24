@@ -1,6 +1,5 @@
 /*
 TODO
--video
 -adjustable camera framerate
 -save/restore settings
 -make sure file doesn't exist before writing to it
