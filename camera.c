@@ -30,6 +30,7 @@ struct Camera {
 	bool streaming;
 	int curr_frame_idx;
 	int buffer_count;
+	int framerate;
 	struct v4l2_buffer frame_buffer;
 	CameraAccessMethod access_method;
 	PictureFormat best_format;
@@ -48,6 +49,10 @@ static GlProcs gl;
 
 void camera_init(const GlProcs *procs) {
 	gl = *procs;
+}
+
+int camera_framerate(Camera *camera) {
+	return camera->framerate;
 }
 
 static int uint32_cmp_qsort(const void *av, const void *bv) {
@@ -859,9 +864,13 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, int desired_framera
 	};
 	if (v4l2_ioctl(camera->fd, VIDIOC_S_PARM, &stream_params) != 0) {
 		perror("v4l2_ioctl VIDIOC_S_PARM");
-		// even if we don't get the framerate we want, don't fail.
+		// NOTE: even if we don't get the framerate we want, don't fail, but do ensure our reported framerate is correct
+		v4l2_ioctl(camera->fd, VIDIOC_G_PARM, &stream_params);
 	}
-
+	// fuck you, fractional framerates
+	camera->framerate = stream_params.parm.capture.timeperframe.denominator /
+		stream_params.parm.capture.timeperframe.numerator;
+	
 	//printf("image size = %uB\n",format.fmt.pix.sizeimage);
 	switch (camera->access_method) {
 	case CAMERA_ACCESS_READ:

@@ -109,6 +109,7 @@ PictureFormat *camera_get_resolutions_with_pixfmt(Camera *camera, uint32_t pixfm
 uint32_t *camera_get_pixfmts(Camera *camera);
 PictureFormat camera_closest_picfmt(Camera *camera, PictureFormat picfmt);
 uint64_t camera_framerates_supported(Camera *camera);
+int camera_framerate(Camera *camera);
 int32_t camera_frame_width(Camera *camera);
 int32_t camera_frame_height(Camera *camera);
 PictureFormat camera_picture_format(Camera *camera);
