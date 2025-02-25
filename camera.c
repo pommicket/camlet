@@ -1067,10 +1067,14 @@ Hash camera_hash(Camera *camera) {
 	return camera->hash;
 }
 
-void camera_hash_str(Camera *camera, char str[HASH_SIZE * 2 + 1]) {
+void hash_to_str(Hash h, char str[HASH_STR_SIZE]) {
 	for (int i = 0; i < HASH_SIZE; i++) {
-		sprintf(&str[2*i], "%02x", camera->hash.hash[i]);
+		sprintf(&str[2*i], "%02x", h.hash[i]);
 	}
+}
+
+void camera_hash_str(Camera *camera, char str[HASH_STR_SIZE]) {
+	hash_to_str(camera->hash, str);
 }
 
 const char *camera_devnode(Camera *camera) {

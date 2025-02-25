@@ -100,6 +100,9 @@ static bool hash_eq(Hash h1, Hash h2) {
 	return memcmp(h1.hash, h2.hash, sizeof h1.hash) == 0;
 }
 
+#define HASH_STR_SIZE (2 * HASH_SIZE + 1)
+
+void hash_to_str(Hash h, char str[HASH_STR_SIZE]);
 void camera_init(const GlProcs *procs);
 bool pix_fmt_supported(uint32_t pixfmt);
 int picture_format_cmp_resolution(const PictureFormat *a, const PictureFormat *b);
@@ -128,7 +131,7 @@ void camera_close(Camera *camera);
 void cameras_from_device(const char *dev_path, const char *serial, Camera ***cameras);
 bool camera_open(Camera *camera, PictureFormat desired_format, int desired_framerate);
 Hash camera_hash(Camera *camera);
-void camera_hash_str(Camera *camera, char str[HASH_SIZE * 2 + 1]);
+void camera_hash_str(Camera *camera, char str[HASH_STR_SIZE]);
 bool camera_set_format(Camera *camera, PictureFormat picfmt, int desired_framerate, CameraAccessMethod access, bool force);
 /// Copy current frame from camera to AVFrame.
 ///

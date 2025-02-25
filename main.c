@@ -21,6 +21,7 @@ TODO
 #include "util.h"
 #include "camera.h"
 #include "video.h"
+#include "log.h"
 
 // pixel format used for convenience
 #define PIX_FMT_XXXGRAY 0x47585858
@@ -114,6 +115,9 @@ static const int timer_options[] = {0, 2, 5, 10, 15, 30};
 #endif
 
 static GlProcs gl;
+static char home_dir[PATH_MAX];
+static char config_dir[PATH_MAX];
+
 static void select_camera(State *state);
 
 static void fatal_error(PRINTF_FORMAT_STRING const char *fmt, ...) ATTRIBUTE_PRINTF(1, 2);
@@ -123,6 +127,7 @@ static void fatal_error(const char *fmt, ...) {
 	static char message[256];
 	vsnprintf(message, sizeof message, fmt, args);
 	va_end(args);
+	log_error("%s", message);
 	SDL_ShowSimpleMessageBox(SDL_MESSAGEBOX_ERROR, "camlet error", message, NULL);
 	exit(EXIT_FAILURE);
 }
@@ -623,7 +628,6 @@ static void get_cameras_from_udev_device(State *state, struct udev_device *dev) 
 	str_builder_free(&serial);
 }
 
-static char home_dir[PATH_MAX];
 static bool get_expanded_output_dir(State *state, char path[PATH_MAX]) {
 	Settings *settings = &state->settings;
 	while (settings->output_dir && settings->output_dir[0] &&
@@ -707,22 +711,8 @@ int main(void) {
 	static State state_data;
 	State *state = &state_data;
 	Settings *settings = &state->settings;
-	SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1"); // if this program is sent a SIGTERM/SIGINT, don't turn it into a quit event
-	if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
-		fprintf(stderr, "couldn't initialize SDL\n");
-		return EXIT_FAILURE;
-	}
-	if (sodium_init() < 0) {
-		fatal_error("couldn't initialize libsodium");
-	}
-	if (!FcInit()) {
-		fatal_error("couldn't initialize fontconfig");
-	}
-	#define FcFini "don't call FcFini: it's broken on certain versions of fontconfig - https://github.com/brndnmtthws/conky/pull/1755"
-	if (TTF_Init() < 0) {
-		fatal_error("couldn't initialize SDL2_ttf: %s\n", TTF_GetError());
-	}
 	{
+		// get home directory
 		const char *home = getenv("HOME");
 		if (home) {
 			snprintf(home_dir, sizeof home_dir, "%s", home);
@@ -735,6 +725,48 @@ int main(void) {
 				strcpy(home_dir, "."); // why not
 			}
 		}
+	}
+	{
+		// get config directory
+		const char *cfg = getenv("XDG_CONFIG_HOME");
+		if (cfg) {
+			snprintf(config_dir, sizeof config_dir, "%s/camlet", cfg);
+		} else {
+			snprintf(config_dir, sizeof config_dir, "%s/.config/camlet", home_dir);
+		}
+		mkdir_with_parents(config_dir);
+		// set log path
+		char *log_path = a_sprintf("%s/log.txt", config_dir);
+		struct stat statbuf = {0};
+		stat(log_path, &statbuf);
+		if (statbuf.st_size > (128l << 10)) {
+			// keep old log around and start a new one
+			char *old_log_path = a_sprintf("%s/log_old.txt", config_dir);
+			remove(old_log_path);
+			rename(log_path, old_log_path);
+			free(old_log_path);
+		}
+		if (log_path) {
+			log_init(log_path);
+		} else {
+			perror("a_sprintf");
+		}
+		free(log_path);
+	}
+	SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1"); // if this program is sent a SIGTERM/SIGINT, don't turn it into a quit event
+	if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
+		log_error("couldn't initialize SDL");
+		return EXIT_FAILURE;
+	}
+	if (sodium_init() < 0) {
+		fatal_error("couldn't initialize libsodium");
+	}
+	if (!FcInit()) {
+		fatal_error("couldn't initialize fontconfig");
+	}
+	#define FcFini "don't call FcFini: it's broken on certain versions of fontconfig - https://github.com/brndnmtthws/conky/pull/1755"
+	if (TTF_Init() < 0) {
+		fatal_error("couldn't initialize SDL2_ttf: %s", TTF_GetError());
 	}
 	char *font_path = NULL;
 	{
@@ -1037,7 +1069,7 @@ void main() {\n\
 			for (size_t i = 0; i < arr_len(state->cameras); i++) {
 				Camera *camera = state->cameras[i];
 				printf("[%zu] %s ", i, camera_name(camera));
-				char buf[HASH_SIZE * 2 + 1] = {0};
+				char buf[HASH_STR_SIZE] = {0};
 				camera_hash_str(camera, buf);
 				printf("%s", buf);
 				printf("\n");

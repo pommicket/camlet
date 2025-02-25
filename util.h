@@ -1,3 +1,6 @@
+#ifndef UTIL_H_
+#define UTIL_H_
+
 #include <stdarg.h>
 #include <stddef.h>
 #include <stdlib.h>
@@ -44,3 +47,5 @@ static uint8_t popcount64(uint64_t x) {
 	}
 	return cnt;
 }
+
+#endif
