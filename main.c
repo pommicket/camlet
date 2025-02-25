@@ -2,7 +2,6 @@
 TODO
 -adjustable camera framerate
 -save/restore settings
--make sure file doesn't exist before writing to it
 */
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -590,12 +589,31 @@ static bool get_expanded_output_dir(State *state, char path[PATH_MAX]) {
 static bool take_picture(State *state) {
 	static char path[PATH_MAX];
 	Settings *settings = &state->settings;
-	if (!get_expanded_output_dir(state, path))
-		return false;
-	struct tm *tm = localtime((time_t[1]){time(NULL)});
-	strftime(path + strlen(path), sizeof path - strlen(path), "/%Y-%m-%d-%H-%M-%S", tm);
-	const char *extension = state->mode == MODE_VIDEO ? "mp4" : image_format_extensions[settings->image_format];
-	snprintf(path + strlen(path), sizeof path - strlen(path), ".%s", extension);
+	// keep trying file names until we get one that doesn't exist yet
+	for (size_t k = 0; ; k++) {
+		if (!get_expanded_output_dir(state, path))
+			return false;
+		struct timespec ts = {0};
+		clock_gettime(CLOCK_REALTIME, &ts);
+		struct tm *tm = localtime((time_t[1]){ts.tv_sec});
+		strftime(path + strlen(path), sizeof path - strlen(path), "/%Y-%m-%d-%H-%M-%S", tm);
+		if (k > 0) {
+			// add nanoseconds as well
+			snprintf(path + strlen(path), sizeof path - strlen(path), "-%lu", (unsigned long)ts.tv_nsec);
+		}
+		const char *extension = state->mode == MODE_VIDEO ? "mp4" : image_format_extensions[settings->image_format];
+		snprintf(path + strlen(path), sizeof path - strlen(path), ".%s", extension);
+		int fd = open(path, O_EXCL | O_CREAT, 0644);
+		if (fd == -1 && errno == EEXIST) {
+			continue;
+		} else if (fd == -1) {
+			perror("can't write to picture directory");
+			return false;
+		} else {
+			close(fd);
+			break;
+		}
+	}
 	bool success = false;
 	switch (state->mode) {
 	case MODE_IMAGE:
@@ -1016,6 +1034,11 @@ void main() {\n\
 			case SDLK_v:
 				if (state->curr_menu == MENU_SET_OUTPUT_DIR && (event.key.keysym.mod & KMOD_CTRL) && settings->output_dir) {
 					char *text = SDL_GetClipboardText();
+					if (!text) break;
+					if (strlen(text) + strlen(settings->output_dir) + 40 > PATH_MAX) {
+						// too long
+						break;
+					}
 					settings->output_dir =
 						realloc(settings->output_dir, strlen(settings->output_dir) + 2 + strlen(text));
 					strcat(settings->output_dir, text);
@@ -1160,9 +1183,13 @@ void main() {\n\
 				}
 			}
 			if (event.type == SDL_TEXTINPUT && state->curr_menu == MENU_SET_OUTPUT_DIR) {
-				settings->output_dir = realloc(settings->output_dir, strlen(settings->output_dir) + 2 + strlen(event.text.text));
-				strcat(settings->output_dir, event.text.text);
-				state->menu_needs_rerendering = true;
+				if (strlen(event.text.text) + strlen(settings->output_dir) + 40 > PATH_MAX) {
+					// too long
+				} else {
+					settings->output_dir = realloc(settings->output_dir, strlen(settings->output_dir) + 2 + strlen(event.text.text));
+					strcat(settings->output_dir, event.text.text);
+					state->menu_needs_rerendering = true;
+				}
 			}
 			if (state->quit) goto quit;
 		}

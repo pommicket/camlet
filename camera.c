@@ -714,6 +714,7 @@ CameraAccessMethod camera_access_method(Camera *camera) {
 }
 
 void camera_close(Camera *camera) {
+	camera->any_frames = false;
 	free(camera->read_frame);
 	camera->read_frame = NULL;
 	free(camera->decompression_buf);
@@ -726,8 +727,10 @@ void camera_close(Camera *camera) {
 		free(camera->userp_frames[i]);
 		camera->userp_frames[i] = NULL;
 	}
-	if (camera->fd >= 0)
+	if (camera->fd >= 0) {
 		v4l2_close(camera->fd);
+		camera->fd = -1;
+	}
 }
 
 void camera_free(Camera *camera) {
@@ -773,10 +776,12 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod 
 	camera->decompression_buf = realloc(camera->decompression_buf, (size_t)3 * picfmt.width * picfmt.height);
 	if (!camera->decompression_buf) {
 		perror("realloc");
+		camera_close(camera);
 		return false;
 	}
 	if (v4l2_ioctl(camera->fd, VIDIOC_S_FMT, &format) != 0) {
 		perror("v4l2_ioctl VIDIOC_S_FMT");
+		camera_close(camera);
 		return false;
 	}
 	camera->curr_format = format;
@@ -806,10 +811,12 @@ bool camera_open(Camera *camera, PictureFormat desired_format) {
 	camera->fd = v4l2_open(camera->devnode, O_RDWR | O_CLOEXEC);
 	if (camera->fd < 0) {
 		perror("v4l2_open");
+		camera_close(camera);
 		return false;
 	}
 	if (v4l2_ioctl(camera->fd, VIDIOC_S_INPUT, &camera->input_idx) != 0) {
 		perror("v4l2_ioctl");
+		camera_close(camera);
 		return false;
 	}
 	camera_set_format(camera, desired_format, camera->access_method, true);
