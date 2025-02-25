@@ -36,6 +36,7 @@ typedef enum {
 	MENU_PIXFMT,
 	MENU_HELP,
 	MENU_SET_OUTPUT_DIR,
+	MENU_FRAMERATE,
 	MENU_COUNT
 } Menu;
 
@@ -47,6 +48,7 @@ enum {
 	MENU_OPT_IMGFMT,
 	MENU_OPT_SET_OUTPUT_DIR,
 	MENU_OPT_TIMER,
+	MENU_OPT_FRAMERATE,
 };
 // use char for MenuOption type so that we can use strlen
 typedef char MenuOption;
@@ -57,6 +59,7 @@ static const MenuOption main_menu[] = {
 	MENU_OPT_IMGFMT,
 	MENU_OPT_PIXFMT,
 	MENU_OPT_SET_OUTPUT_DIR,
+	MENU_OPT_FRAMERATE,
 	MENU_OPT_QUIT,
 	0
 };
@@ -241,6 +244,8 @@ static int menu_option_count(State *state) {
 		return n;
 		}
 		break;
+	case MENU_FRAMERATE:
+		return 1 + popcount64(camera_framerates_supported(state->camera));
 	case MENU_SET_OUTPUT_DIR: return 1;
 	case MENU_COUNT: break;
 	}
@@ -347,6 +352,19 @@ static void menu_select(State *state) {
 			state->curr_menu = MENU_SET_OUTPUT_DIR;
 			state->menu_needs_rerendering = true;
 			break;
+		case MENU_OPT_FRAMERATE: {
+			if (!state->camera) break;
+			state->curr_menu = MENU_FRAMERATE;
+			state->menu_needs_rerendering = true;
+			// set menu_sel
+			int framerate_idx = 0;
+			for (int i = 0; i < 64; i++) {
+				if (i == camera_framerate(state->camera)) break;
+				if (camera_framerates_supported(state->camera) & ((uint64_t)1 << i))
+					framerate_idx++;
+			}
+			state->menu_sel[MENU_FRAMERATE] = (framerate_idx + 1) % menu_option_count(state);
+			} break;
 		case MENU_OPT_TIMER:
 			change_timer(state, 1);
 			break;
@@ -1255,6 +1273,7 @@ void main() {\n\
 			size_t n_options = menu_option_count(state);
 			uint32_t *pixfmts = state->camera ? camera_get_pixfmts(state->camera) : NULL;
 			PictureFormat *resolutions = state->camera ? camera_get_resolutions_with_pixfmt(state->camera, camera_pixel_format(state->camera)) : NULL;
+			const uint64_t framerates = state->camera ? camera_framerates_supported(state->camera) : 0;
 			for (int opt_idx = 0; opt_idx < (int)n_options; opt_idx++) {
 				char *option = NULL;
 				switch (state->curr_menu) {
@@ -1285,6 +1304,10 @@ void main() {\n\
 					case MENU_OPT_SET_OUTPUT_DIR:
 						option = a_sprintf("Output directory: %s", settings->output_dir);
 						break;
+					case MENU_OPT_FRAMERATE:
+						option = state->camera ? a_sprintf("Frame rate: %d", camera_framerate(state->camera))
+							: strdup("Frame rate: None");
+						break;
 					case MENU_OPT_TIMER:
 						option = a_sprintf("Timer: %ds", settings->timer);
 						break;
@@ -1314,6 +1337,22 @@ void main() {\n\
 						option = a_sprintf("%s", pixfmt_to_string(pixfmts[opt_idx-1]));
 					}
 					break;
+				case MENU_FRAMERATE: {
+					if (opt_idx == 0) {
+						option = strdup("Back");
+					} else {
+						int o = opt_idx;
+						for (int i = 0; i < 64; i++) {
+							if (framerates & ((uint64_t)1<< i)) {
+								if (--o == 0) {
+									option = a_sprintf("%d", i);
+									break;
+								}
+							}
+						}
+						if (!option) option = strdup("???");
+					}
+					} break;
 				case MENU_HELP:
 				case MENU_SET_OUTPUT_DIR:
 					option = a_sprintf("Back");

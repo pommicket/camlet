@@ -35,3 +35,12 @@ static double get_time_double(void) {
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
+
+static uint8_t popcount64(uint64_t x) {
+	uint8_t cnt = 0;
+	while (x) {
+		x &= x - 1;
+		cnt++;
+	}
+	return cnt;
+}
