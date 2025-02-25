@@ -297,6 +297,7 @@ TODO: test me with a camera that supports userptr i/o
 	return true;*/
 }
 static bool camera_stop_io(Camera *camera) {
+	camera->any_frames = false;
 	if (v4l2_ioctl(camera->fd, VIDIOC_STREAMOFF,
 		(enum v4l2_buf_type[1]) { V4L2_BUF_TYPE_VIDEO_CAPTURE }) != 0) {
 		perror("v4l2_ioctl VIDIOC_STREAMOFF");
@@ -309,6 +310,11 @@ static bool camera_stop_io(Camera *camera) {
 	camera->fd = v4l2_open(camera->devnode, O_RDWR);
 	if (camera->fd < 0) {
 		perror("v4l2_open");
+		return false;
+	}
+	if (v4l2_ioctl(camera->fd, VIDIOC_S_INPUT, &camera->input_idx) != 0) {
+		perror("v4l2_ioctl");
+		camera_close(camera);
 		return false;
 	}
 	return true;
@@ -928,7 +934,7 @@ static void cameras_from_device_with_fd(const char *dev_path, const char *serial
 }
 
 void cameras_from_device(const char *dev_path, const char *serial, Camera ***cameras) {
-	int fd = v4l2_open(dev_path, O_RDWR);
+	int fd = v4l2_open(dev_path, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
 		perror("v4l2_open");
 		return;
