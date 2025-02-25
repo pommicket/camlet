@@ -321,8 +321,6 @@ static bool camera_stop_io(Camera *camera) {
 	camera->streaming = false;
 	// Just doing VIDIOC_STREAMOFF doesn't seem to be enough to prevent EBUSY.
 	//  (Even if we dequeue all buffers afterwards)
-	// Re-opening doesn't seem to be necessary for read-based access for me,
-	// but idk if that's true on all cameras.
 	v4l2_close(camera->fd);
 	camera->fd = v4l2_open(camera->devnode, O_RDWR);
 	if (camera->fd < 0) {
@@ -751,6 +749,13 @@ void camera_close(Camera *camera) {
 		camera->userp_frames[i] = NULL;
 	}
 	if (camera->fd >= 0) {
+		if (camera->streaming) {
+			if (v4l2_ioctl(camera->fd, VIDIOC_STREAMOFF,
+				(enum v4l2_buf_type[1]) { V4L2_BUF_TYPE_VIDEO_CAPTURE }) != 0) {
+				perror("v4l2_ioctl VIDIOC_STREAMOFF");
+			}
+			camera->streaming = false;
+		}
 		v4l2_close(camera->fd);
 		camera->fd = -1;
 	}
@@ -794,6 +799,9 @@ uint64_t camera_framerates_supported(Camera *camera) {
 
 bool camera_set_format(Camera *camera, PictureFormat picfmt, int desired_framerate, CameraAccessMethod access, bool force) {
 	assert(camera);
+	if (camera->fd < 0) {
+		return false;
+	}
 	if (!access) {
 		// by default, don't change access method
 		access = camera->access_method;

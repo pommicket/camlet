@@ -12,7 +12,7 @@
 #include "camera.h"
 
 // no real harm in making this bigger, other than increased memory usage.
-#define AUDIO_QUEUE_SIZE 65536
+#define AUDIO_QUEUE_SIZE ((size_t)128 << 10)
 #define AUDIO_NOT_RECORDING (UINT32_MAX)
 #define AUDIO_QUIT (UINT32_MAX - 1)
 
@@ -82,8 +82,14 @@ static int audio_thread(void *data) {
 			// reset tail now that we are recording
 			tail = 0;
 		}
-		if (result >= 0) {
+		if ((tail - head + AUDIO_QUEUE_SIZE) % AUDIO_QUEUE_SIZE > AUDIO_QUEUE_SIZE * 3 / 4) {
+			if (warned[0] < 10) {
+				fprintf(stderr, "\x1b[93mwarning:\x1b[0m audio overrun\n");
+				warned[0]++;
+			}
+		} else if (result >= 0) {
 			const uint32_t nfloats = sizeof buf / sizeof(float);
+			printf("capture: %u \n",nfloats);
 			if (tail + nfloats <= AUDIO_QUEUE_SIZE) {
 				// easy case
 				memcpy(&ctx->audio_queue[tail], buf, sizeof buf);
@@ -290,51 +296,56 @@ bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 	if (!ctx || !camera || !ctx->recording) return false;
 	double curr_time = get_time_double();
 	double time_since_start = curr_time - ctx->start_time;
-	// process audio
-	if (ctx->audio_thread_created) while (true) {
-		int err = av_frame_make_writable(ctx->audio_frame);
-		if (err < 0) {
-			fprintf(stderr, "error: av_frame_make_writable: %s\n", av_err2str(err));
-			break;
-		}
-		ctx->audio_frame->pts = ctx->next_audio_pts;
-		uint32_t nfloats = (uint32_t)ctx->audio_frame_samples * 2;
+	if (ctx->audio_thread_created) {
+		// process audio
 		// only this thread writes to head, so relaxed is fine.
 		uint32_t head = atomic_load_explicit(&ctx->audio_head, memory_order_relaxed);
 		uint32_t tail = atomic_load(&ctx->audio_tail);
-		bool frame_ready = false;
-		if (tail == AUDIO_NOT_RECORDING) {
-			// capture thread doesn't even know we're recording yet
-		} else if (head + nfloats < AUDIO_QUEUE_SIZE) {
-			// easy case
-			frame_ready = head + nfloats <= tail;
-			if (frame_ready) {
-				for (uint32_t s = 0; s < nfloats; s++) {
-					((float *)ctx->audio_frame->data[s % 2])[s / 2] = ctx->audio_queue[head + s];
-				}
-				head += nfloats;
+		printf("start recv: head=%u tail=%u\n",head,tail);
+		while (true) {
+			int err = av_frame_make_writable(ctx->audio_frame);
+			if (err < 0) {
+				fprintf(stderr, "error: av_frame_make_writable: %s\n", av_err2str(err));
+				break;
 			}
-		} else {
-			// "wrap around" case
-			frame_ready = head + nfloats - AUDIO_QUEUE_SIZE <= tail && tail <= AUDIO_QUEUE_SIZE / 2;
+			ctx->audio_frame->pts = ctx->next_audio_pts;
+			uint32_t nfloats = (uint32_t)ctx->audio_frame_samples * 2;
+			bool frame_ready = false;
+			if (tail == AUDIO_NOT_RECORDING) {
+				// capture thread doesn't even know we're recording yet
+			} else if (head + nfloats < AUDIO_QUEUE_SIZE) {
+				// easy case
+				frame_ready = head + nfloats <= tail || head > tail /* tail wrapped around */;
+				if (frame_ready) {
+					for (uint32_t s = 0; s < nfloats; s++) {
+						((float *)ctx->audio_frame->data[s % 2])[s / 2] = ctx->audio_queue[head + s];
+					}
+					head += nfloats;
+				}
+			} else {
+				// "wrap around" case
+				frame_ready = head + nfloats - AUDIO_QUEUE_SIZE <= tail && tail < head;
+				if (frame_ready) {
+					for (uint32_t s = 0; s < AUDIO_QUEUE_SIZE - head; s++) {
+						((float *)ctx->audio_frame->data[s % 2])[s / 2] = ctx->audio_queue[head + s];
+					}
+					for (uint32_t s = 0; s < head + nfloats - AUDIO_QUEUE_SIZE; s++) {
+						uint32_t i = AUDIO_QUEUE_SIZE - head + s;
+						((float *)ctx->audio_frame->data[i % 2])[i / 2] = ctx->audio_queue[s];
+					}
+					head = head + nfloats - AUDIO_QUEUE_SIZE;
+				}
+			}
 			if (frame_ready) {
-				for (uint32_t s = 0; s < AUDIO_QUEUE_SIZE - head; s++) {
-					((float *)ctx->audio_frame->data[s % 2])[s / 2] = ctx->audio_queue[head + s];
-				}
-				for (uint32_t s = 0; s < head + nfloats - AUDIO_QUEUE_SIZE; s++) {
-					uint32_t i = AUDIO_QUEUE_SIZE - head + s;
-					((float *)ctx->audio_frame->data[i % 2])[i / 2] = ctx->audio_queue[s];
-				}
-				head = head + nfloats - AUDIO_QUEUE_SIZE;
+				ctx->next_audio_pts += ctx->audio_frame_samples;
+				printf("recvd: %u\n",nfloats);
+				write_frame(ctx, ctx->audio_encoder, ctx->audio_stream, ctx->audio_frame);
+			} else {
+				printf("end recv\n");
+				break;
 			}
 		}
-		if (frame_ready) {
-			atomic_store(&ctx->audio_head, head);
-			ctx->next_audio_pts += ctx->audio_frame_samples;
-			write_frame(ctx, ctx->audio_encoder, ctx->audio_stream, ctx->audio_frame);
-		} else {
-			break;
-		}
+		atomic_store(&ctx->audio_head, head);
 	}
 	// process video
 	int64_t video_pts = (int64_t)(time_since_start

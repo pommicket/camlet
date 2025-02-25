@@ -1,6 +1,5 @@
 /*
 TODO
--figure out why audio is broken for low framerate videos
 -save/restore settings
 */
 #define _GNU_SOURCE
