@@ -251,6 +251,10 @@ uint32_t *camera_get_pixfmts(Camera *camera) {
 PictureFormat camera_closest_picfmt(Camera *camera, PictureFormat desired) {
 	PictureFormat best_format = {0};
 	int32_t best_score = INT32_MIN;
+	if (desired.pixfmt == 0) {
+		// sensible default
+		desired.pixfmt = V4L2_PIX_FMT_RGB24;
+	}
 	arr_foreach_ptr(camera->formats, const PictureFormat, fmt) {
 		int32_t score = 0;
 		if (fmt->pixfmt != desired.pixfmt) {
@@ -796,7 +800,8 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, int desired_framera
 	}
 	if (!force
 		&& camera->access_method == access
-		&& picture_format_cmp_qsort((PictureFormat[1]) { camera_picture_format(camera) }, &picfmt) == 0) {
+		&& picture_format_cmp_qsort((PictureFormat[1]) { camera_picture_format(camera) }, &picfmt) == 0
+		&& (desired_framerate == 0 || camera->framerate == desired_framerate)) {
 		// no changes needed
 		return true;
 	}

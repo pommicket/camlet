@@ -1,6 +1,6 @@
 /*
 TODO
--adjustable camera framerate
+-figure out why audio is broken for low framerate videos
 -save/restore settings
 */
 #define _GNU_SOURCE
@@ -87,6 +87,7 @@ typedef struct {
 	int32_t image_resolution[2];
 	int32_t video_resolution[2];
 	int video_framerate;
+	int image_framerate;
 	ImageFormat image_format;
 	char *output_dir;
 } Settings;
@@ -136,23 +137,31 @@ static void APIENTRY gl_message_callback(GLenum source, GLenum type, unsigned in
 }
 #endif
 
-static PictureFormat settings_desired_picture_format(State *state) {
+static PictureFormat settings_picture_format_for_camera(State *state, Camera *camera) {
 	Settings *settings = &state->settings;
-	return (PictureFormat) {
+	PictureFormat picfmt = {
 		.width = state->mode == MODE_VIDEO ? settings->video_resolution[0] : settings->image_resolution[0],
 		.height = state->mode == MODE_VIDEO ? settings->video_resolution[1] : settings->image_resolution[1],
 		.pixfmt = settings->pixel_format
 	};
-}
-
-static PictureFormat settings_picture_format_for_camera(State *state, Camera *camera) {
-	PictureFormat picfmt = settings_desired_picture_format(state);
-	return camera_closest_picfmt(camera, picfmt);
+	if (state->mode == MODE_VIDEO && (!picfmt.width || !picfmt.height)) {
+		// default for video
+		picfmt.width = 1280;
+		picfmt.height = 720;
+	}
+	if (state->mode == MODE_VIDEO)
+		picfmt.pixfmt = V4L2_PIX_FMT_YUV420;
+	picfmt = camera_closest_picfmt(camera, picfmt);
+	if (state->mode == MODE_VIDEO)
+		picfmt.pixfmt = V4L2_PIX_FMT_YUV420;
+	return picfmt;
 }
 
 static int settings_desired_framerate(State *state) {
 	Settings *settings = &state->settings;
-	return state->mode == MODE_VIDEO ? settings->video_framerate : 0;
+	// by default, aim for 30FPS for video (60FPS may be too much to handle)
+	int video_framerate = settings->video_framerate ? settings->video_framerate : 30;
+	return state->mode == MODE_VIDEO ? video_framerate : settings->image_framerate;
 }
 
 // compile a GLSL shader
@@ -435,6 +444,29 @@ static void menu_select(State *state) {
 	} else if (state->curr_menu == MENU_SET_OUTPUT_DIR) {
 		state->curr_menu = MENU_MAIN;
 		state->menu_needs_rerendering = true;
+	} else if (state->curr_menu == MENU_FRAMERATE) {
+		int sel = state->menu_sel[MENU_FRAMERATE];
+		int framerate = INT_MAX;
+		if (sel > 0) {
+			uint64_t supported = camera_framerates_supported(state->camera);
+			for (framerate = 0; framerate < 64; framerate++) {
+				if (supported & ((uint64_t)1 << framerate)) {
+					if (--sel == 0) {
+						break;
+					}
+				}
+			}
+		}
+		if (framerate < 64) {
+			PictureFormat picfmt = settings_picture_format_for_camera(state, state->camera);
+			if (state->mode == MODE_VIDEO)
+				settings->video_framerate = framerate;
+			else
+				settings->image_framerate = framerate;
+			camera_set_format(state->camera, picfmt, framerate, 0, false);
+		}
+		state->curr_menu = MENU_MAIN;
+		state->menu_needs_rerendering = true;
 	}
 }
 
@@ -659,10 +691,10 @@ static bool take_picture(State *state) {
 		break;
 	case MODE_VIDEO:
 		if (state->camera) {
-			// TODO: adjustable video quality and framerate
+			// TODO: adjustable video quality
 			success = video_start(state->video, path,
 				camera_frame_width(state->camera), camera_frame_height(state->camera),
-				30, 5);
+				camera_framerate(state->camera), 5);
 		}
 		break;
 	case MODE_COUNT:
@@ -1035,6 +1067,8 @@ void main() {\n\
 					// our special camera got disconnected ):
 					video_stop(state->video);
 					state->camera = NULL;
+					if (state->curr_menu != MENU_HELP)
+						state->curr_menu = 0;
 				}
 				for (size_t i = 0; i < arr_len(state->cameras); ) {
 					if (strcmp(camera_devnode(state->cameras[i]), devnode) == 0) {
@@ -1093,12 +1127,7 @@ void main() {\n\
 						0, false);
 					break;
 				case MODE_VIDEO: {
-					PictureFormat desired = settings_desired_picture_format(state);
-					desired.pixfmt = V4L2_PIX_FMT_YUV420;
-					// default to 720p for video
-					if (!desired.width) desired.width = 1280;
-					if (!desired.height) desired.height = 720;
-					PictureFormat picfmt = camera_closest_picfmt(state->camera, desired);
+					PictureFormat picfmt = settings_picture_format_for_camera(state, state->camera);
 					// force V4L2 to do the conversion if we have to
 					picfmt.pixfmt = V4L2_PIX_FMT_YUV420;
 					camera_set_format(state->camera, picfmt, settings_desired_framerate(state), 0, false);
