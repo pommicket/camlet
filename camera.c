@@ -11,7 +11,7 @@
 #include "3rd_party/stb_image_write.h"
 #include <jpeglib.h>
 #include <libavcodec/avcodec.h>
-#include "util.h"
+#include "log.h"
 
 #define CAMERA_MAX_BUFFERS 4
 struct Camera {
@@ -168,7 +168,7 @@ static bool camera_setup_with_read(Camera *camera) {
 	uint32_t image_size = camera->curr_format.fmt.pix.sizeimage;
 	camera->read_frame = realloc(camera->read_frame, image_size);
 	if (!camera->read_frame) {
-		perror("realloc");
+		log_perror("realloc camera->read_frame to %" PRIu32, image_size);
 		return false;
 	}
 	memset(camera->read_frame, 0, image_size);
@@ -182,7 +182,7 @@ static bool camera_setup_with_mmap(Camera *camera) {
 	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	req.memory = V4L2_MEMORY_MMAP;
 	if (v4l2_ioctl(camera->fd, VIDIOC_REQBUFS, &req) != 0) {
-		perror("v4l2_ioctl VIDIOC_REQBUFS");
+		log_perror("v4l2_ioctl VIDIOC_REQBUFS \"%s\"", camera->name);
 		return false;
 	}
 	camera->buffer_count = req.count;
@@ -192,7 +192,7 @@ static bool camera_setup_with_mmap(Camera *camera) {
 		buf.memory = V4L2_MEMORY_MMAP;
 		buf.index = i;
 		if (v4l2_ioctl(camera->fd, VIDIOC_QUERYBUF, &buf) != 0) {
-			perror("v4l2_ioctl VIDIOC_QUERYBUF");
+			log_perror("v4l2_ioctl VIDIOC_QUERYBUF \"%s\" %d", camera->name, i);
 			return false;
 		}
 		camera->mmap_size[i] = buf.length;
@@ -200,7 +200,7 @@ static bool camera_setup_with_mmap(Camera *camera) {
 			MAP_SHARED, camera->fd, buf.m.offset);
 		if (camera->mmap_frames[i] == MAP_FAILED) {
 			camera->mmap_frames[i] = NULL;
-			perror("mmap");
+			log_perror("mmap");
 			return false;
 		}
 	}
@@ -210,14 +210,14 @@ static bool camera_setup_with_mmap(Camera *camera) {
 		buf.memory = V4L2_MEMORY_MMAP;
 		buf.index = i;
 		if (v4l2_ioctl(camera->fd, VIDIOC_QBUF, &buf) != 0) {
-			perror("v4l2_ioctl VIDIOC_QBUF");
+			log_perror("v4l2_ioctl VIDIOC_QBUF \"%s\" %d", camera->name, i);
 			return false;
 		}
 	}
 	if (v4l2_ioctl(camera->fd,
 		VIDIOC_STREAMON,
 		(enum v4l2_buf_type[1]) { V4L2_BUF_TYPE_VIDEO_CAPTURE }) != 0) {
-		perror("v4l2_ioctl VIDIOC_STREAMON");
+		log_perror("v4l2_ioctl VIDIOC_STREAMON \"%s\"", camera->name);
 		return false;
 	}
 	return true;
@@ -287,7 +287,7 @@ TODO: test me with a camera that supports userptr i/o
 	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	req.memory = V4L2_MEMORY_USERPTR;
 	if (v4l2_ioctl(camera->fd, VIDIOC_REQBUFS, &req) != 0) {
-		perror("v4l2_ioctl VIDIOC_REQBUFS");
+		log_perror("v4l2_ioctl VIDIOC_REQBUFS");
 		return false;
 	}
 	for (int i = 0; i < CAMERA_MAX_BUFFERS; i++) {
@@ -299,13 +299,13 @@ TODO: test me with a camera that supports userptr i/o
 		buf.m.userptr = (unsigned long)camera->userp_frames[i];
 		buf.length = camera->curr_format.fmt.pix.sizeimage;
 		if (v4l2_ioctl(camera->fd, VIDIOC_QBUF, &buf) != 0) {
-			perror("v4l2_ioctl VIDIOC_QBUF");
+			log_perror("v4l2_ioctl VIDIOC_QBUF");
 		}
 	}
 	if (v4l2_ioctl(camera->fd,
 		VIDIOC_STREAMON,
 		(enum v4l2_buf_type[1]) { V4L2_BUF_TYPE_VIDEO_CAPTURE }) != 0) {
-		perror("v4l2_ioctl VIDIOC_STREAMON");
+		log_perror("v4l2_ioctl VIDIOC_STREAMON");
 		return false;
 	}
 	return true;*/
@@ -316,7 +316,7 @@ static bool camera_stop_io(Camera *camera) {
 	camera->any_frames = false;
 	if (v4l2_ioctl(camera->fd, VIDIOC_STREAMOFF,
 		(enum v4l2_buf_type[1]) { V4L2_BUF_TYPE_VIDEO_CAPTURE }) != 0) {
-		perror("v4l2_ioctl VIDIOC_STREAMOFF");
+		log_perror("v4l2_ioctl VIDIOC_STREAMOFF \"%s\"", camera->name);
 	}
 	camera->streaming = false;
 	// Just doing VIDIOC_STREAMOFF doesn't seem to be enough to prevent EBUSY.
@@ -324,11 +324,11 @@ static bool camera_stop_io(Camera *camera) {
 	v4l2_close(camera->fd);
 	camera->fd = v4l2_open(camera->devnode, O_RDWR);
 	if (camera->fd < 0) {
-		perror("v4l2_open");
+		log_perror("v4l2_open \"%s\"", camera->devnode);
 		return false;
 	}
 	if (v4l2_ioctl(camera->fd, VIDIOC_S_INPUT, &camera->input_idx) != 0) {
-		perror("v4l2_ioctl");
+		log_perror("v4l2_ioctl VIDIOC_S_INPUT \"%s\" %" PRIu32, camera->name, camera->input_idx);
 		camera_close(camera);
 		return false;
 	}
@@ -497,7 +497,7 @@ bool camera_save_jpg(Camera *camera, const char *name, int quality) {
 		// frame is already in jpeg format
 		FILE *fp = fopen(name, "wb");
 		if (!fp) {
-			perror("fopen");
+			log_perror("fopen \"%s\"", name);
 			return false;
 		}
 		fwrite(camera_curr_frame(camera), 1, camera->frame_bytes_set, fp);
@@ -564,10 +564,9 @@ bool camera_next_frame(Camera *camera) {
 		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 		buf.memory = memory;
 		if (v4l2_ioctl(camera->fd, VIDIOC_DQBUF, &buf) != 0) {
-			static bool printed_error;
-			if (!printed_error) {
-				perror("v4l2_ioctl VIDIOC_DQBUF");
-				printed_error = true;
+			static atomic_flag printed_error = ATOMIC_FLAG_INIT;
+			if (!atomic_flag_test_and_set(&printed_error)) {
+				log_perror("v4l2_ioctl VIDIOC_DQBUF \"%s\"", camera->name);
 			}
 			return false;
 		}
@@ -601,17 +600,19 @@ bool camera_next_frame(Camera *camera) {
 		if (!messenger.error)
 			jpeg_start_decompress(&cinfo);
 		if (!messenger.error && cinfo.output_components != 3) {
-			fprintf(stderr, "JPEG has %d components, instead of 3. That's messed up.\n",
+			log_error("JPEG has %d components, instead of 3. That's messed up.",
 				cinfo.output_components);
 			messenger.error = true;
 		}
 		if (!messenger.error && (int32_t)cinfo.output_width != frame_width) {
-			fprintf(stderr, "JPEG from camera has width %" PRId32 ", but I was expecting %" PRId32 "\n",
+			log_error("JPEG from camera has width %" PRId32 ", but I was expecting %" PRId32,
 				(int32_t)cinfo.output_width, frame_width);
+			messenger.error = true;
 		}
 		if (!messenger.error && (int32_t)cinfo.output_height != frame_height) {
-			fprintf(stderr, "JPEG from camera has height %" PRId32 ", but I was expecting %" PRId32 "\n",
+			log_error("JPEG from camera has height %" PRId32 ", but I was expecting %" PRId32,
 				(int32_t)cinfo.output_height, frame_height);
+			messenger.error = true;
 		}
 		if (!messenger.error) {
 			for (int32_t y = 0; y < frame_height; y++) {
@@ -752,7 +753,7 @@ void camera_close(Camera *camera) {
 		if (camera->streaming) {
 			if (v4l2_ioctl(camera->fd, VIDIOC_STREAMOFF,
 				(enum v4l2_buf_type[1]) { V4L2_BUF_TYPE_VIDEO_CAPTURE }) != 0) {
-				perror("v4l2_ioctl VIDIOC_STREAMOFF");
+				log_perror("v4l2_ioctl VIDIOC_STREAMOFF \"%s\"", camera->name);
 			}
 			camera->streaming = false;
 		}
@@ -839,20 +840,23 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, int desired_framera
 	format.fmt.pix.pixelformat = pixfmt;
 	format.fmt.pix.width = picfmt.width;
 	format.fmt.pix.height = picfmt.height;
-	camera->decompression_buf = realloc(camera->decompression_buf, (size_t)3 * picfmt.width * picfmt.height);
+	const size_t decompression_buf_size = (size_t)3 * picfmt.width * picfmt.height;
+	camera->decompression_buf = realloc(camera->decompression_buf, decompression_buf_size);
 	if (!camera->decompression_buf) {
-		perror("realloc");
+		log_perror("realloc camera->decompression_buf to %zu", decompression_buf_size);
 		camera_close(camera);
 		return false;
 	}
 	if (v4l2_ioctl(camera->fd, VIDIOC_S_FMT, &format) != 0) {
-		perror("v4l2_ioctl VIDIOC_S_FMT");
+		log_perror("v4l2_ioctl VIDIOC_S_FMT \"%s\" %dx%d %s", camera->name,
+			format.fmt.pix.width, format.fmt.pix.height,
+			(const char *)(const uint32_t[1]){format.fmt.pix.pixelformat});
 		camera_close(camera);
 		return false;
 	}
 	camera->curr_format = format;
 
-	uint64_t framerates_supported = camera_framerates_supported(camera);
+	const uint64_t framerates_supported = camera_framerates_supported(camera);
 	int framerate = 30;
 	if (desired_framerate) {
 		// select closest framerate to desired
@@ -876,7 +880,7 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, int desired_framera
 		.parm.capture = {.readbuffers = 4, .timeperframe = {1, (uint32_t)framerate}},
 	};
 	if (v4l2_ioctl(camera->fd, VIDIOC_S_PARM, &stream_params) != 0) {
-		perror("v4l2_ioctl VIDIOC_S_PARM");
+		log_perror("v4l2_ioctl VIDIOC_S_PARM \"%s\" framerate=%d", camera->name, framerate);
 		// NOTE: even if we don't get the framerate we want, don't fail, but do ensure our reported framerate is correct
 		v4l2_ioctl(camera->fd, VIDIOC_G_PARM, &stream_params);
 	}
@@ -917,12 +921,12 @@ bool camera_open(Camera *camera, PictureFormat desired_format, int desired_frame
 	assert(!camera->userp_frames[0]);
 	camera->fd = v4l2_open(camera->devnode, O_RDWR | O_CLOEXEC);
 	if (camera->fd < 0) {
-		perror("v4l2_open");
+		log_perror("v4l2_open \"%s\"", camera->devnode);
 		camera_close(camera);
 		return false;
 	}
 	if (v4l2_ioctl(camera->fd, VIDIOC_S_INPUT, &camera->input_idx) != 0) {
-		perror("v4l2_ioctl");
+		log_perror("v4l2_ioctl VIDIOC_S_INPUT \"%s\" %d", camera->name, camera->input_idx);
 		camera_close(camera);
 		return false;
 	}
@@ -942,7 +946,7 @@ static void cameras_from_device_with_fd(const char *dev_path, const char *serial
 		if (input.type != V4L2_INPUT_TYPE_CAMERA) continue;
 		Camera *camera = calloc(1, sizeof *camera);
 		if (!camera) {
-			perror("calloc");
+			log_perror("calloc camera (size = %zu)", sizeof *camera);
 			return;
 		}
 		camera->fd = -1;
@@ -985,7 +989,7 @@ static void cameras_from_device_with_fd(const char *dev_path, const char *serial
 				for (int i = 0; ; i++) {
 					struct v4l2_frmivalenum ival = {.index = i, .pixel_format = fmtdesc.pixelformat, .width = frame_width, .height = frame_height};
 					if (v4l2_ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &ival) != 0) {
-						if (errno != EINVAL) perror("v4l2_ioctl");
+						if (errno != EINVAL) log_perror("v4l2_ioctl VIDIOC_ENUM_FRAMEINTERVALS");
 						break;
 					}
 					// does anyone actually use continuous/stepwise? probably not.
@@ -1056,7 +1060,7 @@ static void cameras_from_device_with_fd(const char *dev_path, const char *serial
 void cameras_from_device(const char *dev_path, const char *serial, Camera ***cameras) {
 	int fd = v4l2_open(dev_path, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
-		perror("v4l2_open");
+		log_perror("v4l2_open \"%s\"", dev_path);
 		return;
 	}
 	cameras_from_device_with_fd(dev_path, serial, fd, cameras);
@@ -1092,7 +1096,7 @@ bool camera_copy_to_av_frame(Camera *camera, struct AVFrame *frame_out) {
 		|| frame_out->format != AV_PIX_FMT_YUV420P) {
 		static atomic_flag warned = ATOMIC_FLAG_INIT;
 		if (!atomic_flag_test_and_set_explicit(&warned, memory_order_relaxed)) {
-			fprintf(stderr, "%s: Bad picture format.\n", __func__);
+			log_error("%s: Bad picture format.", __func__);
 		}
 		return false;
 	}

@@ -1,6 +1,7 @@
 #include "log.h"
 #include <stdbool.h>
 #include <unistd.h>
+#include <errno.h>
 
 static FILE *log_file = NULL;
 
@@ -57,6 +58,19 @@ void log_error(const char *fmt, ...) {
 	va_start(args, fmt);
 	log_message(LOG_ERROR, fmt, args);
 	va_end(args);
+}
+
+void log_perror(const char *fmt, ...) {
+	int err = errno;
+	va_list args;
+	va_start(args, fmt);
+	char *prefix = va_sprintf(fmt, args);
+	va_end(args);
+	char error[64];
+	*error = '\0';
+	strerror_r(err, error, sizeof error);
+	log_error("%s: %s", prefix, error);
+	free(prefix);
 }
 
 void log_warning(const char *fmt, ...) {

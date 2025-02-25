@@ -8,7 +8,7 @@
 #include <pulse/simple.h>
 #include <unistd.h>
 
-#include "util.h"
+#include "log.h"
 #include "camera.h"
 
 // no real harm in making this bigger, other than increased memory usage.
@@ -58,7 +58,7 @@ static int audio_thread(void *data) {
 	pa_simple *pulseaudio = pa_simple_new(NULL, "camlet", PA_STREAM_RECORD, NULL,
 		"microphone", &audio_format, NULL, &buffer_attr, &err);
 	if (!pulseaudio) {
-		fprintf(stderr, "couldn't connect to pulseaudio: %s", pa_strerror(err));
+		log_error("couldn't connect to pulseaudio: %s", pa_strerror(err));
 		return -1;
 	}
 	uint32_t warned[2] = {0};
@@ -84,12 +84,11 @@ static int audio_thread(void *data) {
 		}
 		if ((tail - head + AUDIO_QUEUE_SIZE) % AUDIO_QUEUE_SIZE > AUDIO_QUEUE_SIZE * 3 / 4) {
 			if (warned[0] < 10) {
-				fprintf(stderr, "\x1b[93mwarning:\x1b[0m audio overrun\n");
+				log_warning("audio overrun");
 				warned[0]++;
 			}
 		} else if (result >= 0) {
 			const uint32_t nfloats = sizeof buf / sizeof(float);
-			printf("capture: %u \n",nfloats);
 			if (tail + nfloats <= AUDIO_QUEUE_SIZE) {
 				// easy case
 				memcpy(&ctx->audio_queue[tail], buf, sizeof buf);
@@ -102,7 +101,7 @@ static int audio_thread(void *data) {
 			}
 		} else {
 			if (!warned[1]) {
-				fprintf(stderr, "pa_simple_read: %s", pa_strerror(err));
+				log_error("pa_simple_read: %s", pa_strerror(err));
 				warned[1]++;
 			}
 		}
@@ -121,7 +120,7 @@ VideoContext *video_init(void) {
 	if (thrd_create(&ctx->audio_thread, audio_thread, ctx) == thrd_success) {
 		ctx->audio_thread_created = true;
 	} else {
-		perror("couldn't create audio thread");
+		log_perror("couldn't create audio thread");
 	}
 	return ctx;
 }
@@ -139,25 +138,29 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 	}
 	int err = avformat_alloc_output_context2(&ctx->avf_context, NULL, NULL, filename);
 	if (!ctx->avf_context) {
-		fprintf(stderr, "error: avformat_alloc_output_context2: %s\n", av_err2str(err));
+		log_error("avformat_alloc_output_context2 \"%s\": %s", filename, av_err2str(err));
 		return false;
 	}
 	const AVOutputFormat *fmt = ctx->avf_context->oformat;
 	const AVCodec *video_codec = avcodec_find_encoder(fmt->video_codec);
 	if (!video_codec) {
-		fprintf(stderr, "couldn't find encoder for codec %s\n", avcodec_get_name(fmt->video_codec));
+		log_error("couldn't find encoder for video codec %s", avcodec_get_name(fmt->video_codec));
 		return false;
 	}
 	ctx->video_stream = avformat_new_stream(ctx->avf_context, NULL);
+	if (!ctx->video_stream) {
+		log_error("avformat_new_stream (audio): %s", av_err2str(err));
+		return false;
+	}
 	ctx->video_stream->id = 0;
 	ctx->video_encoder = avcodec_alloc_context3(video_codec);
 	if (!ctx->video_encoder) {
-		fprintf(stderr, "couldn't create video encoding context\n");
+		log_error("couldn't create video encoding context for codec %s", avcodec_get_name(fmt->video_codec));
 		return false;
 	}
 	ctx->av_packet = av_packet_alloc();
 	if (!ctx->av_packet) {
-		fprintf(stderr, "couldn't allocate video packet\n");
+		log_error("couldn't allocate video packet");
 		return false;
 	}
 	ctx->video_encoder->codec_id = fmt->video_codec;
@@ -171,17 +174,17 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 		ctx->video_encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 	err = avcodec_open2(ctx->video_encoder, video_codec, NULL);
 	if (err < 0) {
-		fprintf(stderr, "error: avcodec_open2: %s\n", av_err2str(err));
+		log_error("avcodec_open2 for video codec %s: %s", avcodec_get_name(fmt->video_codec), av_err2str(err));
 		return false;
 	}
 	err = avcodec_parameters_from_context(ctx->video_stream->codecpar, ctx->video_encoder);
 	if (err < 0) {
-		fprintf(stderr, "error: avcodec_parameters_from_context: %s\n", av_err2str(err));
+		log_error("avcodec_parameters_from_context for video codec %s: %s", avcodec_get_name(fmt->video_codec), av_err2str(err));
 		return false;
 	}
 	ctx->video_frame = av_frame_alloc();
 	if (!ctx->video_frame) {
-		fprintf(stderr, "couldn't allocate video frame\n");
+		log_error("couldn't allocate video frame");
 		return false;
 	}
 	ctx->video_frame->format = AV_PIX_FMT_YUV420P;
@@ -189,22 +192,22 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 	ctx->video_frame->height = ctx->video_encoder->height;
 	err = av_frame_get_buffer(ctx->video_frame, 0);
 	if (err < 0) {
-		fprintf(stderr, "error: av_frame_get_buffer: %s\n", av_err2str(err));
+		log_error("av_frame_get_buffer for video: %s", av_err2str(err));
 		return false;
 	}
 	err = avio_open(&ctx->avf_context->pb, filename, AVIO_FLAG_WRITE);
 	if (err < 0) {
-		fprintf(stderr, "error: avio_open: %s\n", av_err2str(err));
+		log_error("avio_open \"%s\": %s", filename, av_err2str(err));
 		return false;
 	}
 	const AVCodec *audio_codec = avcodec_find_encoder(fmt->audio_codec);
 	if (!audio_codec) {
-		fprintf(stderr, "error: avcodec_find_encoder: %s\n", av_err2str(err));
+		log_error("avcodec_find_encoder for audio codec %s: %s", avcodec_get_name(fmt->audio_codec), av_err2str(err));
 		goto no_audio;
 	}
 	ctx->audio_encoder = avcodec_alloc_context3(audio_codec);
 	if (!ctx->audio_encoder) {
-		fprintf(stderr, "error: avcodec_alloc_context3: %s\n", av_err2str(err));
+		log_error("avcodec_alloc_context3 for audio codec %s: %s", avcodec_get_name(fmt->audio_codec), av_err2str(err));
 		goto no_audio;
 	}
 	// only FLTP is supported by AAC encoder
@@ -217,7 +220,7 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 		ctx->audio_encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
 	err = avcodec_open2(ctx->audio_encoder, audio_codec, NULL);
 	if (err < 0) {
-		fprintf(stderr, "error: couldn't set audio encoder codec (avcodec_open2): %s\n", av_err2str(err));
+		log_error("avcodec_open2 for audio codec %s: %s", avcodec_get_name(fmt->audio_codec), av_err2str(err));
 		goto no_audio;
 	}
 	ctx->audio_frame_samples = audio_codec->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE
@@ -225,7 +228,7 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 		: ctx->audio_encoder->frame_size;
 	ctx->audio_frame = av_frame_alloc();
 	if (!ctx->audio_frame) {
-		fprintf(stderr, "error: couldn't allocate audio frame\n");
+		log_error("couldn't allocate audio frame");
 		goto no_audio;
 	}
 	ctx->audio_frame->format = AV_SAMPLE_FMT_FLTP;
@@ -234,27 +237,27 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 	ctx->audio_frame->nb_samples = ctx->audio_frame_samples;
 	err = av_frame_get_buffer(ctx->audio_frame, 0);
 	if (err < 0) {
-		fprintf(stderr, "error: av_frame_get_buffer (audio): %s\n", av_err2str(err));
+		log_error("av_frame_get_buffer (audio): %s", av_err2str(err));
 		goto no_audio;
 	}
 
 	// create stream last so that if stuff above fails we don't have a broken stream in the avformat context
 	ctx->audio_stream = avformat_new_stream(ctx->avf_context, audio_codec);
 	if (!ctx->audio_stream) {
-		fprintf(stderr, "error: avformat_new_stream (audio): %s\n", av_err2str(err));
+		log_error("avformat_new_stream (audio): %s", av_err2str(err));
 		goto no_audio;
 	}
 	ctx->audio_stream->id = 1;
 	ctx->audio_stream->time_base = (AVRational){1, 44100};
 	err = avcodec_parameters_from_context(ctx->audio_stream->codecpar, ctx->audio_encoder);
 	if (err < 0) {
-		fprintf(stderr, "error: avcodec_parameters_from_context (audio): %s\n", av_err2str(err));
+		log_error("avcodec_parameters_from_context (audio): %s", av_err2str(err));
 		goto no_audio;
 	}
 no_audio:
 	err = avformat_write_header(ctx->avf_context, NULL);
 	if (err < 0) {
-		fprintf(stderr, "error: avformat_write_header: %s\n", av_err2str(err));
+		log_error("avformat_write_header: %s", av_err2str(err));
 		return false;
 	}
 	atomic_store(&ctx->audio_head, 0);
@@ -269,7 +272,7 @@ no_audio:
 static bool write_frame(VideoContext *ctx, AVCodecContext *encoder, AVStream *stream, AVFrame *frame) {
 	int err = avcodec_send_frame(encoder, frame);
 	if (err < 0) {
-		fprintf(stderr, "error: avcodec_send_frame: %s\n", av_err2str(err));
+		log_error("avcodec_send_frame (stream %d): %s", stream->index, av_err2str(err));
 		return false;
 	}
 	while (true) {
@@ -278,14 +281,14 @@ static bool write_frame(VideoContext *ctx, AVCodecContext *encoder, AVStream *st
 			break;
 		}
 		if (err < 0) {
-			fprintf(stderr, "error: avcodec_receive_packet: %s\n", av_err2str(err));
+			log_error("avcodec_receive_packet (stream %d): %s", stream->index, av_err2str(err));
 			return false;
 		}
 		ctx->av_packet->stream_index = stream->index;
 		av_packet_rescale_ts(ctx->av_packet, encoder->time_base, stream->time_base);
 		err = av_interleaved_write_frame(ctx->avf_context, ctx->av_packet);
 		if (err < 0) {
-			fprintf(stderr, "error: av_interleaved_write_frame: %s\n", av_err2str(err));
+			log_error("av_interleaved_write_frame (stream %d): %s", stream->index, av_err2str(err));
 			return false;
 		}
 	}
@@ -301,11 +304,10 @@ bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 		// only this thread writes to head, so relaxed is fine.
 		uint32_t head = atomic_load_explicit(&ctx->audio_head, memory_order_relaxed);
 		uint32_t tail = atomic_load(&ctx->audio_tail);
-		printf("start recv: head=%u tail=%u\n",head,tail);
 		while (true) {
 			int err = av_frame_make_writable(ctx->audio_frame);
 			if (err < 0) {
-				fprintf(stderr, "error: av_frame_make_writable: %s\n", av_err2str(err));
+				log_error("av_frame_make_writable (video): %s", av_err2str(err));
 				break;
 			}
 			ctx->audio_frame->pts = ctx->next_audio_pts;
@@ -338,10 +340,8 @@ bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 			}
 			if (frame_ready) {
 				ctx->next_audio_pts += ctx->audio_frame_samples;
-				printf("recvd: %u\n",nfloats);
 				write_frame(ctx, ctx->audio_encoder, ctx->audio_stream, ctx->audio_frame);
 			} else {
-				printf("end recv\n");
 				break;
 			}
 		}
@@ -354,7 +354,7 @@ bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 	if (video_pts >= ctx->next_video_pts) {
 		int err = av_frame_make_writable(ctx->video_frame);
 		if (err < 0) {
-			fprintf(stderr, "error: av_frame_make_writable: %s\n", av_err2str(err));
+			log_error("av_frame_make_writable (audio): %s", av_err2str(err));
 			return false;
 		}
 		ctx->video_frame->pts = video_pts;
@@ -381,7 +381,7 @@ void video_stop(VideoContext *ctx) {
 		write_frame(ctx, ctx->audio_encoder, ctx->audio_stream, NULL);
 		int err = av_write_trailer(ctx->avf_context);
 		if (err < 0) {
-			fprintf(stderr, "error: av_write_trailer: %s\n", av_err2str(err));
+			log_error("av_write_trailer: %s", av_err2str(err));
 		}
 		avio_closep(&ctx->avf_context->pb);
 	}
@@ -409,7 +409,9 @@ void video_quit(VideoContext *ctx) {
 	video_stop(ctx);
 	if (ctx->audio_thread_created) {
 		atomic_store(&ctx->audio_head, AUDIO_QUIT);
-		thrd_join(ctx->audio_thread, NULL);
+		if (thrd_join(ctx->audio_thread, NULL) != thrd_success) {
+			log_perror("thrd_join");
+		}
 	}
 	free(ctx);
 }

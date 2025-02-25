@@ -563,7 +563,7 @@ static bool mkdir_with_parents(const char *path) {
 			return mkdir_with_parents(path);
 		}
 		if (errno != ENOENT) {
-			perror("mkdir");
+			log_perror("mkdir");
 			free(buf);
 			return false;
 		}
@@ -667,7 +667,7 @@ static bool take_picture(State *state) {
 		if (fd == -1 && errno == EEXIST) {
 			continue;
 		} else if (fd == -1) {
-			perror("can't write to picture directory");
+			log_perror("can't write to picture directory");
 			return false;
 		} else {
 			close(fd);
@@ -1039,7 +1039,7 @@ void main() {\n\
 	// subsystems don't seem to be set for "remove" events, so we shouldn't do this:
 	//    udev_monitor_filter_add_match_subsystem_devtype(udev_monitor, "video4linux", NULL);
 	if (!udev_monitor) {
-		perror("udev_monitor_new_from_netlink");
+		log_perror("udev_monitor_new_from_netlink");
 	}
 	if (udev_monitor) {
 		// set udev monitor to nonblocking
@@ -1047,7 +1047,7 @@ void main() {\n\
 		int flags = fcntl(fd, F_GETFL);
 		flags |= O_NONBLOCK | O_CLOEXEC;
 		if (fcntl(fd, F_SETFL, flags) != 0) {
-			perror("fcntl");
+			log_perror("fcntl");
 		}
 		// enable monitor
 		udev_monitor_enable_receiving(udev_monitor);
@@ -1547,6 +1547,10 @@ void main() {\n\
 		} else {
 			gl.ActiveTexture(GL_TEXTURE0);
 			gl.BindTexture(GL_TEXTURE_2D, no_camera_texture);
+			gl.ActiveTexture(GL_TEXTURE1);
+			gl.BindTexture(GL_TEXTURE_2D, black_texture);
+			gl.ActiveTexture(GL_TEXTURE2);
+			gl.BindTexture(GL_TEXTURE_2D, black_texture);
 			gl.Uniform1i(u_pixel_format, V4L2_PIX_FMT_RGB24);
 		}
 		double timer_time_left = settings->timer - (curr_time - state->timer_activate_time);
