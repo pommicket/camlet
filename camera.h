@@ -108,6 +108,7 @@ const char *pixfmt_to_string(uint32_t pixfmt);
 PictureFormat *camera_get_resolutions_with_pixfmt(Camera *camera, uint32_t pixfmt);
 uint32_t *camera_get_pixfmts(Camera *camera);
 PictureFormat camera_closest_picfmt(Camera *camera, PictureFormat picfmt);
+uint64_t camera_framerates_supported(Camera *camera);
 int32_t camera_frame_width(Camera *camera);
 int32_t camera_frame_height(Camera *camera);
 PictureFormat camera_picture_format(Camera *camera);
@@ -124,10 +125,10 @@ uint32_t camera_pixel_format(Camera *camera);
 CameraAccessMethod camera_access_method(Camera *camera);
 void camera_close(Camera *camera);
 void cameras_from_device(const char *dev_path, const char *serial, Camera ***cameras);
-bool camera_open(Camera *camera, PictureFormat desired_format);
+bool camera_open(Camera *camera, PictureFormat desired_format, int desired_framerate);
 Hash camera_hash(Camera *camera);
 void camera_hash_str(Camera *camera, char str[HASH_SIZE * 2 + 1]);
-bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod access, bool force);
+bool camera_set_format(Camera *camera, PictureFormat picfmt, int desired_framerate, CameraAccessMethod access, bool force);
 /// Copy current frame from camera to AVFrame.
 ///
 /// Returns `true` on success. Currently only works if both the camera and the AVFrame are in the YUV420 format.

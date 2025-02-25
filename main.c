@@ -83,6 +83,7 @@ typedef struct {
 	int timer;
 	int32_t image_resolution[2];
 	int32_t video_resolution[2];
+	int video_framerate;
 	ImageFormat image_format;
 	char *output_dir;
 } Settings;
@@ -141,10 +142,14 @@ static PictureFormat settings_desired_picture_format(State *state) {
 	};
 }
 
-
 static PictureFormat settings_picture_format_for_camera(State *state, Camera *camera) {
 	PictureFormat picfmt = settings_desired_picture_format(state);
 	return camera_closest_picfmt(camera, picfmt);
+}
+
+static int settings_desired_framerate(State *state) {
+	Settings *settings = &state->settings;
+	return state->mode == MODE_VIDEO ? settings->video_framerate : 0;
 }
 
 // compile a GLSL shader
@@ -364,7 +369,8 @@ static void menu_select(State *state) {
 		}
 		camera_set_format(state->camera,
 			resolution,
-			camera_access_method(state->camera),
+			settings_desired_framerate(state),
+			0,
 			false);
 		arr_free(resolutions);
 	} else if (state->curr_menu == MENU_INPUT) {
@@ -382,7 +388,7 @@ static void menu_select(State *state) {
 			camera_close(state->camera);
 			state->camera = new_camera;
 			PictureFormat picfmt = settings_picture_format_for_camera(state, state->camera);
-			if (camera_open(state->camera, picfmt)) {
+			if (camera_open(state->camera, picfmt, settings_desired_framerate(state))) {
 				// put at highest precedence
 				move_to_highest_precedence(&state->settings, state->camera);
 			} else {
@@ -403,7 +409,8 @@ static void menu_select(State *state) {
 		arr_free(pixfmts);
 		camera_set_format(state->camera,
 			new_picfmt,
-			camera_access_method(state->camera),
+			settings_desired_framerate(state),
+			0,
 			false);
 	} else if (state->curr_menu == MENU_HELP) {
 		state->curr_menu = 0;
@@ -449,7 +456,7 @@ static void select_camera(State *state) {
 			}
 			state->camera = state->cameras[camera_idx];
 		}
-		if (camera_open(state->camera, settings_picture_format_for_camera(state, state->camera))) {
+		if (camera_open(state->camera, settings_picture_format_for_camera(state, state->camera), settings_desired_framerate(state))) {
 			bool already_there = false;
 			arr_foreach_ptr(settings->camera_precedence, Hash, h) {
 				if (hash_eq(*h, camera_hash(state->camera))) {
@@ -1064,7 +1071,8 @@ void main() {\n\
 				case MODE_IMAGE:
 					camera_set_format(state->camera,
 						settings_picture_format_for_camera(state, state->camera),
-						camera_access_method(state->camera), false);
+						settings_desired_framerate(state),
+						0, false);
 					break;
 				case MODE_VIDEO: {
 					PictureFormat desired = settings_desired_picture_format(state);
@@ -1075,7 +1083,7 @@ void main() {\n\
 					PictureFormat picfmt = camera_closest_picfmt(state->camera, desired);
 					// force V4L2 to do the conversion if we have to
 					picfmt.pixfmt = V4L2_PIX_FMT_YUV420;
-					camera_set_format(state->camera, picfmt, camera_access_method(state->camera), false);
+					camera_set_format(state->camera, picfmt, settings_desired_framerate(state), 0, false);
 					} break;
 				case MODE_COUNT:
 					assert(false);

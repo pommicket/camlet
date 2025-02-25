@@ -27,12 +27,15 @@ struct Camera {
 	// this can be variable for compressed formats, and doesn't match v4l2_format sizeimage for grayscale for example
 	size_t frame_bytes_set;
 	bool any_frames;
+	bool streaming;
 	int curr_frame_idx;
 	int buffer_count;
 	struct v4l2_buffer frame_buffer;
 	CameraAccessMethod access_method;
 	PictureFormat best_format;
 	PictureFormat *formats;
+	// [i] = bitmask of frame rates supported for formats[i]
+	uint64_t *framerates_supported;
 	size_t mmap_size[CAMERA_MAX_BUFFERS];
 	uint8_t *mmap_frames[CAMERA_MAX_BUFFERS];
 	uint8_t *userp_frames[CAMERA_MAX_BUFFERS];
@@ -167,6 +170,7 @@ static bool camera_setup_with_read(Camera *camera) {
 	return camera->read_frame != NULL;
 }
 static bool camera_setup_with_mmap(Camera *camera) {
+	camera->streaming = true;
 	camera->access_method = CAMERA_ACCESS_MMAP;
 	struct v4l2_requestbuffers req = {0};
 	req.count = CAMERA_MAX_BUFFERS;
@@ -269,6 +273,7 @@ static bool camera_setup_with_userp(Camera *camera) {
 /*
 TODO: test me with a camera that supports userptr i/o
 	struct v4l2_requestbuffers req = {0};
+	camera->streaming = true;
 	req.count = CAMERA_MAX_BUFFERS;
 	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	req.memory = V4L2_MEMORY_USERPTR;
@@ -297,11 +302,14 @@ TODO: test me with a camera that supports userptr i/o
 	return true;*/
 }
 static bool camera_stop_io(Camera *camera) {
+	if (!camera->streaming)
+		return true;
 	camera->any_frames = false;
 	if (v4l2_ioctl(camera->fd, VIDIOC_STREAMOFF,
 		(enum v4l2_buf_type[1]) { V4L2_BUF_TYPE_VIDEO_CAPTURE }) != 0) {
 		perror("v4l2_ioctl VIDIOC_STREAMOFF");
 	}
+	camera->streaming = false;
 	// Just doing VIDIOC_STREAMOFF doesn't seem to be enough to prevent EBUSY.
 	//  (Even if we dequeue all buffers afterwards)
 	// Re-opening doesn't seem to be necessary for read-based access for me,
@@ -743,10 +751,44 @@ void camera_free(Camera *camera) {
 	camera_close(camera);
 	free(camera->devnode);
 	free(camera->name);
+	arr_free(camera->framerates_supported);
 	free(camera);
 }
 
-bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod access, bool force) {
+uint64_t camera_framerates_supported(Camera *camera) {
+	ptrdiff_t format_idx = -1;
+	PictureFormat curr_pic_fmt = camera_picture_format(camera);
+	arr_foreach_ptr(camera->formats, PictureFormat, fmt) {
+		if (picture_format_cmp_qsort(fmt, &curr_pic_fmt) == 0) {
+			format_idx = fmt - camera->formats;
+			break;
+		}
+	}
+	if (format_idx >= 0) {
+		return camera->framerates_supported[format_idx];
+	}
+	// we can get here if we're letting V4L2 do the pixel format conversion for us
+	// take the AND of the supported framerates for all picture formats with this resolution.
+	uint64_t mask = UINT64_MAX;
+	arr_foreach_ptr(camera->formats, PictureFormat, fmt) {
+		if (picture_format_cmp_resolution(fmt, &curr_pic_fmt) == 0) {
+			mask &= camera->framerates_supported[fmt - camera->formats];
+		}
+	}
+	if (mask == 0 || mask == UINT64_MAX) {
+		// uhh let's hope 30FPS is supported.
+		return (uint64_t)1 << 30;
+	} else {
+		return mask;
+	}
+}
+
+bool camera_set_format(Camera *camera, PictureFormat picfmt, int desired_framerate, CameraAccessMethod access, bool force) {
+	assert(camera);
+	if (!access) {
+		// by default, don't change access method
+		access = camera->access_method;
+	}
 	if (!force
 		&& camera->access_method == access
 		&& picture_format_cmp_qsort((PictureFormat[1]) { camera_picture_format(camera) }, &picfmt) == 0) {
@@ -791,14 +833,51 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod 
 		return false;
 	}
 	camera->curr_format = format;
+
+	uint64_t framerates_supported = camera_framerates_supported(camera);
+	int framerate = 30;
+	if (desired_framerate) {
+		// select closest framerate to desired
+		for (int f = 63; f >= 0; f--) {
+			if (!(framerates_supported & ((uint64_t)1 << f))) continue;
+			if (abs(f - desired_framerate) < abs(framerate - desired_framerate)) {
+				framerate = f;
+			}
+		}
+	} else {
+		// select highest framerate
+		for (int f = 63; f >= 0; f--) {
+			if (framerates_supported & ((uint64_t)1 << f)) {
+				framerate = f;
+				break;
+			}
+		}
+	}
+	struct v4l2_streamparm stream_params = {
+		.type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+		.parm.capture = {.readbuffers = 4, .timeperframe = {1, (uint32_t)framerate}},
+	};
+	if (v4l2_ioctl(camera->fd, VIDIOC_S_PARM, &stream_params) != 0) {
+		perror("v4l2_ioctl VIDIOC_S_PARM");
+		// even if we don't get the framerate we want, don't fail.
+	}
+
 	//printf("image size = %uB\n",format.fmt.pix.sizeimage);
 	switch (camera->access_method) {
 	case CAMERA_ACCESS_READ:
 		return camera_setup_with_read(camera);
 	case CAMERA_ACCESS_MMAP:
-		return camera_setup_with_mmap(camera);
+		if (camera_setup_with_mmap(camera))
+			return true;
+		camera_stop_io(camera);
+		// try read instead
+		return camera_setup_with_read(camera);
 	case CAMERA_ACCESS_USERP:
-		return camera_setup_with_userp(camera);
+		if (camera_setup_with_userp(camera))
+			return true;
+		camera_stop_io(camera);
+		// try read instead
+		return camera_setup_with_read(camera);
 	default:
 		#if DEBUG
 		assert(false);
@@ -807,9 +886,9 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, CameraAccessMethod 
 	}
 }
 
-bool camera_open(Camera *camera, PictureFormat desired_format) {
+bool camera_open(Camera *camera, PictureFormat desired_format, int desired_framerate) {
 	if (!camera->access_method)
-		camera->access_method = CAMERA_ACCESS_MMAP;
+		camera->access_method = CAMERA_ACCESS_MMAP; // by default
 	// camera should not already be open
 	assert(!camera->read_frame);
 	assert(!camera->mmap_frames[0]);
@@ -825,7 +904,7 @@ bool camera_open(Camera *camera, PictureFormat desired_format) {
 		camera_close(camera);
 		return false;
 	}
-	camera_set_format(camera, desired_format, camera->access_method, true);
+	camera_set_format(camera, desired_format, desired_framerate, camera->access_method, true);
 	return true;
 }
 
@@ -880,6 +959,25 @@ static void cameras_from_device_with_fd(const char *dev_path, const char *serial
 					.height = frame_height,
 					.pixfmt = fmtdesc.pixelformat,
 				}));
+				uint64_t framerates_supported = 0;
+				for (int i = 0; ; i++) {
+					struct v4l2_frmivalenum ival = {.index = i, .pixel_format = fmtdesc.pixelformat, .width = frame_width, .height = frame_height};
+					if (v4l2_ioctl(fd, VIDIOC_ENUM_FRAMEINTERVALS, &ival) != 0) {
+						if (errno != EINVAL) perror("v4l2_ioctl");
+						break;
+					}
+					// does anyone actually use continuous/stepwise? probably not.
+					struct v4l2_fract frmival = ival.type == V4L2_FRMIVAL_TYPE_DISCRETE ? ival.discrete : ival.stepwise.max;
+					if (frmival.numerator == 1 && frmival.denominator < 8*sizeof(framerates_supported)) {
+						framerates_supported |= (uint64_t)1 << frmival.denominator;
+					}
+				}
+				if (!framerates_supported) {
+					// assume 30FPS works
+					framerates_supported |= (uint64_t)1 << 30;
+				}
+				arr_add(camera->framerates_supported, framerates_supported);
+				
 			}
 		}
 		if (arr_len(camera->formats) == 0) {
