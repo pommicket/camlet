@@ -1077,6 +1077,21 @@ void hash_to_str(Hash h, char str[HASH_STR_SIZE]) {
 	}
 }
 
+bool hash_from_str(Hash *hash, const char *str) {
+	if (strlen(str) != 2 * HASH_SIZE) {
+		return false;
+	}
+	for (int i = 0; i < HASH_SIZE; i++) {
+		char n[3] = {str[2 * i], str[2 * i + 1], 0}, *endp = NULL;
+		long byte = strtol(n, &endp, 16);
+		if (byte < 0 || byte >= 256) {
+			return false;
+		}
+		hash->hash[i] = (uint8_t)byte;
+	}
+	return true;
+}
+
 void camera_hash_str(Camera *camera, char str[HASH_STR_SIZE]) {
 	hash_to_str(camera->hash, str);
 }

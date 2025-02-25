@@ -1,7 +1,3 @@
-/*
-TODO
--save/restore settings
-*/
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -106,6 +102,8 @@ typedef struct {
 	Camera **cameras;
 	SDL_Rect *menu_option_rects;
 	Settings settings;
+	char home_dir[PATH_MAX];
+	char config_dir[PATH_MAX];
 } State;
 
 static const int timer_options[] = {0, 2, 5, 10, 15, 30};
@@ -115,8 +113,6 @@ static const int timer_options[] = {0, 2, 5, 10, 15, 30};
 #endif
 
 static GlProcs gl;
-static char home_dir[PATH_MAX];
-static char config_dir[PATH_MAX];
 
 static void select_camera(State *state);
 
@@ -140,6 +136,135 @@ static void APIENTRY gl_message_callback(GLenum source, GLenum type, unsigned in
 	printf("Message from OpenGL: %s.\n", message);
 }
 #endif
+
+static void settings_save(State *state) {
+	Settings *settings = &state->settings;
+	char *tmp_settings_path = a_sprintf("%s/settings.txt.tmp", state->config_dir);
+	char *settings_path = a_sprintf("%s/settings.txt", state->config_dir);
+	FILE *settings_file = fopen(tmp_settings_path, "w");
+	if (settings_file) {
+		arr_foreach_ptr(settings->camera_precedence, const Hash, h) {
+			char hash_str[HASH_STR_SIZE];
+			hash_to_str(*h, hash_str);
+			fprintf(settings_file, "camera %s\n", hash_str);
+		}
+		if (settings->pixel_format)
+			fprintf(settings_file, "pixel_format %#" PRIx32 "\n", settings->pixel_format);
+		fprintf(settings_file, "timer %d\n", settings->timer);
+		if (settings->image_resolution[0]) {
+			fprintf(settings_file, "image_resolution %" PRId32 " %" PRId32 "\n",
+				settings->image_resolution[0], settings->image_resolution[1]);
+		}
+		if (settings->video_resolution[0]) {
+			fprintf(settings_file, "video_resolution %" PRId32 " %" PRId32 "\n",
+				settings->video_resolution[0], settings->video_resolution[1]);
+		}
+		if (settings->image_framerate)
+			fprintf(settings_file, "image_framerate %d\n", settings->image_framerate);
+		if (settings->video_framerate)
+			fprintf(settings_file, "video_framerate %d\n", settings->video_framerate);
+		fprintf(settings_file, "image_format %s\n", image_format_extensions[settings->image_format]);
+		fprintf(settings_file, "output_dir %s\n", settings->output_dir);
+		fclose(settings_file);
+		rename(tmp_settings_path, settings_path);
+	} else {
+		log_perror("couldn't open %s", tmp_settings_path);
+	}
+	free(tmp_settings_path);
+	free(settings_path);
+}
+
+static void settings_load(State *state) {
+	Settings *settings = &state->settings;
+	char *settings_path = a_sprintf("%s/settings.txt", state->config_dir);
+	FILE *settings_file = fopen(settings_path, "r");
+	if (settings_file) {
+		static char line[PATH_MAX + 256];
+		while (fgets(line, sizeof line, settings_file)) {
+			line[strcspn(line, "\r\n")] = '\0';
+			if (!line[0] || line[0] == '#') continue;
+			char command[32];
+			size_t command_len = strcspn(line, " ");
+			if (command_len >= sizeof command) {
+				log_error("bad command in settings line: %s", line);
+				continue;
+			}
+			memcpy(command, line, command_len);
+			command[command_len] = '\0';
+			const char *args = line[command_len] == ' ' ? line + command_len + 1 : "";
+			if (strcmp(command, "camera") == 0) {
+				Hash hash;
+				if (hash_from_str(&hash, args)) {
+					arr_add(settings->camera_precedence, hash);
+				}
+			} else if (strcmp(command, "pixel_format") == 0) {
+				settings->pixel_format = strtol(args, NULL, 0);
+			} else if (strcmp(command, "timer") == 0) {
+				int timer = atoi(args);
+				if (timer < 0 || timer > 10000) {
+					log_error("Bad timer value in settings file: %d", timer);
+					continue;
+				}
+				settings->timer = timer;
+			} else if (strcmp(command, "image_resolution") == 0) {
+				char *endp = NULL;
+				long w = strtol(args, &endp, 0);
+				long h = endp ? strtol(endp, NULL, 0) : 0;
+				if (w <= 0 || h <= 0 || w > 100000 || h > 100000) {
+					log_error("Bad resolution in settings file: %ldx%ld", w, h);
+					continue;
+				}
+				settings->image_resolution[0] = w;
+				settings->image_resolution[1] = h;
+			} else if (strcmp(command, "video_resolution") == 0) {
+				char *endp = NULL;
+				long w = strtol(args, &endp, 0);
+				long h = endp ? strtol(endp, NULL, 0) : 0;
+				if (w <= 0 || h <= 0 || w > 100000 || h > 100000) {
+					log_error("Bad resolution in settings file: %ldx%ld", w, h);
+					continue;
+				}
+				settings->video_resolution[0] = w;
+				settings->video_resolution[1] = h;
+			} else if (strcmp(command, "image_framerate") == 0) {
+				int framerate = atoi(args);
+				if (framerate < 0 || framerate >= 64) {
+					log_error("Bad framerate in settings file: %d", framerate);
+					continue;
+				}
+				settings->image_framerate = framerate;
+			} else if (strcmp(command, "video_framerate") == 0) {
+				int framerate = atoi(args);
+				if (framerate < 0 || framerate >= 64) {
+					log_error("Bad timer value in settings file: %d", framerate);
+					continue;
+				}
+				settings->video_framerate = framerate;
+			} else if (strcmp(command, "image_format") == 0) {
+				bool found = false;
+				for (int i = 0; i < IMG_FMT_COUNT; i++) {
+					if (image_format_extensions[i] && strcmp(image_format_extensions[i], args) == 0) {
+						found = true;
+						settings->image_format = i;
+						break;
+					}
+				}
+				if (!found)
+					log_warning("Unknown image format '%s' in settings file. Defaulting to jpeg.", args);
+			} else if (strcmp(command, "output_dir") == 0) {
+				settings->output_dir = strdup(args);
+			}
+		}
+		fclose(settings_file);
+	} else {
+		if (errno != ENOENT) {
+			log_perror("couldn't open %s", settings_path);
+		}
+		// ok, default settings
+		settings->output_dir = strdup(DEFAULT_OUTPUT_DIR);
+	}
+	free(settings_path);
+}
 
 static PictureFormat settings_picture_format_for_camera(State *state, Camera *camera) {
 	Settings *settings = &state->settings;
@@ -639,7 +764,7 @@ static bool get_expanded_output_dir(State *state, char path[PATH_MAX]) {
 		settings->output_dir = strdup(DEFAULT_OUTPUT_DIR);
 	}
 	if (settings->output_dir[0] == '~' && settings->output_dir[1] == '/') {
-		snprintf(path, PATH_MAX, "%s/%s", home_dir, &settings->output_dir[2]);
+		snprintf(path, PATH_MAX, "%s/%s", state->home_dir, &settings->output_dir[2]);
 	} else {
 		snprintf(path, PATH_MAX, "%s", settings->output_dir);
 	}
@@ -708,21 +833,21 @@ static bool take_picture(State *state) {
 }
 
 int main(void) {
-	static State state_data;
+	static State state_data = {0};
 	State *state = &state_data;
 	Settings *settings = &state->settings;
 	{
 		// get home directory
 		const char *home = getenv("HOME");
 		if (home) {
-			snprintf(home_dir, sizeof home_dir, "%s", home);
+			snprintf(state->home_dir, sizeof state->home_dir, "%s", home);
 		} else {
 			struct passwd *pwd = getpwuid(getuid());
 			if (pwd) {
-				snprintf(home_dir, sizeof home_dir, "%s", pwd->pw_dir);
+				snprintf(state->home_dir, sizeof state->home_dir, "%s", pwd->pw_dir);
 			} else {
 				perror("getpwuid");
-				strcpy(home_dir, "."); // why not
+				strcpy(state->home_dir, "."); // why not
 			}
 		}
 	}
@@ -730,18 +855,18 @@ int main(void) {
 		// get config directory
 		const char *cfg = getenv("XDG_CONFIG_HOME");
 		if (cfg) {
-			snprintf(config_dir, sizeof config_dir, "%s/camlet", cfg);
+			snprintf(state->config_dir, sizeof state->config_dir, "%s/camlet", cfg);
 		} else {
-			snprintf(config_dir, sizeof config_dir, "%s/.config/camlet", home_dir);
+			snprintf(state->config_dir, sizeof state->config_dir, "%s/.config/camlet", state->home_dir);
 		}
-		mkdir_with_parents(config_dir);
+		mkdir_with_parents(state->config_dir);
 		// set log path
-		char *log_path = a_sprintf("%s/log.txt", config_dir);
+		char *log_path = a_sprintf("%s/log.txt", state->config_dir);
 		struct stat statbuf = {0};
 		stat(log_path, &statbuf);
 		if (statbuf.st_size > (128l << 10)) {
 			// keep old log around and start a new one
-			char *old_log_path = a_sprintf("%s/log_old.txt", config_dir);
+			char *old_log_path = a_sprintf("%s/log_old.txt", state->config_dir);
 			remove(old_log_path);
 			rename(log_path, old_log_path);
 			free(old_log_path);
@@ -753,6 +878,7 @@ int main(void) {
 		}
 		free(log_path);
 	}
+	settings_load(state);
 	SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1"); // if this program is sent a SIGTERM/SIGINT, don't turn it into a quit event
 	if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
 		log_error("couldn't initialize SDL");
@@ -1076,8 +1202,6 @@ void main() {\n\
 			}
 		}
 	}
-	if (!settings->output_dir)
-		settings->output_dir = strdup(DEFAULT_OUTPUT_DIR);
 	state->camera = NULL;
 	state->flash_time = -INFINITY;
 	if (arr_len(state->cameras) != 0) {
@@ -1250,9 +1374,6 @@ void main() {\n\
 				}
 				if (state->curr_menu == MENU_MAIN)
 					menu_select(state);
-				if (state->curr_menu == MENU_MAIN && main_menu[state->menu_sel[MENU_MAIN]] == MENU_OPT_TIMER) {
-					change_timer(state, 1);
-				}
 				break;
 			case SDLK_RETURN:
 				menu_select(state);
@@ -1685,11 +1806,12 @@ void main() {\n\
 	}
 	quit:
 	video_quit(state->video);
-	udev_monitor_unref(udev_monitor);
-	udev_unref(udev);
 	arr_foreach_ptr(state->cameras, Camera *, pcamera) {
 		camera_free(*pcamera);
 	}
+	settings_save(state);
+	udev_monitor_unref(udev_monitor);
+	udev_unref(udev);
 	arr_free(state->cameras);
 	free(settings->output_dir);
 	arr_free(settings->camera_precedence);

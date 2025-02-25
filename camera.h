@@ -103,6 +103,8 @@ static bool hash_eq(Hash h1, Hash h2) {
 #define HASH_STR_SIZE (2 * HASH_SIZE + 1)
 
 void hash_to_str(Hash h, char str[HASH_STR_SIZE]);
+bool hash_from_str(Hash *hash, const char *str);
+
 void camera_init(const GlProcs *procs);
 bool pix_fmt_supported(uint32_t pixfmt);
 int picture_format_cmp_resolution(const PictureFormat *a, const PictureFormat *b);
