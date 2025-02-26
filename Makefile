@@ -17,7 +17,7 @@ release/setup2:
 	rm -rf release
 	meson setup --buildtype=release release
 	touch release/setup2
-camlet.deb: release control
+camlet.deb: release control.sh
 	rm -rf tmp
 	mkdir -p tmp/camlet/usr/bin tmp/camlet/DEBIAN tmp/camlet/usr/share/applications tmp/camlet/usr/share/icons/hicolor/48x48/apps
 	cp release/camlet tmp/camlet/usr/bin/
@@ -25,6 +25,7 @@ camlet.deb: release control
 	cp camlet.png tmp/camlet/usr/share/icons/hicolor/48x48/apps
 	sh control.sh > tmp/camlet/DEBIAN/control
 	dpkg-deb --build tmp/camlet
+	mv tmp/camlet.deb .
 	rm -rf tmp
 install: release
 	@[ -w $(INSTALL_PREFIX) ] || { echo "You need permission to write to $(INSTALL_PREFIX). Try running with sudo/as root." && exit 1; }
