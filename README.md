@@ -64,6 +64,7 @@ You can try deleting/renaming your settings file as a temporary solution, to res
 <table>
 <tr><th>Version</th> <th>Description</th> <th>Date</th></tr>
 <tr><td>0.0.0</td> <td>Initial release</td> <td>2025 Feb 26</td></tr>
+<tr><td>0.0.1</td> <td>Fix crash switching to video mode with no camera connected</td> <td>2025 Feb 26</td></tr>
 </table>
 
 ## License

@@ -1,4 +1,4 @@
-#define VERSION "0.0.0"
+#define VERSION "0.0.1"
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -1378,9 +1378,11 @@ void main() {\n\
 				if (state->curr_menu) break;
 				if (video_is_recording(state->video)) break;
 				state->mode = (state->mode + 1) % MODE_COUNT;
-				// picture format may be different now
-				PictureFormat picfmt = settings_picture_format_for_camera(state, state->camera);
-				camera_set_format(state->camera, picfmt, settings_desired_framerate(state), 0, false);
+				if (state->camera) {
+					// picture format may be different now
+					PictureFormat picfmt = settings_picture_format_for_camera(state, state->camera);
+					camera_set_format(state->camera, picfmt, settings_desired_framerate(state), 0, false);
+				}
 				break;
 			case SDLK_SPACE:
 				if (!state->camera || state->curr_menu != 0) break;
