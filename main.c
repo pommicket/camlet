@@ -3,7 +3,7 @@
 /*
 TODO:
 - application icon (and SDL_SetWindowIcon)
-- cmdline argument for starting in video mode
+- adjustable jpeg and video quality
 */
 
 #define _GNU_SOURCE
@@ -26,7 +26,7 @@ TODO:
 #include "camera.h"
 #include "video.h"
 #include "log.h"
-
+#include "argparser.h"
 
 // pixel format used for convenience
 #define PIX_FMT_XXXGRAY 0x47585858
@@ -146,10 +146,11 @@ static void APIENTRY gl_message_callback(GLenum source, GLenum type, unsigned in
 }
 #endif
 
-static void settings_save(State *state) {
+static void settings_save(State *state, const char *settings_path) {
 	Settings *settings = &state->settings;
 	char *tmp_settings_path = a_sprintf("%s/settings.txt.tmp", state->config_dir);
-	char *settings_path = a_sprintf("%s/settings.txt", state->config_dir);
+	char *default_settings_path = a_sprintf("%s/settings.txt", state->config_dir);
+	if (!settings_path) settings_path = default_settings_path;
 	FILE *settings_file = fopen(tmp_settings_path, "w");
 	if (settings_file) {
 		arr_foreach_ptr(settings->camera_precedence, const Hash, h) {
@@ -180,12 +181,13 @@ static void settings_save(State *state) {
 		log_perror("couldn't open %s", tmp_settings_path);
 	}
 	free(tmp_settings_path);
-	free(settings_path);
+	free(default_settings_path);
 }
 
-static void settings_load(State *state) {
+static void settings_load(State *state, const char *settings_path) {
 	Settings *settings = &state->settings;
-	char *settings_path = a_sprintf("%s/settings.txt", state->config_dir);
+	char *default_settings_path = a_sprintf("%s/settings.txt", state->config_dir);
+	if (!settings_path) settings_path = default_settings_path;
 	FILE *settings_file = fopen(settings_path, "r");
 	if (settings_file) {
 		static char line[PATH_MAX + 256];
@@ -272,7 +274,7 @@ static void settings_load(State *state) {
 		// ok, default settings
 		settings->output_dir = strdup(DEFAULT_OUTPUT_DIR);
 	}
-	free(settings_path);
+	free(default_settings_path);
 }
 
 static PictureFormat settings_picture_format_for_camera(State *state, Camera *camera) {
@@ -828,7 +830,6 @@ static bool take_picture(State *state) {
 		break;
 	case MODE_VIDEO:
 		if (state->camera) {
-			// TODO: adjustable video quality
 			success = video_start(state->video, path,
 				camera_frame_width(state->camera), camera_frame_height(state->camera),
 				camera_framerate(state->camera), 5);
@@ -841,10 +842,52 @@ static bool take_picture(State *state) {
 	return success;
 }
 
-int main(void) {
+static void print_help(void) {
+	printf("camlet v. " VERSION "\n");
+	printf("Usage: camlet [--help] [--version] [--settings FILE] [--video]\n");
+	printf("  --help - Display this documentation and exit\n");
+	printf("  --version - Show version information and exit\n");
+	printf("  --video - Start camlet in video mode\n");
+	printf("  --settings FILE - Read settings from FILE, instead of the default location.\n");
+	printf("                    Any changes made to settings will be saved there.\n");
+	printf("\n");
+	printf("For help on how to use camlet, press F1 while it is running.\n");
+}
+
+int main(int argc, char **argv) {
 	static State state_data = {0};
 	State *state = &state_data;
 	Settings *settings = &state->settings;
+	const char *settings_path = NULL;
+	{
+		// parse command-line arguments
+		ArgParser parser = {
+			.argc = argc,
+			.argv = argv,
+			.options_with_value = "settings"
+		};
+		while (arg_parser_next(&parser)) {
+			if (!parser.option) {
+				fprintf(stderr, "Unrecognized option: %s\n", parser.value);
+				print_help();
+				return EXIT_FAILURE;
+			} else if (strcmp(parser.option, "settings") == 0) {
+				settings_path = parser.value;
+			} else if (strcmp(parser.option, "version") == 0) {
+				printf("camlet v. " VERSION "\n");
+				return 0;
+			} else if (strcmp(parser.option, "help") == 0) {
+				print_help();
+				return 0;
+			} else if (strcmp(parser.option, "video") == 0) {
+				state->mode = MODE_VIDEO;
+			} else {
+				fprintf(stderr, "Unrecognized option: %s\n", parser.option);
+				print_help();
+				return EXIT_FAILURE;
+			}
+		}
+	}
 	{
 		// get home directory
 		const char *home = getenv("HOME");
@@ -887,7 +930,7 @@ int main(void) {
 		}
 		free(log_path);
 	}
-	settings_load(state);
+	settings_load(state, settings_path);
 	SDL_SetHint(SDL_HINT_NO_SIGNAL_HANDLERS, "1"); // if this program is sent a SIGTERM/SIGINT, don't turn it into a quit event
 	if (SDL_Init(SDL_INIT_EVERYTHING) < 0) {
 		log_error("couldn't initialize SDL");
@@ -1283,23 +1326,9 @@ void main() {\n\
 				if (state->curr_menu) break;
 				if (video_is_recording(state->video)) break;
 				state->mode = (state->mode + 1) % MODE_COUNT;
-				switch (state->mode) {
-				case MODE_IMAGE:
-					camera_set_format(state->camera,
-						settings_picture_format_for_camera(state, state->camera),
-						settings_desired_framerate(state),
-						0, false);
-					break;
-				case MODE_VIDEO: {
-					PictureFormat picfmt = settings_picture_format_for_camera(state, state->camera);
-					// force V4L2 to do the conversion if we have to
-					picfmt.pixfmt = V4L2_PIX_FMT_YUV420;
-					camera_set_format(state->camera, picfmt, settings_desired_framerate(state), 0, false);
-					} break;
-				case MODE_COUNT:
-					assert(false);
-					break;
-				}
+				// picture format may be different now
+				PictureFormat picfmt = settings_picture_format_for_camera(state, state->camera);
+				camera_set_format(state->camera, picfmt, settings_desired_framerate(state), 0, false);
 				break;
 			case SDLK_SPACE:
 				if (!state->camera || state->curr_menu != 0) break;
@@ -1819,7 +1848,7 @@ void main() {\n\
 	arr_foreach_ptr(state->cameras, Camera *, pcamera) {
 		camera_free(*pcamera);
 	}
-	settings_save(state);
+	settings_save(state, settings_path);
 	udev_monitor_unref(udev_monitor);
 	udev_unref(udev);
 	arr_free(state->cameras);
