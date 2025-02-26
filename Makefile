@@ -4,6 +4,8 @@ camlet.debug: meson.build *.[ch] 3rd_party/*.[ch] debug/setup
 	meson compile -C debug
 	ln -sf debug/camlet camlet.debug
 	cp debug/compile_commands.json .
+camlet_icon.c: camlet.bmp
+	xxd -i camlet.bmp > $@
 debug/setup:
 	rm -rf debug
 	meson setup debug

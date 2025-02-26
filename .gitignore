@@ -5,3 +5,6 @@ camlet.debug
 compile_commands.json
 out.bmp
 *.jpg
+*.swp
+*~
+.vscode

@@ -3,7 +3,6 @@
 /*
 TODO:
 - application icon (and SDL_SetWindowIcon)
-- adjustable jpeg and video quality
 */
 
 #define _GNU_SOURCE
@@ -31,7 +30,12 @@ TODO:
 // pixel format used for convenience
 #define PIX_FMT_XXXGRAY 0x47585858
 
+extern unsigned int camlet_bmp_len;
+extern unsigned char camlet_bmp[];
+
 static const char *const DEFAULT_OUTPUT_DIR = "~/Pictures/Webcam";
+static const int DEFAULT_JPEG_QUALITY = 90;
+static const int DEFAULT_VIDEO_QUALITY = 5;
 
 typedef enum {
 	MENU_NONE,
@@ -54,6 +58,7 @@ enum {
 	MENU_OPT_SET_OUTPUT_DIR,
 	MENU_OPT_TIMER,
 	MENU_OPT_FRAMERATE,
+	MENU_OPT_QUALITY,
 };
 // use char for MenuOption type so that we can use strlen
 typedef char MenuOption;
@@ -65,6 +70,7 @@ static const MenuOption main_menu[] = {
 	MENU_OPT_PIXFMT,
 	MENU_OPT_SET_OUTPUT_DIR,
 	MENU_OPT_FRAMERATE,
+	MENU_OPT_QUALITY,
 	MENU_OPT_QUIT,
 	0
 };
@@ -93,6 +99,8 @@ typedef struct {
 	int32_t video_resolution[2];
 	int video_framerate;
 	int image_framerate;
+	int jpeg_quality;
+	int video_quality;
 	ImageFormat image_format;
 	char *output_dir;
 } Settings;
@@ -173,6 +181,10 @@ static void settings_save(State *state, const char *settings_path) {
 			fprintf(settings_file, "image_framerate %d\n", settings->image_framerate);
 		if (settings->video_framerate)
 			fprintf(settings_file, "video_framerate %d\n", settings->video_framerate);
+		if (settings->jpeg_quality)
+			fprintf(settings_file, "jpeg_quality %d\n", settings->jpeg_quality);
+		if (settings->video_quality)
+			fprintf(settings_file, "video_quality %d\n", settings->video_quality);
 		fprintf(settings_file, "image_format %s\n", image_format_extensions[settings->image_format]);
 		fprintf(settings_file, "output_dir %s\n", settings->output_dir);
 		fclose(settings_file);
@@ -244,6 +256,20 @@ static void settings_load(State *state, const char *settings_path) {
 					continue;
 				}
 				settings->image_framerate = framerate;
+			} else if (strcmp(command, "jpeg_quality") == 0) {
+				int quality = atoi(args);
+				if (quality < 1 || quality > 100) {
+					log_error("Bad jpeg_quality in settings file: %d", quality);
+					continue;
+				}
+				settings->jpeg_quality = quality;
+			} else if (strcmp(command, "video_quality") == 0) {
+				int quality = atoi(args);
+				if (quality < 1 || quality > 100) {
+					log_error("Bad video_quality in settings file: %d", quality);
+					continue;
+				}
+				settings->video_quality = quality;
 			} else if (strcmp(command, "video_framerate") == 0) {
 				int framerate = atoi(args);
 				if (framerate < 0 || framerate >= 64) {
@@ -448,6 +474,22 @@ static void change_timer(State *state, int direction) {
 	state->menu_needs_rerendering = true;
 }
 
+static void change_quality(State *state, int direction) {
+	Settings *settings = &state->settings;
+	if (state->mode == MODE_VIDEO) {
+		if (!settings->video_quality) settings->video_quality = DEFAULT_VIDEO_QUALITY;
+		settings->video_quality += direction;
+		if (settings->video_quality < 1) settings->video_quality = 1;
+		if (settings->video_quality > 100) settings->video_quality = 100;
+	} else {
+		if (!settings->jpeg_quality) settings->jpeg_quality = DEFAULT_JPEG_QUALITY;
+		settings->jpeg_quality += direction;
+		if (settings->jpeg_quality < 1) settings->jpeg_quality = 1;
+		if (settings->jpeg_quality > 100) settings->jpeg_quality = 100;
+	}
+	state->menu_needs_rerendering = true;
+}
+
 static void menu_select(State *state) {
 	Settings *settings = &state->settings;
 	if (state->curr_menu == MENU_MAIN) {
@@ -514,6 +556,9 @@ static void menu_select(State *state) {
 			}
 			state->menu_sel[MENU_FRAMERATE] = (framerate_idx + 1) % menu_option_count(state);
 			} break;
+		case MENU_OPT_QUALITY:
+			change_quality(state, 1);
+			break;
 		case MENU_OPT_TIMER:
 			change_timer(state, 1);
 			break;
@@ -815,7 +860,8 @@ static bool take_picture(State *state) {
 	case MODE_IMAGE:
 		switch (settings->image_format) {
 		case IMG_FMT_JPEG:
-			success = camera_save_jpg(state->camera, path, 90);
+			success = camera_save_jpg(state->camera, path,
+				settings->jpeg_quality ? settings->jpeg_quality : DEFAULT_JPEG_QUALITY);
 			break;
 		case IMG_FMT_PNG:
 			success = camera_save_png(state->camera, path);
@@ -832,7 +878,7 @@ static bool take_picture(State *state) {
 		if (state->camera) {
 			success = video_start(state->video, path,
 				camera_frame_width(state->camera), camera_frame_height(state->camera),
-				camera_framerate(state->camera), 5);
+				camera_framerate(state->camera), settings->video_quality ? settings->video_quality : DEFAULT_VIDEO_QUALITY);
 		}
 		break;
 	case MODE_COUNT:
@@ -980,6 +1026,13 @@ int main(int argc, char **argv) {
 	SDL_Window *window = SDL_CreateWindow("camlet", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, 1280, 720, SDL_WINDOW_OPENGL|SDL_WINDOW_SHOWN|SDL_WINDOW_RESIZABLE);
 	if (!window) {
 		fatal_error("couldn't create window: %s", SDL_GetError());
+	}
+	{
+		// set window icon
+		SDL_RWops *ops = SDL_RWFromConstMem(camlet_bmp, camlet_bmp_len);
+		SDL_Surface *icon = SDL_LoadBMP_RW(ops, true);
+		SDL_SetWindowIcon(window, icon);
+		SDL_FreeSurface(icon);
 	}
 	state->video = video_init();
 
@@ -1389,6 +1442,8 @@ void main() {\n\
 					state->menu_needs_rerendering = true;
 				} else if (state->curr_menu == MENU_MAIN && main_menu[state->menu_sel[MENU_MAIN]] == MENU_OPT_TIMER) {
 					change_timer(state, -1);
+				} else if (state->curr_menu == MENU_MAIN && main_menu[state->menu_sel[MENU_MAIN]] == MENU_OPT_QUALITY) {
+					change_quality(state, -1);
 				} else if (menu_option_count(state) > menu_options_per_column) {
 					int sel = state->menu_sel[state->curr_menu] - menu_options_per_column;
 					if (sel < 0) {
@@ -1526,6 +1581,13 @@ void main() {\n\
 					case MENU_OPT_FRAMERATE:
 						option = state->camera ? a_sprintf("Frame rate: %d", camera_framerate(state->camera))
 							: strdup("Frame rate: None");
+						break;
+					case MENU_OPT_QUALITY:
+						if (state->mode == MODE_VIDEO) {
+							option = a_sprintf("Video quality: %d", settings->video_quality ? settings->video_quality : DEFAULT_VIDEO_QUALITY);
+						} else {
+							option = a_sprintf("JPEG quality: %d", settings->jpeg_quality ? settings->jpeg_quality : DEFAULT_JPEG_QUALITY);
+						}
 						break;
 					case MENU_OPT_TIMER:
 						option = a_sprintf("Timer: %ds", settings->timer);
