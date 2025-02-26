@@ -4,8 +4,7 @@
 #include <threads.h>
 #include <libavcodec/avcodec.h>
 #include <libavformat/avformat.h>
-#include <pulse/pulseaudio.h>
-#include <pulse/simple.h>
+#include <SDL.h>
 #include <unistd.h>
 
 #include "log.h"
@@ -13,8 +12,6 @@
 
 // no real harm in making this bigger, other than increased memory usage.
 #define AUDIO_QUEUE_SIZE ((size_t)128 << 10)
-#define AUDIO_NOT_RECORDING (UINT32_MAX)
-#define AUDIO_QUIT (UINT32_MAX - 1)
 
 struct VideoContext {
 	double start_time;
@@ -29,98 +26,62 @@ struct VideoContext {
 	AVStream *audio_stream;
 	int64_t next_video_pts;
 	int64_t next_audio_pts;
-	thrd_t audio_thread;
-	bool audio_thread_created;
+	SDL_AudioDeviceID audio_device;
 	bool recording;
 	// ring buffer of audio data.
 	float audio_queue[AUDIO_QUEUE_SIZE];
 	atomic_uint_fast32_t audio_head;
 	atomic_uint_fast32_t audio_tail;
-	char _unused[128]; // reduce false sharing
+	char _unused1[128]; // reduce false sharing
 };
 
-// NOTE: SDL2 pulseaudio capture is broken on some versions: https://github.com/libsdl-org/SDL/issues/9706
-//      When SDL3 is widespread enough (e.g. available on Debian stable), we can switch to that for capturing.
-static int audio_thread(void *data) {
+// NOTE: SDL2 pulseaudio capture is broken on some versions of SDL 2.30: https://github.com/libsdl-org/SDL/issues/9706
+static void audio_callback(void *data, Uint8 *stream_u8, int len) {
 	VideoContext *ctx = data;
-	pa_sample_spec audio_format = {
-		.format = PA_SAMPLE_FLOAT32NE,
-		.rate = 44100,
-		.channels = 2,
-	};
-	// by default pulseaudio uses a crazy large buffer, like 500KB,
-	// and doesn't send any audio until it's full.
-	const pa_buffer_attr buffer_attr = {
-		.maxlength = 8192,
-		.fragsize = 4096,
-	};
-	int err = 0;
-	pa_simple *pulseaudio = pa_simple_new(NULL, "camlet", PA_STREAM_RECORD, NULL,
-		"microphone", &audio_format, NULL, &buffer_attr, &err);
-	if (!pulseaudio) {
-		log_error("couldn't connect to pulseaudio: %s", pa_strerror(err));
-		return -1;
-	}
-	uint32_t warned[2] = {0};
-	bool quit = false;
-	// only this thread writes to ctx->tail, so we can have a local variable which mirrors it.
-	uint32_t tail = AUDIO_NOT_RECORDING;
-	while (!quit) {
-		float buf[1024];
-		int result = pa_simple_read(pulseaudio, buf, sizeof buf, &err);
-		uint32_t head = atomic_load(&ctx->audio_head);
-		if (head == AUDIO_NOT_RECORDING) {
-			// not recording
-			if (tail != AUDIO_NOT_RECORDING) {
-				tail = AUDIO_NOT_RECORDING;
-				atomic_store(&ctx->audio_tail, tail);
-			}
-			continue;
-		} else if (head == AUDIO_QUIT) {
-			break;
-		} else if (tail == AUDIO_NOT_RECORDING) {
-			// reset tail now that we are recording
-			tail = 0;
+	const float *stream = (const float *)stream_u8;
+	// this call already happens-after any earlier writes to audio_tail, so relaxed is fine.
+	uint32_t tail = atomic_load_explicit(&ctx->audio_tail, memory_order_relaxed);
+	uint32_t head = atomic_load(&ctx->audio_head);
+	if ((tail - head + AUDIO_QUEUE_SIZE) % AUDIO_QUEUE_SIZE > AUDIO_QUEUE_SIZE * 3 / 4) {
+		static int warned;
+		if (warned < 10) {
+			log_warning("audio overrun");
+			warned++;
 		}
-		if ((tail - head + AUDIO_QUEUE_SIZE) % AUDIO_QUEUE_SIZE > AUDIO_QUEUE_SIZE * 3 / 4) {
-			if (warned[0] < 10) {
-				log_warning("audio overrun");
-				warned[0]++;
-			}
-		} else if (result >= 0) {
-			const uint32_t nfloats = sizeof buf / sizeof(float);
-			if (tail + nfloats <= AUDIO_QUEUE_SIZE) {
-				// easy case
-				memcpy(&ctx->audio_queue[tail], buf, sizeof buf);
-				tail += nfloats;
-			} else {
-				// "wrap around" case
-				memcpy(&ctx->audio_queue[tail], buf, (AUDIO_QUEUE_SIZE - tail) * sizeof(float));
-				memcpy(&ctx->audio_queue[0], &buf[AUDIO_QUEUE_SIZE - tail], (tail + nfloats - AUDIO_QUEUE_SIZE) * sizeof(float));
-				tail = tail + nfloats - AUDIO_QUEUE_SIZE;
-			}
+	} else {
+		const uint32_t nfloats = (uint32_t)len / sizeof(float);
+		if (tail + nfloats <= AUDIO_QUEUE_SIZE) {
+			// easy case
+			memcpy(&ctx->audio_queue[tail], stream, len);
+			tail += nfloats;
 		} else {
-			if (!warned[1]) {
-				log_error("pa_simple_read: %s", pa_strerror(err));
-				warned[1]++;
-			}
+			// "wrap around" case
+			memcpy(&ctx->audio_queue[tail], stream, (AUDIO_QUEUE_SIZE - tail) * sizeof(float));
+			memcpy(&ctx->audio_queue[0], &stream[AUDIO_QUEUE_SIZE - tail], (tail + nfloats - AUDIO_QUEUE_SIZE) * sizeof(float));
+			tail = tail + nfloats - AUDIO_QUEUE_SIZE;
 		}
-		atomic_store(&ctx->audio_tail, tail);
 	}
-	pa_simple_free(pulseaudio);
-	return 0;
+	atomic_store(&ctx->audio_tail, tail);
 }
 
 
 VideoContext *video_init(void) {
 	VideoContext *ctx = calloc(1, sizeof(VideoContext));
 	if (!ctx) return NULL;
-	atomic_init(&ctx->audio_head, AUDIO_NOT_RECORDING);
-	atomic_init(&ctx->audio_tail, AUDIO_NOT_RECORDING);
-	if (thrd_create(&ctx->audio_thread, audio_thread, ctx) == thrd_success) {
-		ctx->audio_thread_created = true;
-	} else {
-		log_perror("couldn't create audio thread");
+	atomic_init(&ctx->audio_head, 0);
+	atomic_init(&ctx->audio_tail, 0);
+	
+	SDL_AudioSpec desired = {
+		.channels = 2,
+		.freq = 44100,
+		.format = AUDIO_F32,
+		.samples = 2048,
+		.callback = audio_callback,
+		.userdata = ctx,
+	}, obtained = {0};
+	ctx->audio_device = SDL_OpenAudioDevice(NULL, 1, &desired, &obtained, SDL_AUDIO_ALLOW_SAMPLES_CHANGE);
+	if (!ctx->audio_device) {
+		log_error("couldn't create audio device: %s", SDL_GetError());
 	}
 	return ctx;
 }
@@ -131,11 +92,7 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 		return true;
 	}
 	video_stop(ctx);
-	// wait for capture thread to acknowledge that we have stopped recording
-	if (ctx->audio_thread_created) while (true) {
-		if (atomic_load(&ctx->audio_tail) == AUDIO_NOT_RECORDING) break;
-		usleep(1000);
-	}
+	bool have_audio = false;
 	int err = avformat_alloc_output_context2(&ctx->avf_context, NULL, NULL, filename);
 	if (!ctx->avf_context) {
 		log_error("avformat_alloc_output_context2 \"%s\": %s", filename, av_err2str(err));
@@ -254,6 +211,7 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 		log_error("avcodec_parameters_from_context (audio): %s", av_err2str(err));
 		goto no_audio;
 	}
+	have_audio = true;
 no_audio:
 	err = avformat_write_header(ctx->avf_context, NULL);
 	if (err < 0) {
@@ -265,6 +223,10 @@ no_audio:
 	ctx->next_audio_pts = 0;
 	ctx->recording = true;
 	ctx->start_time = get_time_double();
+	if (have_audio) {
+		// start recording audio
+		SDL_PauseAudioDevice(ctx->audio_device, 0);
+	}
 	return true;
 }
 
@@ -299,7 +261,7 @@ bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 	if (!ctx || !camera || !ctx->recording) return false;
 	double curr_time = get_time_double();
 	double time_since_start = curr_time - ctx->start_time;
-	if (ctx->audio_thread_created) {
+	if (ctx->audio_device) {
 		// process audio
 		// only this thread writes to head, so relaxed is fine.
 		uint32_t head = atomic_load_explicit(&ctx->audio_head, memory_order_relaxed);
@@ -313,9 +275,7 @@ bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 			ctx->audio_frame->pts = ctx->next_audio_pts;
 			uint32_t nfloats = (uint32_t)ctx->audio_frame_samples * 2;
 			bool frame_ready = false;
-			if (tail == AUDIO_NOT_RECORDING) {
-				// capture thread doesn't even know we're recording yet
-			} else if (head + nfloats < AUDIO_QUEUE_SIZE) {
+			if (head + nfloats < AUDIO_QUEUE_SIZE) {
 				// easy case
 				frame_ready = head + nfloats <= tail || head > tail /* tail wrapped around */;
 				if (frame_ready) {
@@ -373,7 +333,12 @@ bool video_is_recording(VideoContext *ctx) {
 void video_stop(VideoContext *ctx) {
 	if (!ctx) return;
 	if (ctx->recording) {
-		atomic_store(&ctx->audio_head, AUDIO_NOT_RECORDING);
+		SDL_PauseAudioDevice(ctx->audio_device, 1);
+		// block until callback finishes.
+		SDL_LockAudioDevice(ctx->audio_device);
+		SDL_UnlockAudioDevice(ctx->audio_device);
+		atomic_store(&ctx->audio_head, 0);
+		atomic_store(&ctx->audio_tail, 0);
 		ctx->recording = false;
 		// flush video encoder
 		write_frame(ctx, ctx->video_encoder, ctx->video_stream, NULL);
@@ -407,11 +372,8 @@ void video_stop(VideoContext *ctx) {
 void video_quit(VideoContext *ctx) {
 	if (!ctx) return;
 	video_stop(ctx);
-	if (ctx->audio_thread_created) {
-		atomic_store(&ctx->audio_head, AUDIO_QUIT);
-		if (thrd_join(ctx->audio_thread, NULL) != thrd_success) {
-			log_perror("thrd_join");
-		}
+	if (ctx->audio_device) {
+		SDL_CloseAudioDevice(ctx->audio_device);
 	}
 	free(ctx);
 }

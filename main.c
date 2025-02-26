@@ -2,7 +2,6 @@
 
 /*
 TODO:
-- switch back to SDL for audio now that that bug has been fixed
 - application icon (and SDL_SetWindowIcon)
 - cmdline argument for starting in video mode
 */
@@ -1570,7 +1569,7 @@ void main() {\n\
 			}
 			if (state->curr_menu == MENU_HELP) {
 				const char *text[] = {
-					"F1 - open this help screen",
+					"F1 - show this help text",
 					"F2 - show debug info",
 					state->mode == MODE_VIDEO
 						? "Space - start/stop recording"
