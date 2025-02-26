@@ -1,10 +1,5 @@
 #define VERSION "0.0.0"
 
-/*
-TODO:
-- application icon (and SDL_SetWindowIcon)
-*/
-
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
