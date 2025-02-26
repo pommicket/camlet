@@ -6,7 +6,8 @@
 #include <stddef.h>
 #include <string.h>
 #include <GL/glcorearb.h>
-struct AVFrame;
+
+struct vpx_image;
 
 typedef uint32_t PixelFormat;
 typedef struct Camera Camera;
@@ -28,8 +29,6 @@ typedef enum {
 	CAMERA_ACCESS_MMAP,
 	// access camera via read calls
 	CAMERA_ACCESS_READ,
-	// access camera via user-pointer streaming
-	CAMERA_ACCESS_USERP,
 } CameraAccessMethod;
 
 /// macro trickery to avoid having to write every GL function multiple times
@@ -135,10 +134,7 @@ bool camera_open(Camera *camera, PictureFormat desired_format, int desired_frame
 Hash camera_hash(Camera *camera);
 void camera_hash_str(Camera *camera, char str[HASH_STR_SIZE]);
 bool camera_set_format(Camera *camera, PictureFormat picfmt, int desired_framerate, CameraAccessMethod access, bool force);
-/// Copy current frame from camera to AVFrame.
-///
-/// Returns `true` on success. Currently only works if both the camera and the AVFrame are in the YUV420 format.
-bool camera_copy_to_av_frame(Camera *camera, struct AVFrame *frame);
+bool camera_copy_to_vpx_image(Camera *camera, struct vpx_image *image);
 void camera_free(Camera *camera);
 
 #endif

@@ -2,10 +2,11 @@
 
 #include <stdatomic.h>
 #include <threads.h>
-#include <libavcodec/avcodec.h>
-#include <libavformat/avformat.h>
 #include <SDL.h>
 #include <unistd.h>
+#include <ogg/ogg.h>
+#include <vorbis/vorbisenc.h>
+#include <vpx/vp8cx.h>
 
 #include "log.h"
 #include "camera.h"
@@ -15,18 +16,16 @@
 
 struct VideoContext {
 	double start_time;
-	AVFormatContext *avf_context;
-	AVCodecContext *video_encoder;
-	AVCodecContext *audio_encoder;
-	AVFrame *video_frame;
-	AVFrame *audio_frame;
 	int audio_frame_samples;
-	AVPacket *av_packet;
-	AVStream *video_stream;
-	AVStream *audio_stream;
+	ogg_stream_state video_stream, audio_stream;
+	vorbis_dsp_state vorbis;
+	vpx_codec_ctx_t vpx;
+	vpx_image_t vpx_image;
 	int64_t next_video_pts;
-	int64_t next_audio_pts;
+	int64_t video_packetno;
+	int framerate;
 	SDL_AudioDeviceID audio_device;
+	FILE *outfile;
 	bool recording;
 	// ring buffer of audio data.
 	float audio_queue[AUDIO_QUEUE_SIZE];
@@ -70,7 +69,6 @@ VideoContext *video_init(void) {
 	if (!ctx) return NULL;
 	atomic_init(&ctx->audio_head, 0);
 	atomic_init(&ctx->audio_tail, 0);
-	
 	SDL_AudioSpec desired = {
 		.channels = 2,
 		.freq = 44100,
@@ -86,143 +84,110 @@ VideoContext *video_init(void) {
 	return ctx;
 }
 
+static bool write_packet_to_stream(VideoContext *ctx, ogg_stream_state *stream, ogg_packet *packet) {
+	if (ogg_stream_packetin(stream, packet) != 0) {
+		log_error("ogg_stream_packetin failed");
+		return false;
+	}
+	ogg_page page;
+	while (ogg_stream_pageout(stream, &page) != 0) {
+		fwrite(page.header, 1, page.header_len, ctx->outfile);
+		fwrite(page.body, 1, page.body_len, ctx->outfile);
+	}
+	if (ferror(ctx->outfile)) {
+		log_error("error writing video output");
+		return false;
+	}
+	return true;
+}
+
 bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t height, int fps, int quality) {
 	if (!ctx) return false;
 	if (ctx->recording) {
 		return true;
 	}
 	video_stop(ctx);
+	ctx->framerate = fps;
+	ctx->outfile = fopen(filename, "wb");
+	if (!ctx->outfile) {
+		log_perror("couldn't create %s", filename);
+	}
+	struct timespec ts = {1, 1};
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	int serial_number = (int)((int32_t)ts.tv_nsec + 1000000000 * ((int32_t)ts.tv_sec % 2));
+	if (ogg_stream_init(&ctx->video_stream, serial_number) < 0) {
+		log_error("ogg_stream_init(video_stream) failed");
+		return false;
+	}
+	vpx_codec_enc_cfg_t cfg = {0};
+	// NOTE: vp9 encoder seems to be much slower
+	vpx_codec_iface_t *vp8 = vpx_codec_vp8_cx();
+	int err = vpx_codec_enc_config_default(vp8, &cfg, 0);
+	if (err != 0) {
+		log_error("vpx_codec_enc_config_default: %s", vpx_codec_err_to_string(err));
+		return false;
+	}
+	cfg.g_w = width;
+	cfg.g_h = height;
+	cfg.g_timebase.num = 1;
+	cfg.g_timebase.den = fps;
+	cfg.rc_target_bitrate = (unsigned)quality * (unsigned)width * (unsigned)height;
+	err = vpx_codec_enc_init(&ctx->vpx, vp8, &cfg, 0);
+	if (err != 0) {
+		log_error("vpx_codec_enc_init: %s", vpx_codec_err_to_string(err));
+		return false;
+	}
+	if (!vpx_img_alloc(&ctx->vpx_image, VPX_IMG_FMT_I420, width, height, 1)) {
+		log_error("couldn't allocate VPX image");
+		return false;
+	}
+	// I can't find any documentation of OggVP8
+	//  This was pieced together from ogg_build_vp8_headers in
+	//   https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/oggenc.c
+	typedef struct {
+		char magic[5];
+		uint8_t stream_type;
+		uint8_t version[2];
+		// doesn't seem very forwards-thinking to have these be 16-bit. oh well.
+		uint16_t width;
+		uint16_t height;
+		uint8_t sample_aspect_ratio_num[3];
+		uint8_t sample_aspect_ratio_den[3];
+		// not aligned to 4 bytes ):
+		uint16_t framerate_num_hi;
+		uint16_t framerate_num_lo;
+		uint16_t framerate_den_hi;
+		uint16_t framerate_den_lo;
+	} OggVP8Header;
+	if (width > UINT16_MAX || height > UINT16_MAX) {
+		log_error("video resolution too high");
+		return false;
+	}
+	OggVP8Header header = {
+		.magic = "OVP80",
+		.stream_type = 1,
+		.version = {1, 0},
+		// big-endian for some reason....
+		.width = SDL_SwapBE16((uint16_t)width),
+		.height = SDL_SwapBE16((uint16_t)height),
+		.sample_aspect_ratio_num = {0, 0, 1},
+		.sample_aspect_ratio_den = {0, 0, 1},
+		.framerate_num_lo = SDL_SwapBE16((uint16_t)fps),
+		.framerate_den_lo = SDL_SwapBE16(1),
+	};
+	ogg_packet packet = {
+		.packet = (uint8_t *)&header,
+		.bytes = sizeof header,
+		.b_o_s = true,
+		.e_o_s = false,
+	};
+	write_packet_to_stream(ctx, &ctx->video_stream, &packet);
 	bool have_audio = false;
-	int err = avformat_alloc_output_context2(&ctx->avf_context, NULL, NULL, filename);
-	if (!ctx->avf_context) {
-		log_error("avformat_alloc_output_context2 \"%s\": %s", filename, av_err2str(err));
-		return false;
-	}
-	const AVOutputFormat *fmt = ctx->avf_context->oformat;
-	const AVCodec *video_codec = avcodec_find_encoder(fmt->video_codec);
-	if (!video_codec) {
-		log_error("couldn't find encoder for video codec %s", avcodec_get_name(fmt->video_codec));
-		return false;
-	}
-	ctx->video_stream = avformat_new_stream(ctx->avf_context, NULL);
-	if (!ctx->video_stream) {
-		log_error("avformat_new_stream (audio): %s", av_err2str(err));
-		return false;
-	}
-	ctx->video_stream->id = 0;
-	ctx->video_encoder = avcodec_alloc_context3(video_codec);
-	if (!ctx->video_encoder) {
-		log_error("couldn't create video encoding context for codec %s", avcodec_get_name(fmt->video_codec));
-		return false;
-	}
-	ctx->av_packet = av_packet_alloc();
-	if (!ctx->av_packet) {
-		log_error("couldn't allocate video packet");
-		return false;
-	}
-	ctx->video_encoder->codec_id = fmt->video_codec;
-	ctx->video_encoder->bit_rate = (int64_t)quality * width * height;
-	ctx->video_encoder->width = width;
-	ctx->video_encoder->height = height;
-	ctx->video_encoder->time_base = ctx->video_stream->time_base = (AVRational){1, fps};
-	ctx->video_encoder->gop_size = 12;
-	ctx->video_encoder->pix_fmt = AV_PIX_FMT_YUV420P;
-	if (ctx->avf_context->oformat->flags & AVFMT_GLOBALHEADER)
-		ctx->video_encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-	err = avcodec_open2(ctx->video_encoder, video_codec, NULL);
-	if (err < 0) {
-		log_error("avcodec_open2 for video codec %s: %s", avcodec_get_name(fmt->video_codec), av_err2str(err));
-		return false;
-	}
-	err = avcodec_parameters_from_context(ctx->video_stream->codecpar, ctx->video_encoder);
-	if (err < 0) {
-		log_error("avcodec_parameters_from_context for video codec %s: %s", avcodec_get_name(fmt->video_codec), av_err2str(err));
-		return false;
-	}
-	ctx->video_frame = av_frame_alloc();
-	if (!ctx->video_frame) {
-		log_error("couldn't allocate video frame");
-		return false;
-	}
-	ctx->video_frame->format = AV_PIX_FMT_YUV420P;
-	ctx->video_frame->width = ctx->video_encoder->width;
-	ctx->video_frame->height = ctx->video_encoder->height;
-	err = av_frame_get_buffer(ctx->video_frame, 0);
-	if (err < 0) {
-		log_error("av_frame_get_buffer for video: %s", av_err2str(err));
-		return false;
-	}
-	err = avio_open(&ctx->avf_context->pb, filename, AVIO_FLAG_WRITE);
-	if (err < 0) {
-		log_error("avio_open \"%s\": %s", filename, av_err2str(err));
-		return false;
-	}
-	const AVCodec *audio_codec = avcodec_find_encoder(fmt->audio_codec);
-	if (!audio_codec) {
-		log_error("avcodec_find_encoder for audio codec %s: %s", avcodec_get_name(fmt->audio_codec), av_err2str(err));
-		goto no_audio;
-	}
-	ctx->audio_encoder = avcodec_alloc_context3(audio_codec);
-	if (!ctx->audio_encoder) {
-		log_error("avcodec_alloc_context3 for audio codec %s: %s", avcodec_get_name(fmt->audio_codec), av_err2str(err));
-		goto no_audio;
-	}
-	// only FLTP is supported by AAC encoder
-	ctx->audio_encoder->sample_fmt = AV_SAMPLE_FMT_FLTP;
-	ctx->audio_encoder->bit_rate = (int64_t)192 * 1024;
-	ctx->audio_encoder->sample_rate = 44100;
-	static const AVChannelLayout channel_layout = AV_CHANNEL_LAYOUT_STEREO;
-	av_channel_layout_copy(&ctx->audio_encoder->ch_layout, &channel_layout);
-	if (ctx->avf_context->oformat->flags & AVFMT_GLOBALHEADER)
-		ctx->audio_encoder->flags |= AV_CODEC_FLAG_GLOBAL_HEADER;
-	err = avcodec_open2(ctx->audio_encoder, audio_codec, NULL);
-	if (err < 0) {
-		log_error("avcodec_open2 for audio codec %s: %s", avcodec_get_name(fmt->audio_codec), av_err2str(err));
-		goto no_audio;
-	}
-	ctx->audio_frame_samples = audio_codec->capabilities & AV_CODEC_CAP_VARIABLE_FRAME_SIZE
-		? 4096
-		: ctx->audio_encoder->frame_size;
-	ctx->audio_frame = av_frame_alloc();
-	if (!ctx->audio_frame) {
-		log_error("couldn't allocate audio frame");
-		goto no_audio;
-	}
-	ctx->audio_frame->format = AV_SAMPLE_FMT_FLTP;
-	av_channel_layout_copy(&ctx->audio_frame->ch_layout, &channel_layout);
-	ctx->audio_frame->sample_rate = 44100;
-	ctx->audio_frame->nb_samples = ctx->audio_frame_samples;
-	err = av_frame_get_buffer(ctx->audio_frame, 0);
-	if (err < 0) {
-		log_error("av_frame_get_buffer (audio): %s", av_err2str(err));
-		goto no_audio;
-	}
-
-	// create stream last so that if stuff above fails we don't have a broken stream in the avformat context
-	ctx->audio_stream = avformat_new_stream(ctx->avf_context, audio_codec);
-	if (!ctx->audio_stream) {
-		log_error("avformat_new_stream (audio): %s", av_err2str(err));
-		goto no_audio;
-	}
-	ctx->audio_stream->id = 1;
-	ctx->audio_stream->time_base = (AVRational){1, 44100};
-	err = avcodec_parameters_from_context(ctx->audio_stream->codecpar, ctx->audio_encoder);
-	if (err < 0) {
-		log_error("avcodec_parameters_from_context (audio): %s", av_err2str(err));
-		goto no_audio;
-	}
-	have_audio = true;
-no_audio:
-	err = avformat_write_header(ctx->avf_context, NULL);
-	if (err < 0) {
-		log_error("avformat_write_header: %s", av_err2str(err));
-		return false;
-	}
 	atomic_store(&ctx->audio_head, 0);
-	ctx->next_video_pts = 0;
-	ctx->next_audio_pts = 0;
 	ctx->recording = true;
 	ctx->start_time = get_time_double();
+	ctx->next_video_pts = 0;
+	ctx->video_packetno = 1;
 	if (have_audio) {
 		// start recording audio
 		SDL_PauseAudioDevice(ctx->audio_device, 0);
@@ -230,32 +195,33 @@ no_audio:
 	return true;
 }
 
-
-static bool write_frame(VideoContext *ctx, AVCodecContext *encoder, AVStream *stream, AVFrame *frame) {
-	int err = avcodec_send_frame(encoder, frame);
-	if (err < 0) {
-		log_error("avcodec_send_frame (stream %d): %s", stream->index, av_err2str(err));
-		return false;
-	}
-	while (true) {
-		err = avcodec_receive_packet(encoder, ctx->av_packet);
-		if (err == AVERROR(EAGAIN) || err == AVERROR_EOF) {
-			break;
-		}
-		if (err < 0) {
-			log_error("avcodec_receive_packet (stream %d): %s", stream->index, av_err2str(err));
-			return false;
-		}
-		ctx->av_packet->stream_index = stream->index;
-		av_packet_rescale_ts(ctx->av_packet, encoder->time_base, stream->time_base);
-		err = av_interleaved_write_frame(ctx->avf_context, ctx->av_packet);
-		if (err < 0) {
-			log_error("av_interleaved_write_frame (stream %d): %s", stream->index, av_err2str(err));
-			return false;
-		}
-	}
-	return true;
+// inverse of vp8_gptopts in  https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/oggparsevp8.c
+// see also: https://github.com/FFmpeg/FFmpeg/blob/99e2af4e7837ca09b97d93a562dc12947179fc48/libavformat/oggenc.c#L671
+static uint64_t vp8_pts_to_gp(int64_t pts, bool is_key_frame) {
+	return (uint64_t)pts << 32 | (uint64_t)!is_key_frame << 3;
 }
+
+static void write_video_frame(VideoContext *ctx, vpx_image_t *image, int64_t pts) {
+	int err = vpx_codec_encode(&ctx->vpx, image, pts, 1, 0, 1000000 / (ctx->framerate * 2));
+	if (err != 0) {
+		log_error("vpx_codec_encode: %s", vpx_codec_err_to_string(err));
+	}
+	const vpx_codec_cx_pkt_t *pkt = NULL;
+	vpx_codec_iter_t iter = NULL;
+	while ((pkt = vpx_codec_get_cx_data(&ctx->vpx, &iter))) {
+		if (pkt->kind != VPX_CODEC_CX_FRAME_PKT) continue;
+		ogg_packet oggp = {
+			.packet = pkt->data.frame.buf,
+			.bytes = pkt->data.frame.sz,
+			.granulepos = vp8_pts_to_gp(pkt->data.frame.pts, pkt->data.frame.flags & VPX_FRAME_IS_KEY),
+			.b_o_s = false,
+			.packetno = ctx->video_packetno++,
+			.e_o_s = false,
+		};
+		write_packet_to_stream(ctx, &ctx->video_stream, &oggp);
+	}
+}
+
 
 bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 	if (!ctx || !camera || !ctx->recording) return false;
@@ -267,12 +233,9 @@ bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 		uint32_t head = atomic_load_explicit(&ctx->audio_head, memory_order_relaxed);
 		uint32_t tail = atomic_load(&ctx->audio_tail);
 		while (true) {
-			int err = av_frame_make_writable(ctx->audio_frame);
-			if (err < 0) {
-				log_error("av_frame_make_writable (video): %s", av_err2str(err));
-				break;
-			}
-			ctx->audio_frame->pts = ctx->next_audio_pts;
+			break;(void)tail;
+			// TODO
+			#if 0
 			uint32_t nfloats = (uint32_t)ctx->audio_frame_samples * 2;
 			bool frame_ready = false;
 			if (head + nfloats < AUDIO_QUEUE_SIZE) {
@@ -299,28 +262,21 @@ bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 				}
 			}
 			if (frame_ready) {
-				ctx->next_audio_pts += ctx->audio_frame_samples;
 				write_frame(ctx, ctx->audio_encoder, ctx->audio_stream, ctx->audio_frame);
 			} else {
 				break;
 			}
+			#endif
 		}
 		atomic_store(&ctx->audio_head, head);
 	}
 	// process video
-	int64_t video_pts = (int64_t)(time_since_start
-		* ctx->video_encoder->time_base.den
-		/ ctx->video_encoder->time_base.num);
-	if (video_pts >= ctx->next_video_pts) {
-		int err = av_frame_make_writable(ctx->video_frame);
-		if (err < 0) {
-			log_error("av_frame_make_writable (audio): %s", av_err2str(err));
-			return false;
+	int64_t pts = (int64_t)(time_since_start * ctx->framerate);
+	if (pts >= ctx->next_video_pts) {
+		if (camera_copy_to_vpx_image(camera, &ctx->vpx_image)) {
+			write_video_frame(ctx, &ctx->vpx_image, pts);
 		}
-		ctx->video_frame->pts = video_pts;
-		camera_copy_to_av_frame(camera, ctx->video_frame);
-		write_frame(ctx, ctx->video_encoder, ctx->video_stream, ctx->video_frame);
-		ctx->next_video_pts = video_pts + 1;
+		ctx->next_video_pts = pts + 1;
 	}
 	return true;
 }
@@ -341,32 +297,34 @@ void video_stop(VideoContext *ctx) {
 		atomic_store(&ctx->audio_tail, 0);
 		ctx->recording = false;
 		// flush video encoder
-		write_frame(ctx, ctx->video_encoder, ctx->video_stream, NULL);
-		// flush audio encoder
-		write_frame(ctx, ctx->audio_encoder, ctx->audio_stream, NULL);
-		int err = av_write_trailer(ctx->avf_context);
-		if (err < 0) {
-			log_error("av_write_trailer: %s", av_err2str(err));
-		}
-		avio_closep(&ctx->avf_context->pb);
+		write_video_frame(ctx, NULL, -1);
+		// finish video stream
+		ogg_packet oggp = {
+			.packet = NULL,
+			.bytes = 0,
+			.granulepos = vp8_pts_to_gp(ctx->next_video_pts, false),
+			.b_o_s = false,
+			.packetno = ctx->video_packetno++,
+			.e_o_s = true,
+		};
+		write_packet_to_stream(ctx, &ctx->video_stream, &oggp);
+		// TODO: flush audio encoder
 	}
-	if (ctx->video_encoder)
-		avcodec_free_context(&ctx->video_encoder);
-	if (ctx->audio_encoder)
-		avcodec_free_context(&ctx->audio_encoder);
-	if (ctx->video_frame)
-		av_frame_free(&ctx->video_frame);
-	if (ctx->audio_frame)
-		av_frame_free(&ctx->audio_frame);
-	if (ctx->avf_context) {
-		if (ctx->avf_context->pb) {
-			avio_closep(&ctx->avf_context->pb);
-		}
-		avformat_free_context(ctx->avf_context);
-		ctx->avf_context = NULL;
+	if (ctx->outfile) {
+		fclose(ctx->outfile);
+		ctx->outfile = NULL;
 	}
-	if (ctx->av_packet)
-		av_packet_free(&ctx->av_packet);
+	if (ctx->vpx.iface) {
+		vpx_codec_destroy(&ctx->vpx);
+		ctx->vpx.iface = NULL;
+	}
+	if (ctx->vpx_image.planes[0]) {
+		vpx_img_free(&ctx->vpx_image);
+		ctx->vpx_image.planes[0] = NULL;
+	}
+	vorbis_dsp_clear(&ctx->vorbis);
+	ogg_stream_clear(&ctx->video_stream);
+	ogg_stream_clear(&ctx->audio_stream);
 }
 
 void video_quit(VideoContext *ctx) {

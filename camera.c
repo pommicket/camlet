@@ -8,10 +8,12 @@
 #include <fcntl.h>
 #include <time.h>
 #include <tgmath.h>
+#include <errno.h>
+#include <theora/theoraenc.h>
 #include "3rd_party/stb_image_write.h"
 #include <jpeglib.h>
-#include <libavcodec/avcodec.h>
 #include "log.h"
+#include <vpx/vp8cx.h>
 
 #define CAMERA_MAX_BUFFERS 4
 struct Camera {
@@ -39,7 +41,6 @@ struct Camera {
 	uint64_t *framerates_supported;
 	size_t mmap_size[CAMERA_MAX_BUFFERS];
 	uint8_t *mmap_frames[CAMERA_MAX_BUFFERS];
-	uint8_t *userp_frames[CAMERA_MAX_BUFFERS];
 	// buffer used for jpeg decompression and format conversion for saving images
 	// should always be big enough for a 8bpc RGB frame
 	uint8_t *decompression_buf;
@@ -276,40 +277,6 @@ PictureFormat camera_closest_picfmt(Camera *camera, PictureFormat desired) {
 	return best_format;
 }
 
-static bool camera_setup_with_userp(Camera *camera) {
-	camera->access_method = CAMERA_ACCESS_USERP;
-	return false;
-/*
-TODO: test me with a camera that supports userptr i/o
-	struct v4l2_requestbuffers req = {0};
-	camera->streaming = true;
-	req.count = CAMERA_MAX_BUFFERS;
-	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	req.memory = V4L2_MEMORY_USERPTR;
-	if (v4l2_ioctl(camera->fd, VIDIOC_REQBUFS, &req) != 0) {
-		log_perror("v4l2_ioctl VIDIOC_REQBUFS");
-		return false;
-	}
-	for (int i = 0; i < CAMERA_MAX_BUFFERS; i++) {
-		camera->userp_frames[i] = calloc(1, camera->curr_format.fmt.pix.sizeimage);
-		struct v4l2_buffer buf = {0};
-		buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-		buf.memory = V4L2_MEMORY_USERPTR;
-		buf.index = i;
-		buf.m.userptr = (unsigned long)camera->userp_frames[i];
-		buf.length = camera->curr_format.fmt.pix.sizeimage;
-		if (v4l2_ioctl(camera->fd, VIDIOC_QBUF, &buf) != 0) {
-			log_perror("v4l2_ioctl VIDIOC_QBUF");
-		}
-	}
-	if (v4l2_ioctl(camera->fd,
-		VIDIOC_STREAMON,
-		(enum v4l2_buf_type[1]) { V4L2_BUF_TYPE_VIDEO_CAPTURE }) != 0) {
-		log_perror("v4l2_ioctl VIDIOC_STREAMON");
-		return false;
-	}
-	return true;*/
-}
 static bool camera_stop_io(Camera *camera) {
 	if (!camera->streaming)
 		return true;
@@ -353,10 +320,8 @@ static uint8_t *camera_curr_frame(Camera *camera) {
 		return NULL;
 	if (camera->read_frame)
 		return camera->read_frame;
-	if (camera->mmap_frames[camera->curr_frame_idx])
-		return camera->mmap_frames[camera->curr_frame_idx];
-	assert(camera->userp_frames[camera->curr_frame_idx]);
-	return camera->userp_frames[camera->curr_frame_idx];
+	assert(camera->mmap_frames[camera->curr_frame_idx]);
+	return camera->mmap_frames[camera->curr_frame_idx];
 }
 
 static float clampf(float x, float min, float max) {
@@ -548,13 +513,8 @@ bool camera_next_frame(Camera *camera) {
 		camera->frame_bytes_set = v4l2_read(camera->fd, camera->read_frame, camera->curr_format.fmt.pix.sizeimage);
 		camera->any_frames = true;
 		break;
-	case CAMERA_ACCESS_MMAP:
+	case CAMERA_ACCESS_MMAP: {
 		memory = V4L2_MEMORY_MMAP;
-		goto buf;
-	case CAMERA_ACCESS_USERP:
-		memory = V4L2_MEMORY_USERPTR;
-		goto buf;
-	buf: {
 		if (camera->frame_buffer.type) {
 			// queue back in previous buffer
 			v4l2_ioctl(camera->fd, VIDIOC_QBUF, &camera->frame_buffer);
@@ -746,8 +706,6 @@ void camera_close(Camera *camera) {
 			v4l2_munmap(camera->mmap_frames[i], camera->mmap_size[i]);
 			camera->mmap_frames[i] = NULL;
 		}
-		free(camera->userp_frames[i]);
-		camera->userp_frames[i] = NULL;
 	}
 	if (camera->fd >= 0) {
 		if (camera->streaming) {
@@ -898,12 +856,6 @@ bool camera_set_format(Camera *camera, PictureFormat picfmt, int desired_framera
 		camera_stop_io(camera);
 		// try read instead
 		return camera_setup_with_read(camera);
-	case CAMERA_ACCESS_USERP:
-		if (camera_setup_with_userp(camera))
-			return true;
-		camera_stop_io(camera);
-		// try read instead
-		return camera_setup_with_read(camera);
 	default:
 		#if DEBUG
 		assert(false);
@@ -918,7 +870,6 @@ bool camera_open(Camera *camera, PictureFormat desired_format, int desired_frame
 	// camera should not already be open
 	assert(!camera->read_frame);
 	assert(!camera->mmap_frames[0]);
-	assert(!camera->userp_frames[0]);
 	camera->fd = v4l2_open(camera->devnode, O_RDWR | O_CLOEXEC);
 	if (camera->fd < 0) {
 		log_perror("v4l2_open \"%s\"", camera->devnode);
@@ -1100,15 +1051,15 @@ const char *camera_devnode(Camera *camera) {
 	return camera->devnode;
 }
 
-bool camera_copy_to_av_frame(Camera *camera, struct AVFrame *frame_out) {
+bool camera_copy_to_vpx_image(Camera *camera, struct vpx_image *frame_out) {
 	uint8_t *frame_in = camera_curr_frame(camera);
 	int32_t frame_width = camera_frame_width(camera);
 	int32_t frame_height = camera_frame_height(camera);
 	if (!frame_in
-		|| frame_width != frame_out->width
-		|| frame_height != frame_out->height
+		|| frame_width != (int32_t)frame_out->w
+		|| frame_height != (int32_t)frame_out->h
 		|| camera_pixel_format(camera) != V4L2_PIX_FMT_YUV420
-		|| frame_out->format != AV_PIX_FMT_YUV420P) {
+		|| frame_out->fmt != VPX_IMG_FMT_I420) {
 		static atomic_flag warned = ATOMIC_FLAG_INIT;
 		if (!atomic_flag_test_and_set_explicit(&warned, memory_order_relaxed)) {
 			log_error("%s: Bad picture format.", __func__);
@@ -1117,20 +1068,20 @@ bool camera_copy_to_av_frame(Camera *camera, struct AVFrame *frame_out) {
 	}
 	// copy Y plane
 	for (int64_t y = 0; y < frame_height; y++) {
-		memcpy(&frame_out->data[0][y * frame_out->linesize[0]],
+		memcpy(&frame_out->planes[0][y * frame_out->stride[0]],
 			&frame_in[y * frame_width], frame_width);
 	}
 	// copy Cb plane
 	int64_t cb_offset = (int64_t)frame_width * frame_height;
 	for (int64_t y = 0; y < frame_height / 2; y++) {
-		memcpy(&frame_out->data[1][y * frame_out->linesize[1]],
+		memcpy(&frame_out->planes[1][y * frame_out->stride[1]],
 			&frame_in[cb_offset + y * (frame_width / 2)],
 			frame_width / 2);
 	}
 	// copy Cr plane
 	int64_t cr_offset = cb_offset + (int64_t)frame_width / 2 * frame_height / 2;
 	for (int64_t y = 0; y < frame_height / 2; y++) {
-		memcpy(&frame_out->data[2][y * frame_out->linesize[2]],
+		memcpy(&frame_out->planes[2][y * frame_out->stride[2]],
 			&frame_in[cr_offset + y * (frame_width / 2)],
 			frame_width / 2);
 	}

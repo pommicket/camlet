@@ -837,7 +837,7 @@ static bool take_picture(State *state) {
 			// add nanoseconds as well
 			snprintf(path + strlen(path), sizeof path - strlen(path), "-%lu", (unsigned long)ts.tv_nsec);
 		}
-		const char *extension = state->mode == MODE_VIDEO ? "mp4" : image_format_extensions[settings->image_format];
+		const char *extension = state->mode == MODE_VIDEO ? "ogv" : image_format_extensions[settings->image_format];
 		snprintf(path + strlen(path), sizeof path - strlen(path), ".%s", extension);
 		int fd = open(path, O_EXCL | O_CREAT, 0644);
 		if (fd == -1 && errno == EEXIST) {
