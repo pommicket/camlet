@@ -1025,9 +1025,13 @@ int main(int argc, char **argv) {
 	{
 		// set window icon
 		SDL_RWops *ops = SDL_RWFromConstMem(camlet_bmp, camlet_bmp_len);
-		SDL_Surface *icon = SDL_LoadBMP_RW(ops, true);
-		SDL_SetWindowIcon(window, icon);
-		SDL_FreeSurface(icon);
+		if (ops) {
+			SDL_Surface *icon = SDL_LoadBMP_RW(ops, true);
+			if (icon) {
+				SDL_SetWindowIcon(window, icon);
+				SDL_FreeSurface(icon);
+			}
+		}
 	}
 	state->video = video_init();
 
