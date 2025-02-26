@@ -20,6 +20,9 @@ If you want automatic updates, you can also
 sudo apt install camlet
 ```
 
+Unfortunately this will probably only work on Debian stable because ffmpeg likes to break
+their libraries every few months by changing the .so version.
+
 If you are on a non-Debian-based Linux
 distribution, you will have to build from source (see instructions below).
 
