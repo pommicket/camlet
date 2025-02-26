@@ -1,3 +1,12 @@
+#define VERSION "0.0.0"
+
+/*
+TODO:
+- switch back to SDL for audio now that that bug has been fixed
+- application icon (and SDL_SetWindowIcon)
+- cmdline argument for starting in video mode
+*/
+
 #define _GNU_SOURCE
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,6 +27,7 @@
 #include "camera.h"
 #include "video.h"
 #include "log.h"
+
 
 // pixel format used for convenience
 #define PIX_FMT_XXXGRAY 0x47585858
@@ -1778,7 +1788,8 @@ void main() {\n\
 					camera_hash_str(state->camera, hash);
 					strcpy(&hash[8], "...");
 				}
-				snprintf(text, sizeof text, "Camera FPS: %" PRId32 "  Render FPS: %" PRId32 " Camera ID: %s",
+				snprintf(text, sizeof text,
+					"Camera FPS: %" PRId32 " | Render FPS: %" PRId32 " | Camera ID: %s | v. " VERSION,
 					smoothed_camera_time > 1e-9 && smoothed_camera_time < 1 ? (int32_t)(1/smoothed_camera_time) : 0,
 					smoothed_frame_time > 1e-9 && smoothed_frame_time < 1 ? (int32_t)(1/smoothed_frame_time) : 0,
 					state->camera ? hash : "(None)");

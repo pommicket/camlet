@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Encoding=UTF-8
+Name=camlet
+Comment=Take pictures and videos with a webcam
+Exec=camlet
+Icon=camlet.png
+Terminal=false
+Categories=AudioVideo;Video;Recorder
