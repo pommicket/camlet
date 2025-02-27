@@ -35,7 +35,7 @@ distribution, you will have to build from source (see instructions below).
 ## Building from source
 
 camlet requires meson-build, a C compiler, and the development libraries
-for SDL2, SDL2\_ttf, GL (headers only), v4l2, udev, sodium, jpeglib (from IJG), ogg, vorbis, theora, and fontconfig.
+for SDL2, SDL2\_ttf, GL (headers only), v4l2, udev, sodium, jpeglib (from IJG), ogg, vorbis, vpx, and fontconfig.
 
 These can all be installed on Debian/Ubuntu with
 
@@ -65,6 +65,7 @@ You can try deleting/renaming your settings file as a temporary solution, to res
 <tr><th>Version</th> <th>Description</th> <th>Date</th></tr>
 <tr><td>0.0.0</td> <td>Initial release</td> <td>2025 Feb 26</td></tr>
 <tr><td>0.0.1</td> <td>Fix crash switching to video mode with no camera connected</td> <td>2025 Feb 26</td></tr>
+<tr><td>0.0.2</td> <td>Switch to ogg/vorbis/VP8 for videos</td> <td>2025 Feb 26</td></tr>
 </table>
 
 ## License
