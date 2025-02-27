@@ -6,7 +6,7 @@ Camlet is a webcam application for Linux.
 It features
 
 - Proper handling of disconnecting/reconnecting devices
-- Capture JPEG and PNG images and MP4 (H264+AAC) videos
+- Capture JPEG and PNG images and OGV (VP8+vorbis) videos
 - Full selection of resolutions available from camera
 - Remembers settings across program launches
 
