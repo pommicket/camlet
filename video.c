@@ -16,9 +16,10 @@
 
 struct VideoContext {
 	double start_time;
-	int audio_frame_samples;
 	ogg_stream_state video_stream, audio_stream;
 	vorbis_dsp_state vorbis;
+	vorbis_info vorbis_info;
+	vorbis_block vorbis_block;
 	vpx_codec_ctx_t vpx;
 	vpx_image_t vpx_image;
 	int64_t next_video_pts;
@@ -101,6 +102,12 @@ static bool write_packet_to_stream(VideoContext *ctx, ogg_stream_state *stream, 
 	return true;
 }
 
+// inverse of vp8_gptopts in  https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/oggparsevp8.c
+// see also: https://github.com/FFmpeg/FFmpeg/blob/99e2af4e7837ca09b97d93a562dc12947179fc48/libavformat/oggenc.c#L671
+static uint64_t vp8_pts_to_gp(int64_t pts, bool is_key_frame) {
+	return (uint64_t)pts << 32 | (uint64_t)!is_key_frame << 3;
+}
+
 bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t height, int fps, int quality) {
 	if (!ctx) return false;
 	if (ctx->recording) {
@@ -119,8 +126,12 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 		log_error("ogg_stream_init(video_stream) failed");
 		return false;
 	}
+	if (ogg_stream_init(&ctx->audio_stream, serial_number + 1) < 0) {
+		log_error("ogg_stream_init(audio_stream) failed");
+		return false;
+	}
 	vpx_codec_enc_cfg_t cfg = {0};
-	// NOTE: vp9 encoder seems to be much slower
+	// NOTE: vp9 encoder seems to be much slower and OggVP9 isn't a thing (yet)
 	vpx_codec_iface_t *vp8 = vpx_codec_vp8_cx();
 	int err = vpx_codec_enc_config_default(vp8, &cfg, 0);
 	if (err != 0) {
@@ -178,11 +189,45 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 	ogg_packet packet = {
 		.packet = (uint8_t *)&header,
 		.bytes = sizeof header,
+		.granulepos = vp8_pts_to_gp(0, false),
 		.b_o_s = true,
 		.e_o_s = false,
 	};
 	write_packet_to_stream(ctx, &ctx->video_stream, &packet);
 	bool have_audio = false;
+	vorbis_info_init(&ctx->vorbis_info);
+	if ((err = vorbis_encode_init_vbr(&ctx->vorbis_info, 2, 44100, 0.9f)) != 0) {
+		log_error("vorbis_encode_init_vbr failed (error %d)", err);
+		goto no_audio;
+	}
+	if ((err = vorbis_encode_setup_init(&ctx->vorbis_info)) != 0) {
+		log_error("vorbis_encode_setup_init failed (error %d)", err);
+		goto no_audio;
+	}
+	if (vorbis_analysis_init(&ctx->vorbis, &ctx->vorbis_info) != 0) {
+		log_error("vorbis_analysis_init failed");
+		goto no_audio;
+	}
+	if (vorbis_block_init(&ctx->vorbis, &ctx->vorbis_block) != 0) {
+		log_error("vorbis_block_init failed");
+		goto no_audio;
+	}
+	vorbis_comment comments = {0};
+	vorbis_comment_init(&comments);
+	ogg_packet header_packets[3] = {0};
+	if (vorbis_analysis_headerout(&ctx->vorbis, &comments,
+		&header_packets[0], &header_packets[1], &header_packets[2]) != 0) {
+		log_error("vorbis_analysis_headerout failed");
+		goto no_audio;
+	}
+	vorbis_comment_clear(&comments);
+	for (int i = 0; i < 3; i++) {
+		if (!write_packet_to_stream(ctx, &ctx->audio_stream, &header_packets[i])) {
+			goto no_audio;
+		}
+	}
+	have_audio = true;
+no_audio:
 	atomic_store(&ctx->audio_head, 0);
 	ctx->recording = true;
 	ctx->start_time = get_time_double();
@@ -195,11 +240,6 @@ bool video_start(VideoContext *ctx, const char *filename, int32_t width, int32_t
 	return true;
 }
 
-// inverse of vp8_gptopts in  https://github.com/FFmpeg/FFmpeg/blob/master/libavformat/oggparsevp8.c
-// see also: https://github.com/FFmpeg/FFmpeg/blob/99e2af4e7837ca09b97d93a562dc12947179fc48/libavformat/oggenc.c#L671
-static uint64_t vp8_pts_to_gp(int64_t pts, bool is_key_frame) {
-	return (uint64_t)pts << 32 | (uint64_t)!is_key_frame << 3;
-}
 
 static void write_video_frame(VideoContext *ctx, vpx_image_t *image, int64_t pts) {
 	int err = vpx_codec_encode(&ctx->vpx, image, pts, 1, 0, 1000000 / (ctx->framerate * 2));
@@ -223,6 +263,31 @@ static void write_video_frame(VideoContext *ctx, vpx_image_t *image, int64_t pts
 }
 
 
+static void write_audio_frame(VideoContext *ctx, int nsamples) {
+	int err = vorbis_analysis_wrote(&ctx->vorbis, nsamples);
+	if (err != 0) {
+		log_error("vorbis_analysis_wrote failed (error %d)", err);
+	}
+	while ((err = vorbis_analysis_blockout(&ctx->vorbis, &ctx->vorbis_block)) > 0) {
+		if ((err = vorbis_analysis(&ctx->vorbis_block, NULL)) != 0) {
+			log_error("vorbis_analysis failed (error %d)", err);
+		}
+		if ((err = vorbis_bitrate_addblock(&ctx->vorbis_block)) != 0) {
+			log_error("vorbis_bitrate_addblock failed (error %d)", err);
+		}
+		ogg_packet oggp;
+		while ((err = vorbis_bitrate_flushpacket(&ctx->vorbis, &oggp)) > 0) {
+			write_packet_to_stream(ctx, &ctx->audio_stream, &oggp);
+		}
+		if (err < 0) {
+			log_error("vorbis_bitrate_flushpacket failed (error %d)", err);
+		}
+	}
+	if (err < 0) {
+		log_error("vorbis_analysis_blockout failed (error %d)", err);
+	}
+}
+
 bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 	if (!ctx || !camera || !ctx->recording) return false;
 	double curr_time = get_time_double();
@@ -233,17 +298,16 @@ bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 		uint32_t head = atomic_load_explicit(&ctx->audio_head, memory_order_relaxed);
 		uint32_t tail = atomic_load(&ctx->audio_tail);
 		while (true) {
-			break;(void)tail;
-			// TODO
-			#if 0
-			uint32_t nfloats = (uint32_t)ctx->audio_frame_samples * 2;
+			uint32_t audio_frame_samples = 1024; // value recommended by vorbis
+			uint32_t nfloats = (uint32_t)audio_frame_samples * 2;
 			bool frame_ready = false;
 			if (head + nfloats < AUDIO_QUEUE_SIZE) {
 				// easy case
 				frame_ready = head + nfloats <= tail || head > tail /* tail wrapped around */;
 				if (frame_ready) {
+					float **buffer = vorbis_analysis_buffer(&ctx->vorbis, audio_frame_samples);
 					for (uint32_t s = 0; s < nfloats; s++) {
-						((float *)ctx->audio_frame->data[s % 2])[s / 2] = ctx->audio_queue[head + s];
+						buffer[s % 2][s / 2] = ctx->audio_queue[head + s];
 					}
 					head += nfloats;
 				}
@@ -251,22 +315,22 @@ bool video_submit_frame(VideoContext *ctx, Camera *camera) {
 				// "wrap around" case
 				frame_ready = head + nfloats - AUDIO_QUEUE_SIZE <= tail && tail < head;
 				if (frame_ready) {
+					float **buffer = vorbis_analysis_buffer(&ctx->vorbis, audio_frame_samples);
 					for (uint32_t s = 0; s < AUDIO_QUEUE_SIZE - head; s++) {
-						((float *)ctx->audio_frame->data[s % 2])[s / 2] = ctx->audio_queue[head + s];
+						buffer[s % 2][s / 2] = ctx->audio_queue[head + s];
 					}
 					for (uint32_t s = 0; s < head + nfloats - AUDIO_QUEUE_SIZE; s++) {
 						uint32_t i = AUDIO_QUEUE_SIZE - head + s;
-						((float *)ctx->audio_frame->data[i % 2])[i / 2] = ctx->audio_queue[s];
+						buffer[i % 2][i / 2] = ctx->audio_queue[s];
 					}
 					head = head + nfloats - AUDIO_QUEUE_SIZE;
 				}
 			}
 			if (frame_ready) {
-				write_frame(ctx, ctx->audio_encoder, ctx->audio_stream, ctx->audio_frame);
+				write_audio_frame(ctx, audio_frame_samples);
 			} else {
 				break;
 			}
-			#endif
 		}
 		atomic_store(&ctx->audio_head, head);
 	}
@@ -308,7 +372,8 @@ void video_stop(VideoContext *ctx) {
 			.e_o_s = true,
 		};
 		write_packet_to_stream(ctx, &ctx->video_stream, &oggp);
-		// TODO: flush audio encoder
+		// flush audio encoder
+		write_audio_frame(ctx, 0);
 	}
 	if (ctx->outfile) {
 		fclose(ctx->outfile);
@@ -323,6 +388,8 @@ void video_stop(VideoContext *ctx) {
 		ctx->vpx_image.planes[0] = NULL;
 	}
 	vorbis_dsp_clear(&ctx->vorbis);
+	vorbis_info_clear(&ctx->vorbis_info);
+	vorbis_block_clear(&ctx->vorbis_block);
 	ogg_stream_clear(&ctx->video_stream);
 	ogg_stream_clear(&ctx->audio_stream);
 }
