@@ -1131,14 +1131,14 @@ int main(int argc, char **argv) {
 attribute vec2 v_tex_coord;\n\
 uniform vec2 u_scale;\n\
 uniform vec2 u_offset;\n\
-out vec2 tex_coord;\n\
+out vec2 f_tex_coord;\n\
 void main() {\n\
-	tex_coord = vec2(v_tex_coord.x, 1.0 - v_tex_coord.y);\n\
+	f_tex_coord = vec2(v_tex_coord.x, 1.0 - v_tex_coord.y);\n\
 	gl_Position = vec4(u_scale * v_pos + u_offset, 0.0, 1.0);\n\
 }\n\
 ";
-	const char *fshader_code = "in vec4 color;\n\
-in vec2 tex_coord;\n\
+	const char *fshader_code = "\n\
+in vec2 f_tex_coord;\n\
 out vec4 o_color;\n\
 uniform sampler2D u_sampler;\n\
 uniform sampler2D u_sampler2;\n\
@@ -1153,28 +1153,28 @@ vec3 ycbcr_ITU_R_601_to_rgb(vec3 ycbcr) {\n\
 	vec3 gamma = vec3(0.9,1.1,1.3);  \n\
 	return clamp(pow(cool_matrix * vec4(ycbcr,1.0), gamma), 0.0, 1.0);\n\
 }\n\
-void main() {\n\
+vec4 color_at(vec2 tex_coord, sampler2D sampler1, sampler2D sampler2, sampler2D sampler3) {\n\
 	vec3 color;\n\
-	float opacity = u_opacity;\n\
+	float opacity = 1.0;\n\
 	switch (u_pixel_format) {\n\
 	case 0x59455247: // GREY\n\
-		color = texture2D(u_sampler, tex_coord).xxx;\n\
+		color = texture2D(sampler1, tex_coord).xxx;\n\
 		break;\n\
 	case 0x47585858: // XXXGRAY (used for FPS display currently)\n\
-		color = vec3(texture2D(u_sampler, tex_coord).w);\n\
+		color = vec3(texture2D(sampler1, tex_coord).w);\n\
 		break;\n\
 	case 0x56595559: { // YUYV 4:2:2 interleaved\n\
-		ivec2 texsize = textureSize(u_sampler, 0);\n\
+		ivec2 texsize = textureSize(sampler1, 0);\n\
 		vec2 tc = tex_coord * vec2(texsize);\n\
 		ivec2 tc00 = ivec2(tc);\n\
 		ivec2 tc10 = clamp(tc00 + ivec2(1, 0), ivec2(0), texsize - ivec2(1, 1));\n\
 		ivec2 tc01 = clamp(tc00 + ivec2(0, 1), ivec2(0), texsize - ivec2(1, 1));\n\
 		ivec2 tc11 = clamp(tc00 + ivec2(1, 1), ivec2(0), texsize - ivec2(1, 1));\n\
 		vec2 tcfrac = tc - vec2(tc00);\n\
-		vec4 t00 = texelFetch(u_sampler, tc00, 0);\n\
-		vec4 t10 = texelFetch(u_sampler, tc10, 0);\n\
-		vec4 t01 = texelFetch(u_sampler, tc01, 0);\n\
-		vec4 t11 = texelFetch(u_sampler, tc11, 0);\n\
+		vec4 t00 = texelFetch(sampler1, tc00, 0);\n\
+		vec4 t10 = texelFetch(sampler1, tc10, 0);\n\
+		vec4 t01 = texelFetch(sampler1, tc01, 0);\n\
+		vec4 t11 = texelFetch(sampler1, tc11, 0);\n\
 		vec2 cbcr0 = mix(t00.yw, t01.yw, tcfrac.y);\n\
 		vec2 cbcr1 = mix(t10.yw, t11.yw, tcfrac.y);\n\
 		vec2 cbcr = mix(cbcr0, cbcr1, tcfrac.x);\n\
@@ -1192,31 +1192,36 @@ void main() {\n\
 		} break;\n\
 	case 0x32315559: // YUV 4:2:0 with separate planes\n\
 	case 0x32315659: { // YVU 4:2:0 with separate planes (planes are reordered to YUV in camera.c)\n\
-		float y = texture2D(u_sampler, tex_coord).x;\n\
-		float cb = texture2D(u_sampler2, tex_coord).x;\n\
-		float cr = texture2D(u_sampler3, tex_coord).x;\n\
+		float y = texture2D(sampler1, tex_coord).x;\n\
+		float cb = texture2D(sampler2, tex_coord).x;\n\
+		float cr = texture2D(sampler3, tex_coord).x;\n\
 		color = ycbcr_ITU_R_601_to_rgb(vec3(y,cb,cr));\n\
 		} break;\n\
 	case 0x3231564e: {// YUV 4:2:0 with a Y plane and a UV plane\n\
-		float y = texture2D(u_sampler, tex_coord).x;\n\
-		vec2 cbcr = texture2D(u_sampler2, tex_coord).xy;\n\
+		float y = texture2D(sampler1, tex_coord).x;\n\
+		vec2 cbcr = texture2D(sampler2, tex_coord).xy;\n\
 		color = ycbcr_ITU_R_601_to_rgb(vec3(y,cbcr));\n\
 		} break;\n\
 	case 0x3132564e: {// YVU 4:2:0 with a Y plane and a VU plane\n\
-		float y = texture2D(u_sampler, tex_coord).x;\n\
-		vec2 cbcr = texture2D(u_sampler2, tex_coord).yx;\n\
+		float y = texture2D(sampler1, tex_coord).x;\n\
+		vec2 cbcr = texture2D(sampler2, tex_coord).yx;\n\
 		color = ycbcr_ITU_R_601_to_rgb(vec3(y,cbcr));\n\
 		} break;\n\
 	case 0x34324241: { // RGBA32 (used for timer currently)\n\
-		vec4 v = texture2D(u_sampler, tex_coord);\n\
+		vec4 v = texture2D(sampler1, tex_coord);\n\
 		color = v.xyz;\n\
 		opacity *= v.w;\n\
 		} break;\n\
 	default:\n\
-		color = texture2D(u_sampler, tex_coord).xyz;\n\
+		color = texture2D(sampler1, tex_coord).xyz;\n\
 		break;\n\
 	}\n\
-	o_color = vec4(mix(color, vec3(1.0), u_flash), opacity);\n\
+	return vec4(color, opacity);\n\
+}\n\
+void main() {\n\
+	float opacity = u_opacity;\n\
+	vec4 color = color_at(f_tex_coord, u_sampler, u_sampler2, u_sampler3);\n\
+	o_color = vec4(mix(color.xyz, vec3(1.0), u_flash), opacity * color.w);\n\
 }\n\
 ";
 	static char shader_err[256] = {0};
