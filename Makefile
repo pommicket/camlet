@@ -24,7 +24,7 @@ camlet.deb: release control.sh
 	cp camlet.desktop tmp/camlet/usr/share/applications/
 	cp camlet.png tmp/camlet/usr/share/icons/hicolor/48x48/apps
 	sh control.sh > tmp/camlet/DEBIAN/control
-	dpkg-deb --build tmp/camlet
+	dpkg-deb --root-owner-group --build tmp/camlet
 	mv tmp/camlet.deb .
 	rm -rf tmp
 install: release
