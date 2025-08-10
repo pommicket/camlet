@@ -66,6 +66,7 @@ You can try deleting/renaming your settings file as a temporary solution, to res
 <tr><td>0.0.0</td> <td>Initial release</td> <td>2025 Feb 26</td></tr>
 <tr><td>0.0.1</td> <td>Fix crash switching to video mode with no camera connected</td> <td>2025 Feb 26</td></tr>
 <tr><td>0.0.2</td> <td>Switch to ogg/vorbis/VP8 for videos</td> <td>2025 Feb 26</td></tr>
+<tr><td>0.0.3</td> <td>Update to libvpx9</td> <td>2025 Aug 10</td></tr>
 </table>
 
 ## License

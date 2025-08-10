@@ -1,4 +1,4 @@
-#define VERSION "0.0.2"
+#define VERSION "0.0.3"
 
 #define _GNU_SOURCE
 #include <stdio.h>

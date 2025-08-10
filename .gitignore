@@ -8,4 +8,5 @@ out.bmp
 *.swp
 *~
 .vscode
-camlet.deb
+*.deb
+*.deb.asc
