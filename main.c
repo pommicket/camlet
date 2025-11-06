@@ -1,4 +1,4 @@
-#define VERSION "0.0.3"
+#define VERSION "0.0.4"
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -1326,7 +1326,7 @@ void main() {\n\
 			const char *devnode = udev_device_get_devnode(dev);
 			const char *action = udev_device_get_action(dev);
 			const char *subsystem = udev_device_get_sysattr_value(dev, "subsystem");
-			if (strcmp(action, "remove") == 0) {
+			if (strcmp(action, "remove") == 0 && devnode) {
 				if (state->camera && strcmp(devnode, camera_devnode(state->camera)) == 0) {
 					// our special camera got disconnected ):
 					video_stop(state->video);
