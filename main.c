@@ -1,4 +1,4 @@
-#define VERSION "0.0.4"
+#define VERSION "0.0.5"
 
 #define _GNU_SOURCE
 #include <stdio.h>
@@ -657,25 +657,21 @@ static void select_camera(State *state) {
 	while (true) {
 		int camera_idx = -1;
 		// find highest-precedence possibly-working camera
+		Camera *new_camera = NULL;
 		arr_foreach_ptr(settings->camera_precedence, const Hash, h) {
 			arr_foreach_ptr(state->cameras, Camera *const, pcamera) {
 				Camera *c = *pcamera;
 				if (hash_eq(camera_hash(c), *h)) {
-					if (state->camera == c) {
-						// already have best camera selected
-						free(cameras_working);
-						return;
-					}
 					camera_idx = (int)(pcamera - state->cameras);
 					if (cameras_working[camera_idx]) {
-						state->camera = c;
+						new_camera = c;
 						break;
 					}
 				}
 			}
-			if (state->camera) break;
+			if (new_camera) break;
 		}
-		if (!state->camera) {
+		if (!new_camera) {
 			// nothing in precedence list works- find first possibly-working camera
 			for (camera_idx = 0; camera_idx < (int)arr_len(state->cameras); camera_idx++)
 				if (cameras_working[camera_idx])
@@ -684,8 +680,15 @@ static void select_camera(State *state) {
 				// no cameras work
 				break;
 			}
-			state->camera = state->cameras[camera_idx];
+			new_camera = state->cameras[camera_idx];
 		}
+		if (state->camera == new_camera) {
+			// already have best camera selected
+			break;
+		}
+		if (state->camera)
+			camera_close(state->camera);
+		state->camera = new_camera;
 		if (camera_open(state->camera, settings_picture_format_for_camera(state, state->camera), settings_desired_framerate(state))) {
 			bool already_there = false;
 			arr_foreach_ptr(settings->camera_precedence, Hash, h) {

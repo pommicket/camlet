@@ -68,6 +68,7 @@ You can try deleting/renaming your settings file as a temporary solution, to res
 <tr><td>0.0.2</td> <td>Switch to ogg/vorbis/VP8 for videos</td> <td>2025 Feb 26</td></tr>
 <tr><td>0.0.3</td> <td>Update to libvpx9</td> <td>2025 Aug 10</td></tr>
 <tr><td>0.0.4</td> <td>Fix occasional crash</td> <td>2025 Nov 6</td></tr>
+<tr><td>0.0.5</td> <td>Fix crash switching back to earlier camera</td> <td>2025 Nov 6</td></tr>
 </table>
 
 ## License
